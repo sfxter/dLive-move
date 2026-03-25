@@ -1,0 +1,14 @@
+# Set breakpoints on key functions
+# ChannelExists - discover sChannelStripKey layout
+b -a 0x100405630 -N ch_exists
+# ChannelIsStereo - confirm key layout
+b -a 0x100405740 -N ch_stereo
+# GetChannelAudioSource - discover sAudioSource
+b -a 0x1004058b0 -N get_audio_src
+
+# Disable all initially - too noisy
+br disable ch_exists
+br disable ch_stereo
+br disable get_audio_src
+
+run
