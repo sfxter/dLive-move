@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
+#include <map>
 #include <vector>
 #include <set>
 
@@ -232,6 +233,8 @@ static int g_dynNetObjIndices[256] = {};     // all found cDynamicsNetObject reg
 static int g_dynNetObjCount = 0;             // total found
 
 static const size_t SINPUTATTRS_SIZE = 0xAC8; // sizeof(sInputAttributes)
+static const int kMaxAnalogueInputSocket = 511;
+static const uint32_t kMixRackIOPortAudioSourceType = 5;
 
 // sAudioSource: 8 bytes {uint32_t type, uint32_t number}
 struct sAudioSource { uint32_t type; uint32_t number; };
@@ -1405,6 +1408,13 @@ struct PreampData {
     uint8_t phantom;
 };
 
+struct ActiveInputSourceData {
+    sAudioSource source;
+    bool         assigned;
+    PreampData   preampData;
+    bool         validPreamp;
+};
+
 static bool samePreampData(const PreampData& a, const PreampData& b) {
     return a.gain == b.gain && a.pad == b.pad && a.phantom == b.phantom;
 }
@@ -1413,8 +1423,19 @@ static bool isLocalAnaloguePatch(const PatchData& pd) {
     return pd.sourceType == 0 && pd.source.type == 0;
 }
 
+static bool patchDataUsesSocketBackedPreamp(const PatchData& pd);
+static bool audioSourceIsMixRackIOPortPreamp(const sAudioSource& source);
+static bool shouldShiftPatchedPreampForMove(const PatchData& pd,
+                                            bool movePatchWithChannel,
+                                            bool shiftMixRackIOPortWithMoveInScenarioA);
+static bool shouldShiftSocketBackedPreampForMove(const sAudioSource& source,
+                                                 bool movePatchWithChannel,
+                                                 bool shiftMixRackIOPortWithMoveInScenarioA);
+static bool getAnalogueSocketIndexForAudioSource(const sAudioSource& source, int& socketNum);
+
 static void* getAnalogueInput(int socketNum) {
-    if (!g_registryRouter || g_firstAnalogueInputIdx < 0 || socketNum < 0 || socketNum > 127) return nullptr;
+    if (!g_registryRouter || g_firstAnalogueInputIdx < 0 ||
+        socketNum < 0 || socketNum > kMaxAnalogueInputSocket) return nullptr;
     uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
     void* entry = nullptr;
     safeRead(base + (g_firstAnalogueInputIdx + socketNum) * 8, &entry, sizeof(entry));
@@ -1444,8 +1465,11 @@ static bool readPreampDataForSocket(int socketNum, PreampData& pd) {
 }
 
 static bool readPreampDataForPatch(const PatchData& pd, PreampData& preamp) {
-    if (!isLocalAnaloguePatch(pd)) return false;
-    return readPreampDataForSocket((int)pd.source.number, preamp);
+    int socketNum = -1;
+    if (!patchDataUsesSocketBackedPreamp(pd) ||
+        !getAnalogueSocketIndexForAudioSource(pd.source, socketNum))
+        return false;
+    return readPreampDataForSocket(socketNum, preamp);
 }
 
 static bool writePreampDataForSocket(int socketNum, const PreampData& pd) {
@@ -1461,16 +1485,220 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd) {
     auto midiSetPad = (fn_MIDISetPad)RESOLVE(0x1004ed020);
     auto midiSetPhantom = (fn_MIDISetPhantom)RESOLVE(0x1004ed0a0);
 
+    fprintf(stderr,
+            "[MC]     Preamp write begin socket %d ai=%p gain=%d pad=%d phantom=%d\n",
+            socketNum, ai, pd.gain, pd.pad, pd.phantom);
     midiSetGain(ai, pd.gain);
+    fprintf(stderr, "[MC]     Preamp write socket %d: gain applied\n", socketNum);
     midiSetPad(ai, pd.pad != 0);
+    fprintf(stderr, "[MC]     Preamp write socket %d: pad applied\n", socketNum);
     midiSetPhantom(ai, pd.phantom != 0);
+    fprintf(stderr, "[MC]     Preamp write socket %d: phantom applied\n", socketNum);
 
     return true;
 }
 
 static bool writePreampDataForPatch(const PatchData& pd, const PreampData& preamp) {
-    if (!isLocalAnaloguePatch(pd)) return false;
-    return writePreampDataForSocket((int)pd.source.number, preamp);
+    int socketNum = -1;
+    if (!patchDataUsesSocketBackedPreamp(pd) ||
+        !getAnalogueSocketIndexForAudioSource(pd.source, socketNum))
+        return false;
+    return writePreampDataForSocket(socketNum, preamp);
+}
+
+static bool isLocalAnalogueSource(const sAudioSource& source) {
+    return source.type == 0;
+}
+
+static bool readNumSendPointsForType(uint32_t sourceType, uint16_t& count);
+static bool getAnalogueSocketIndexForAudioSource(const sAudioSource& source, int& socketNum);
+
+static bool getSendPointForAudioSource(const sAudioSource& source, void*& sendPt) {
+    sendPt = nullptr;
+    if (!g_audioSRPManager) return false;
+    typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    if (!getSendPoint) return false;
+    sendPt = getSendPoint(g_audioSRPManager, source.type, (uint16_t)source.number);
+    return sendPt != nullptr;
+}
+
+static void* getUnassignedInputSendPoint() {
+    if (!g_audioSRPManager) return nullptr;
+    void* sendPt = nullptr;
+    safeRead((uint8_t*)g_audioSRPManager + 0x350, &sendPt, sizeof(sendPt));
+    return sendPt;
+}
+
+static bool audioSourceIsSocketBackedPreamp(const sAudioSource& source) {
+    void* sendPt = nullptr;
+    if (!getSendPointForAudioSource(source, sendPt) || !sendPt)
+        return false;
+    typedef int (*fn_GetParentType)(void* sendPoint);
+    auto getParentType = (fn_GetParentType)RESOLVE(0x1006cd690);
+    return getParentType && getParentType(sendPt) == 3;
+}
+
+static bool patchDataUsesSocketBackedPreamp(const PatchData& pd) {
+    return isLocalAnaloguePatch(pd) || audioSourceIsMixRackIOPortPreamp(pd.source);
+}
+
+static bool audioSourceIsMixRackIOPortPreamp(const sAudioSource& source) {
+    // Observed live mapping: type 5 is the MixRack I/O Port preamp bank.
+    return source.type == kMixRackIOPortAudioSourceType &&
+           audioSourceIsSocketBackedPreamp(source);
+}
+
+static bool shouldShiftPatchedPreampForMove(const PatchData& pd,
+                                            bool movePatchWithChannel,
+                                            bool shiftMixRackIOPortWithMoveInScenarioA) {
+    if (movePatchWithChannel)
+        return false;
+    if (isLocalAnaloguePatch(pd))
+        return true;
+    if (audioSourceIsMixRackIOPortPreamp(pd.source))
+        return shiftMixRackIOPortWithMoveInScenarioA;
+    return false;
+}
+
+static bool shouldShiftSocketBackedPreampForMove(const sAudioSource& source,
+                                                 bool movePatchWithChannel,
+                                                 bool shiftMixRackIOPortWithMoveInScenarioA) {
+    if (movePatchWithChannel || !audioSourceIsSocketBackedPreamp(source))
+        return false;
+    if (audioSourceIsMixRackIOPortPreamp(source) &&
+        !shiftMixRackIOPortWithMoveInScenarioA)
+        return false;
+    return true;
+}
+
+static bool getAnalogueSocketIndexForAudioSource(const sAudioSource& source, int& socketNum) {
+    socketNum = -1;
+    if (!audioSourceIsSocketBackedPreamp(source))
+        return false;
+
+    uint16_t count = 0;
+    if (!readNumSendPointsForType(source.type, count) || source.number >= count)
+        return false;
+
+    // The nonlocal preamp banks are not laid out uniformly. The observed mapping so far is:
+    //   type 0 -> zero-based
+    //   odd nonzero types -> +1 offset
+    //   even nonzero types -> zero-based
+    socketNum = (int)source.type * 64 + (int)source.number;
+    if ((source.type & 1U) != 0)
+        socketNum += 1;
+    if (socketNum < 0 || socketNum > kMaxAnalogueInputSocket) {
+        socketNum = -1;
+        return false;
+    }
+    return true;
+}
+
+static sAudioSource remapAudioSourceForMove(const sAudioSource& source, int srcCh, int tgtCh,
+                                            bool movePatchWithChannel,
+                                            bool shiftMixRackIOPortWithMoveInScenarioA) {
+    if (!shouldShiftSocketBackedPreampForMove(source, movePatchWithChannel,
+                                              shiftMixRackIOPortWithMoveInScenarioA))
+        return source;
+
+    sAudioSource out = source;
+    int delta = tgtCh - srcCh;
+    int newNumber = (int)source.number + delta;
+    uint16_t count = 0;
+    if (!readNumSendPointsForType(source.type, count) || newNumber < 0 || newNumber >= count) {
+        fprintf(stderr,
+                "[MC]   WARN: active-input source remap {type=%u, num=%u} + delta %d is out of range for ch %d; keeping original\n",
+                source.type,
+                source.number, delta, tgtCh + 1);
+        return out;
+    }
+
+    out.number = (uint32_t)newNumber;
+    fprintf(stderr,
+            "[MC]   Active-input remap srcCh %d -> tgtCh %d: source {type=%u, num=%u} -> {type=%u, num=%u}\n",
+            srcCh + 1, tgtCh + 1,
+            source.type, source.number,
+            out.type, out.number);
+    return out;
+}
+
+static bool readPreampDataForAudioSource(const sAudioSource& source, PreampData& preamp) {
+    int socketNum = -1;
+    if (!getAnalogueSocketIndexForAudioSource(source, socketNum)) return false;
+    return readPreampDataForSocket(socketNum, preamp);
+}
+
+static bool writePreampDataForAudioSource(const sAudioSource& source, const PreampData& preamp) {
+    int socketNum = -1;
+    if (!getAnalogueSocketIndexForAudioSource(source, socketNum)) return false;
+    return writePreampDataForSocket(socketNum, preamp);
+}
+
+static void* getManagedInputChannel(int ch) {
+    if (!g_channelManager || ch < 0 || ch > 127) return nullptr;
+    typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    return getChannel ? getChannel(g_channelManager, 1, (uint8_t)ch) : nullptr;
+}
+
+static std::map<void*, sAudioSource> g_sendPointSourceCache;
+static bool g_sendPointSourceCacheBuilt = false;
+
+static bool readNumSendPointsForType(uint32_t sourceType, uint16_t& count) {
+    if (sourceType >= 0x2f) return false;
+    const uint16_t* counts = (const uint16_t*)RESOLVE(0x1029851c0);
+    return safeRead((const void*)(counts + sourceType), &count, sizeof(count));
+}
+
+static void buildSendPointSourceCache() {
+    if (g_sendPointSourceCacheBuilt || !g_audioSRPManager) return;
+
+    typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    if (!getSendPoint) return;
+
+    for (uint32_t sourceType = 0; sourceType < 0x2f; sourceType++) {
+        uint16_t count = 0;
+        if (!readNumSendPointsForType(sourceType, count))
+            continue;
+        for (uint16_t sourceNum = 0; sourceNum < count; sourceNum++) {
+            void* sendPt = getSendPoint(g_audioSRPManager, sourceType, sourceNum);
+            if (!sendPt) continue;
+            g_sendPointSourceCache[sendPt] = {sourceType, sourceNum};
+        }
+    }
+
+    g_sendPointSourceCacheBuilt = true;
+    fprintf(stderr, "[MC] Built send-point source cache with %zu entries\n",
+            g_sendPointSourceCache.size());
+}
+
+static bool resolveAudioSourceFromSendPoint(void* sendPt, sAudioSource& source) {
+    if (!sendPt) return false;
+    buildSendPointSourceCache();
+    auto it = g_sendPointSourceCache.find(sendPt);
+    if (it == g_sendPointSourceCache.end())
+        return false;
+    source = it->second;
+    return true;
+}
+
+static bool resolveLocalAnalogueSourceFromSendPoint(void* sendPt, sAudioSource& source) {
+    if (!sendPt || !g_audioSRPManager) return false;
+    typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    if (!getSendPoint) return false;
+
+    uint16_t count = 0;
+    if (!readNumSendPointsForType(0, count)) return false;
+    for (uint16_t sourceNum = 0; sourceNum < count; sourceNum++) {
+        void* localSendPt = getSendPoint(g_audioSRPManager, 0, sourceNum);
+        if (localSendPt != sendPt) continue;
+        source = {0, sourceNum};
+        return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -1502,6 +1730,11 @@ struct ChannelSnapshot {
     // Preamp data (gain, pad, phantom)
     PreampData preampData;
     bool       validPreamp;
+
+    // ABCD / redundant input-source setup
+    uint8_t activeInputSource;
+    bool    abcdEnabled;
+    ActiveInputSourceData activeInputData[4];
 
     // Insert routing: specific audio send/receive points for each insert
     // [0] = Insert A, [1] = Insert B
@@ -1777,6 +2010,54 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
 
     // Preamp lives on the patched socket, not on the destination channel index.
     snap.validPreamp = snap.validPatch && readPreampDataForPatch(snap.patchData, snap.preampData);
+
+    snap.activeInputSource = 0;
+    snap.abcdEnabled = false;
+    for (int i = 0; i < 4; i++) {
+        snap.activeInputData[i].source = {0, 0};
+        snap.activeInputData[i].assigned = false;
+        snap.activeInputData[i].validPreamp = false;
+        memset(&snap.activeInputData[i].preampData, 0, sizeof(PreampData));
+    }
+
+    if (void* cChannel = getManagedInputChannel(ch)) {
+        typedef int (*fn_GetActiveInputSource)(void* channel);
+        typedef bool (*fn_HasActiveInputSourceAssigned)(void* channel, int activeInputSource);
+        typedef void* (*fn_GetInputChannelSource)(void* channel, int activeInputSource);
+
+        auto getActiveInputSource = (fn_GetActiveInputSource)RESOLVE(0x1006d80d0);
+        auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(0x1006df840);
+        auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(0x1006d81e0);
+
+        if (getActiveInputSource)
+            snap.activeInputSource = (uint8_t)getActiveInputSource(cChannel);
+        snap.abcdEnabled = snap.activeInputSource != 0;
+
+        for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
+            ActiveInputSourceData& aid = snap.activeInputData[activeInputSource - 1];
+            if (!hasActiveInputSourceAssigned || !getInputChannelSource ||
+                !hasActiveInputSourceAssigned(cChannel, activeInputSource)) {
+                continue;
+            }
+
+            void* sendPt = getInputChannelSource(cChannel, activeInputSource);
+            if (!sendPt) continue;
+            bool resolved = resolveAudioSourceFromSendPoint(sendPt, aid.source);
+            if (!resolved) {
+                fprintf(stderr,
+                        "[MC]   Snapshot ABCD ch %d source %d: unresolved send point %p\n",
+                        ch + 1, activeInputSource, sendPt);
+                continue;
+            }
+
+            aid.assigned = true;
+            aid.validPreamp = readPreampDataForAudioSource(aid.source, aid.preampData);
+            fprintf(stderr,
+                    "[MC]   Snapshot ABCD ch %d source %d: type=%u num=%u preamp=%d\n",
+                    ch + 1, activeInputSource,
+                    aid.source.type, aid.source.number, aid.validPreamp ? 1 : 0);
+        }
+    }
 
     // Insert routing: find FX unit assigned to each insert point
     // Chain: cChannel::GetInsertReturnPoint(insertPt) → returnPt+0x20 → sendPt
@@ -2122,10 +2403,14 @@ static void dumpChannelData(int ch, const char* label);
 static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
                           MovePlan& plan, char* errBuf, size_t errBufLen);
 static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan);
-static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh);
+static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
+                                       bool shiftMixRackIOPortWithMoveInScenarioA);
 static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
-                                           bool movePatchWithChannel);
-static bool moveChannel(int src, int dst, bool movePatchWithChannel, bool moveAdjacentMonoPair);
+                                           bool movePatchWithChannel,
+                                           bool shiftMixRackIOPortWithMoveInScenarioA);
+static bool moveChannel(int src, int dst, bool movePatchWithChannel,
+                        bool shiftMixRackIOPortWithMoveInScenarioA,
+                        bool moveAdjacentMonoPair);
 static bool isInsertStatusProc(int procIdx) {
     return procIdx == 3 || procIdx == 4;
 }
@@ -2709,6 +2994,49 @@ static bool compareSnapshotsForMove(const ChannelSnapshot& expected, const Chann
         }
     }
 
+    if (expected.activeInputSource != actual.activeInputSource ||
+        expected.abcdEnabled != actual.abcdEnabled) {
+        fprintf(stderr,
+                "[MC][VERIFY] ch %d ABCD state mismatch exp={enabled=%d active=%u} got={enabled=%d active=%u}\n",
+                ch + 1,
+                expected.abcdEnabled ? 1 : 0, expected.activeInputSource,
+                actual.abcdEnabled ? 1 : 0, actual.activeInputSource);
+        ok = false;
+    }
+    for (int i = 0; i < 4; i++) {
+        const auto& exp = expected.activeInputData[i];
+        const auto& act = actual.activeInputData[i];
+        if (exp.assigned != act.assigned) {
+            fprintf(stderr,
+                    "[MC][VERIFY] ch %d ABCD source %c assigned mismatch exp=%d got=%d\n",
+                    ch + 1, 'A' + i, exp.assigned ? 1 : 0, act.assigned ? 1 : 0);
+            ok = false;
+            continue;
+        }
+        if (!exp.assigned) continue;
+        if (memcmp(&exp.source, &act.source, sizeof(sAudioSource)) != 0) {
+            fprintf(stderr,
+                    "[MC][VERIFY] ch %d ABCD source %c mismatch exp={type=%u num=%u} got={type=%u num=%u}\n",
+                    ch + 1, 'A' + i,
+                    exp.source.type, exp.source.number,
+                    act.source.type, act.source.number);
+            ok = false;
+        }
+        if (exp.validPreamp != act.validPreamp) {
+            fprintf(stderr,
+                    "[MC][VERIFY] ch %d ABCD source %c preamp presence mismatch\n",
+                    ch + 1, 'A' + i);
+            ok = false;
+            continue;
+        }
+        if (exp.validPreamp && !samePreampData(exp.preampData, act.preampData)) {
+            fprintf(stderr,
+                    "[MC][VERIFY] ch %d ABCD source %c preamp mismatch\n",
+                    ch + 1, 'A' + i);
+            ok = false;
+        }
+    }
+
     for (int ip = 0; ip < 2; ip++) {
         if (expected.insertInfo[ip].hasInsert != actual.insertInfo[ip].hasInsert ||
             expected.insertInfo[ip].parentType != actual.insertInfo[ip].parentType) {
@@ -2745,6 +3073,10 @@ static bool runAutomatedMoveTest() {
     bool movePatchWithChannel = false;
     if (const char* patchEnv = getenv("MC_AUTOTEST_MOVE_PATCH")) {
         movePatchWithChannel = (atoi(patchEnv) != 0);
+    }
+    bool shiftMixRackIOPortWithMoveInScenarioA = false;
+    if (const char* ioEnv = getenv("MC_AUTOTEST_SHIFT_MIXRACK_IO")) {
+        shiftMixRackIOPortWithMoveInScenarioA = (atoi(ioEnv) != 0);
     }
 
     bool forceStereo = false;
@@ -2821,11 +3153,23 @@ static bool runAutomatedMoveTest() {
     }
     for (auto& [tgtCh, snapIdx] : plan.targetMap) {
         int srcCh = plan.lo + snapIdx;
-        if (!expected[snapIdx].validPatch) continue;
-        expected[snapIdx].patchData =
-            getTargetPatchDataForMove(expected[snapIdx].patchData, srcCh, tgtCh, movePatchWithChannel);
+        if (expected[snapIdx].validPatch) {
+            expected[snapIdx].patchData =
+                getTargetPatchDataForMove(expected[snapIdx].patchData, srcCh, tgtCh,
+                                         movePatchWithChannel,
+                                         shiftMixRackIOPortWithMoveInScenarioA);
+        }
+        for (int i = 0; i < 4; i++) {
+            auto& aid = expected[snapIdx].activeInputData[i];
+            if (!aid.assigned) continue;
+            aid.source = remapAudioSourceForMove(aid.source, srcCh, tgtCh,
+                                                movePatchWithChannel,
+                                                shiftMixRackIOPortWithMoveInScenarioA);
+        }
     }
-    bool moved = moveChannel(src, dst, movePatchWithChannel, moveMonoBlock);
+    bool moved = moveChannel(src, dst, movePatchWithChannel,
+                             shiftMixRackIOPortWithMoveInScenarioA,
+                             moveMonoBlock);
     bool ok = moved;
     if (moved) {
         for (auto& [tgtCh, snapIdx] : plan.targetMap) {
@@ -2967,36 +3311,47 @@ static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan) {
     return oldRef;
 }
 
-static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh) {
+static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
+                                       bool shiftMixRackIOPortWithMoveInScenarioA) {
     PatchData out = pd;
-    if (!isLocalAnaloguePatch(pd))
+    if (!shouldShiftPatchedPreampForMove(pd, false,
+                                         shiftMixRackIOPortWithMoveInScenarioA))
         return out;
 
     int delta = tgtCh - srcCh;
     int newNumber = (int)pd.source.number + delta;
-    if (newNumber < 0 || newNumber > 127) {
+    uint16_t count = 0;
+    if (!readNumSendPointsForType(pd.source.type, count) ||
+        newNumber < 0 || newNumber >= count) {
         fprintf(stderr,
-                "[MC]   WARN: patch remap src socket %u + delta %d is out of range for ch %d; keeping original\n",
+                "[MC]   WARN: patch remap src={type=%u, num=%u} + delta %d is out of range for ch %d; keeping original\n",
+                pd.source.type,
                 pd.source.number, delta, tgtCh + 1);
         return out;
     }
 
     out.source.number = (uint32_t)newNumber;
     fprintf(stderr,
-            "[MC]   Patch remap srcCh %d -> tgtCh %d: local socket %u -> %u\n",
-            srcCh + 1, tgtCh + 1, pd.source.number, out.source.number);
+            "[MC]   Patch remap srcCh %d -> tgtCh %d: source {type=%u, num=%u} -> {type=%u, num=%u}\n",
+            srcCh + 1, tgtCh + 1,
+            pd.source.type, pd.source.number,
+            out.source.type, out.source.number);
     return out;
 }
 
 static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
-                                           bool movePatchWithChannel) {
-    return movePatchWithChannel ? pd : remapPatchDataForMove(pd, srcCh, tgtCh);
+                                           bool movePatchWithChannel,
+                                           bool shiftMixRackIOPortWithMoveInScenarioA) {
+    return movePatchWithChannel ? pd :
+        remapPatchDataForMove(pd, srcCh, tgtCh, shiftMixRackIOPortWithMoveInScenarioA);
 }
 
 // =============================================================================
 // Move Channel
 // =============================================================================
-static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, bool moveAdjacentMonoPair = false) {
+static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
+                        bool shiftMixRackIOPortWithMoveInScenarioA = false,
+                        bool moveAdjacentMonoPair = false) {
     MovePlan plan;
     char planErr[256];
     if (!buildMovePlan(src, dst, moveAdjacentMonoPair, plan, planErr, sizeof(planErr))) {
@@ -3015,24 +3370,28 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
     bool hadStereoConfigChange = false;
     std::vector<int> monoizedPairs;
     std::vector<int> stereoizedPairs;
+    const char* patchPolicy = movePatchWithChannel ? "move with channel" : "shift by move amount";
+    const char* ioPortPolicy = movePatchWithChannel
+        ? "move with channel"
+        : (shiftMixRackIOPortWithMoveInScenarioA ? "shift by move amount" : "stay with channel");
 
     if (plan.srcStereo) {
-        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (normalized %d+%d → %d+%d, range %d-%d) [patching: %s] ===\n",
+        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (normalized %d+%d → %d+%d, range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
                 src+1, dst+1,
                 plan.srcStart+1, plan.srcStart+2,
                 plan.dstStart+1, plan.dstStart+2,
                 lo+1, hi+1,
-                movePatchWithChannel ? "move with channel" : "shift by move amount");
+                patchPolicy, ioPortPolicy);
     } else if (plan.srcMonoBlock) {
-        fprintf(stderr, "[MC] === MOVE mono block %d+%d → %d+%d (range %d-%d) [patching: %s] ===\n",
+        fprintf(stderr, "[MC] === MOVE mono block %d+%d → %d+%d (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
                 plan.srcStart+1, plan.srcStart+2,
                 plan.dstStart+1, plan.dstStart+2,
                 lo+1, hi+1,
-                movePatchWithChannel ? "move with channel" : "shift by move amount");
+                patchPolicy, ioPortPolicy);
     } else {
-        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s] ===\n",
+        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
                 src+1, dst+1, lo+1, hi+1,
-                movePatchWithChannel ? "move with channel" : "shift by move amount");
+                patchPolicy, ioPortPolicy);
     }
     if (plan.srcStereo) {
         fprintf(stderr, "[MC] Stereo source pair: %d+%d → %d+%d\n",
@@ -3080,33 +3439,63 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
             uint32_t socketNum;
             int srcCh;
             int tgtCh;
+            char sourceLabel;
             PreampData data;
         };
         std::vector<PlannedPreampWrite> plannedWrites;
-        for (auto& [tgtCh, si] : plan.targetMap) {
-            if (!snaps[si].validPatch || !snaps[si].validPreamp) continue;
-            int srcCh = lo + si;
-            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
-            if (!isLocalAnaloguePatch(tgtPatch)) continue;
-
+        auto checkPlannedWrite = [&](uint32_t socketNum, int srcCh, int tgtCh,
+                                     char sourceLabel, const PreampData& data) -> bool {
             for (const auto& planned : plannedWrites) {
-                if (planned.socketNum != tgtPatch.source.number) continue;
-                if (!samePreampData(planned.data, snaps[si].preampData)) {
+                if (planned.socketNum != socketNum) continue;
+                if (!samePreampData(planned.data, data)) {
                     fprintf(stderr,
                             "[MC] ERROR: Scenario A preamp conflict on target socket %u:"
-                            " ch %d -> %d wants gain=%d pad=%d phantom=%d,"
-                            " but ch %d -> %d wants gain=%d pad=%d phantom=%d\n",
-                            tgtPatch.source.number,
-                            planned.srcCh + 1, planned.tgtCh + 1,
+                            " %c ch %d -> %d wants gain=%d pad=%d phantom=%d,"
+                            " but %c ch %d -> %d wants gain=%d pad=%d phantom=%d\n",
+                            socketNum,
+                            planned.sourceLabel, planned.srcCh + 1, planned.tgtCh + 1,
                             planned.data.gain, planned.data.pad, planned.data.phantom,
-                            srcCh + 1, tgtCh + 1,
-                            snaps[si].preampData.gain, snaps[si].preampData.pad, snaps[si].preampData.phantom);
+                            sourceLabel, srcCh + 1, tgtCh + 1,
+                            data.gain, data.pad, data.phantom);
                     for (int i = 0; i < rangeSize; i++) destroySnapshot(snaps[i]);
                     return false;
                 }
             }
 
-            plannedWrites.push_back({tgtPatch.source.number, srcCh, tgtCh, snaps[si].preampData});
+            plannedWrites.push_back({socketNum, srcCh, tgtCh, sourceLabel, data});
+            return true;
+        };
+
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            if (!snaps[si].validPatch || !snaps[si].validPreamp) continue;
+            int srcCh = lo + si;
+            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh,
+                                                          movePatchWithChannel,
+                                                          shiftMixRackIOPortWithMoveInScenarioA);
+            int socketNum = -1;
+            if (!patchDataUsesSocketBackedPreamp(tgtPatch) ||
+                !getAnalogueSocketIndexForAudioSource(tgtPatch.source, socketNum))
+                continue;
+            if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh, 'M', snaps[si].preampData))
+                return false;
+        }
+
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            int srcCh = lo + si;
+            for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
+                const auto& aid = snaps[si].activeInputData[activeInputSource - 1];
+                if (!aid.assigned || !aid.validPreamp) continue;
+                sAudioSource tgtSource =
+                    remapAudioSourceForMove(aid.source, srcCh, tgtCh,
+                                            movePatchWithChannel,
+                                            shiftMixRackIOPortWithMoveInScenarioA);
+                int socketNum = -1;
+                if (!getAnalogueSocketIndexForAudioSource(tgtSource, socketNum)) continue;
+                if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh,
+                                       (char)('A' + activeInputSource - 1), aid.preampData)) {
+                    return false;
+                }
+            }
         }
     }
 
@@ -3346,8 +3735,8 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
     }
 
     phase("Phase: rewrite patching");
-    fprintf(stderr, "[MC] Writing patching (%s)...\n",
-            movePatchWithChannel ? "move sockets with channel" : "shift sockets by move amount");
+    fprintf(stderr, "[MC] Writing patching (%s; MixRack I/O Port: %s)...\n",
+            patchPolicy, ioPortPolicy);
         // Use CSV import path: cChannel::SetInputChannelSource via task system
         // This is what Import CSV uses — full update + UI refresh
         typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
@@ -3363,7 +3752,9 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
         for (auto& [tgtCh, si] : plan.targetMap) {
             if (!snaps[si].validPatch) continue;
             int srcCh = lo + si;
-            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
+            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh,
+                                                          movePatchWithChannel,
+                                                          shiftMixRackIOPortWithMoveInScenarioA);
 
             bool tgtStereo = isChannelStereo(tgtCh);
             if (tgtStereo && (tgtCh & 1)) {
@@ -3406,7 +3797,8 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
                 if (mateSnapIdx >= 0 && snaps[mateSnapIdx].validPatch) {
                     int mateSrcCh = lo + mateSnapIdx;
                     PatchData matePatch = getTargetPatchDataForMove(
-                        snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh, movePatchWithChannel);
+                        snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh,
+                        movePatchWithChannel, shiftMixRackIOPortWithMoveInScenarioA);
                     sAudioSource& mateSrc = matePatch.source;
                     sendPtB = getSendPoint(g_audioSRPManager, mateSrc.type, (uint16_t)mateSrc.number);
                     fprintf(stderr,
@@ -3423,25 +3815,166 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, boo
                 fprintf(stderr, "[MC]   ch=%p sendPt=%p\n", ch, sendPtA);
             }
 
+            fprintf(stderr, "[MC]   Apply patch on ch %d via SetInputChannelSource\n", tgtCh + 1);
             setInputSource(ch, 1, sendPtA, sendPtB);
+            fprintf(stderr, "[MC]   Patch applied on ch %d\n", tgtCh + 1);
+            QApplication::processEvents();
+            usleep(25 * 1000);
+            QApplication::processEvents();
         }
         fprintf(stderr, "[MC]   Patching applied via SetInputChannelSource.\n");
     phase("Phase: restore preamp sockets");
     for (auto& [tgtCh, si] : plan.targetMap) {
         if (!snaps[si].validPreamp || !snaps[si].validPatch) continue;
         int srcCh = lo + si;
-        PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
-        if (!isLocalAnaloguePatch(tgtPatch)) continue;
+        PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh,
+                                                      movePatchWithChannel,
+                                                      shiftMixRackIOPortWithMoveInScenarioA);
+        int socketNum = -1;
+        if (!patchDataUsesSocketBackedPreamp(tgtPatch) ||
+            !getAnalogueSocketIndexForAudioSource(tgtPatch.source, socketNum))
+            continue;
         if (writePreampDataForPatch(tgtPatch, snaps[si].preampData)) {
             fprintf(stderr,
                     "[MC]   Restore preamp for ch %d on socket %u: gain=%d pad=%d phantom=%d\n",
-                    tgtCh + 1, tgtPatch.source.number,
+                    tgtCh + 1, (unsigned)socketNum,
                     snaps[si].preampData.gain, snaps[si].preampData.pad, snaps[si].preampData.phantom);
         } else {
             fprintf(stderr,
                     "[MC]   WARN: preamp restore failed for ch %d on socket %u\n",
-                    tgtCh + 1, tgtPatch.source.number);
+                    tgtCh + 1, (unsigned)socketNum);
         }
+    }
+
+    phase("Phase: restore ABCD source setup");
+    typedef void (*fn_SetActiveInputChannel)(void* channel, uint8_t activeInputSource);
+    auto setActiveInputChannel = (fn_SetActiveInputChannel)RESOLVE(0x1006d7fe0);
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        bool tgtStereo = isChannelStereo(tgtCh);
+        if (tgtStereo && (tgtCh & 1)) {
+            fprintf(stderr,
+                    "[MC]   ABCD ch %d skipped; stereo pair handled by ch %d\n",
+                    tgtCh + 1, tgtCh);
+            continue;
+        }
+
+        void* ch = getChannel ? getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh) : nullptr;
+        if (!ch || !getSendPoint || !setInputSource) {
+            fprintf(stderr, "[MC]   WARN: ABCD restore unavailable for ch %d\n", tgtCh + 1);
+            continue;
+        }
+
+        int srcCh = lo + si;
+        int pairMateCh = tgtCh + 1;
+        int mateSnapIdx = -1;
+        if (tgtStereo) {
+            for (auto& [mappedTgtCh, mappedSi] : plan.targetMap) {
+                if (mappedTgtCh == pairMateCh) {
+                    mateSnapIdx = mappedSi;
+                    break;
+                }
+            }
+        }
+
+        for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
+            const auto& aid = snaps[si].activeInputData[activeInputSource - 1];
+            void* sendPtA = nullptr;
+            void* sendPtB = nullptr;
+            const char slotName = (char)('A' + activeInputSource - 1);
+
+            if (aid.assigned) {
+                sAudioSource tgtSource =
+                    remapAudioSourceForMove(aid.source, srcCh, tgtCh,
+                                            movePatchWithChannel,
+                                            shiftMixRackIOPortWithMoveInScenarioA);
+                sendPtA = getSendPoint(g_audioSRPManager, tgtSource.type, (uint16_t)tgtSource.number);
+                fprintf(stderr,
+                        "[MC]   Restore ABCD-%c ch %d: A={type=%u,num=%u}->%p\n",
+                        slotName, tgtCh + 1,
+                        tgtSource.type, tgtSource.number, sendPtA);
+            } else {
+                sendPtA = getUnassignedInputSendPoint();
+                fprintf(stderr,
+                        "[MC]   Restore ABCD-%c ch %d: A=Unassigned->%p\n",
+                        slotName, tgtCh + 1, sendPtA);
+            }
+
+            if (tgtStereo && mateSnapIdx >= 0) {
+                int mateSrcCh = lo + mateSnapIdx;
+                const auto& mateAid = snaps[mateSnapIdx].activeInputData[activeInputSource - 1];
+                if (mateAid.assigned) {
+                    sAudioSource mateSource =
+                        remapAudioSourceForMove(mateAid.source, mateSrcCh, pairMateCh,
+                                                movePatchWithChannel,
+                                                shiftMixRackIOPortWithMoveInScenarioA);
+                    sendPtB = getSendPoint(g_audioSRPManager, mateSource.type, (uint16_t)mateSource.number);
+                    fprintf(stderr,
+                            "[MC]   Restore ABCD-%c ch %d+%d: B={type=%u,num=%u}->%p\n",
+                            slotName, tgtCh + 1, pairMateCh + 1,
+                            mateSource.type, mateSource.number, sendPtB);
+                } else {
+                    sendPtB = getUnassignedInputSendPoint();
+                    fprintf(stderr,
+                            "[MC]   Restore ABCD-%c ch %d+%d: B=Unassigned->%p\n",
+                            slotName, tgtCh + 1, pairMateCh + 1, sendPtB);
+                }
+            }
+
+            if (!sendPtA || (tgtStereo && mateSnapIdx >= 0 && !sendPtB)) {
+                fprintf(stderr,
+                        "[MC]   WARN: ABCD-%c unresolved send point on ch %d%s; skipping apply\n",
+                        slotName, tgtCh + 1,
+                        (tgtStereo && mateSnapIdx >= 0) ? " stereo pair" : "");
+                continue;
+            }
+
+            fprintf(stderr, "[MC]   Apply ABCD-%c on ch %d via SetInputChannelSource\n",
+                    slotName, tgtCh + 1);
+            setInputSource(ch, activeInputSource, sendPtA, sendPtB);
+            fprintf(stderr, "[MC]   ABCD-%c applied on ch %d\n",
+                    slotName, tgtCh + 1);
+            QApplication::processEvents();
+        }
+    }
+
+    phase("Phase: restore ABCD preamp sockets");
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        int srcCh = lo + si;
+        for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
+            const auto& aid = snaps[si].activeInputData[activeInputSource - 1];
+            if (!aid.assigned || !aid.validPreamp) continue;
+            sAudioSource tgtSource =
+                remapAudioSourceForMove(aid.source, srcCh, tgtCh,
+                                        movePatchWithChannel,
+                                        shiftMixRackIOPortWithMoveInScenarioA);
+            int socketNum = -1;
+            if (!getAnalogueSocketIndexForAudioSource(tgtSource, socketNum)) continue;
+            fprintf(stderr,
+                    "[MC]   ABCD-%c preamp begin ch %d: source={type=%u,num=%u} socket=%u\n",
+                    'A' + activeInputSource - 1, tgtCh + 1,
+                    tgtSource.type, tgtSource.number, (unsigned)socketNum);
+            if (writePreampDataForAudioSource(tgtSource, aid.preampData)) {
+                fprintf(stderr,
+                        "[MC]   Restore ABCD-%c preamp for ch %d on socket %u: gain=%d pad=%d phantom=%d\n",
+                        'A' + activeInputSource - 1, tgtCh + 1, (unsigned)socketNum,
+                        aid.preampData.gain, aid.preampData.pad, aid.preampData.phantom);
+            } else {
+                fprintf(stderr,
+                        "[MC]   WARN: ABCD-%c preamp restore failed for ch %d on socket %u\n",
+                        'A' + activeInputSource - 1, tgtCh + 1, (unsigned)socketNum);
+            }
+        }
+    }
+
+    phase("Phase: restore ABCD selection");
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        void* ch = getChannel ? getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh) : nullptr;
+        if (!ch || !setActiveInputChannel) continue;
+        uint8_t selectedSource = snaps[si].activeInputSource;
+        setActiveInputChannel(ch, selectedSource);
+        fprintf(stderr,
+                "[MC]   Restore ABCD selection ch %d: enabled=%d active=%u\n",
+                tgtCh + 1, snaps[si].abcdEnabled ? 1 : 0, selectedSource);
     }
 
     auto replayDyn8Settings = [&](const char* phaseTag) {
@@ -3950,6 +4483,10 @@ static void showMoveDialog() {
     patchCheck->setChecked(false);
     layout->addWidget(patchCheck);
 
+    auto* ioPortShiftCheck = new QCheckBox("In Scenario A, also shift MixRack I/O Port sockets");
+    ioPortShiftCheck->setChecked(false);
+    layout->addWidget(ioPortShiftCheck);
+
     auto* monoPairCheck = new QCheckBox("Move two adjacent mono channels as one block");
     monoPairCheck->setChecked(false);
     layout->addWidget(monoPairCheck);
@@ -3981,6 +4518,7 @@ static void showMoveDialog() {
         if (!srcSt && srcCh < 127) {
             canUseMonoPair = !isChannelStereo(srcCh + 1);
         }
+        ioPortShiftCheck->setEnabled(!patchCheck->isChecked());
         monoPairCheck->setEnabled(canUseMonoPair);
         if (!canUseMonoPair) monoPairCheck->setChecked(false);
 
@@ -3998,22 +4536,37 @@ static void showMoveDialog() {
                 .arg(plan.dstStart + 1).arg(plan.dstStart + 2);
             if (plan.rawSrc != plan.srcStart || plan.rawDst != plan.dstStart)
                 text += " Selection normalized to the stereo pair boundary.";
-            text += patchCheck->isChecked()
-                ? " Patching/preamp socket will move with the channel."
-                : " Patching/preamp socket will shift by the move amount.";
+            if (patchCheck->isChecked()) {
+                text += " Patching/preamp socket will move with the channel.";
+            } else {
+                text += " Patching/preamp socket will shift by the move amount.";
+                text += ioPortShiftCheck->isChecked()
+                    ? " MixRack I/O Port sockets will also shift by the move amount."
+                    : " MixRack I/O Port sockets will stay with the channel.";
+            }
             moveHintLabel->setText(text);
         } else if (plan.srcMonoBlock) {
             QString text = QString("Two-mono block move: ch %1+%2 will move together to %3+%4.")
                 .arg(plan.srcStart + 1).arg(plan.srcStart + 2)
                 .arg(plan.dstStart + 1).arg(plan.dstStart + 2);
-            text += patchCheck->isChecked()
-                ? " Patching/preamp socket will move with the channel."
-                : " Patching/preamp socket will shift by the move amount.";
+            if (patchCheck->isChecked()) {
+                text += " Patching/preamp socket will move with the channel.";
+            } else {
+                text += " Patching/preamp socket will shift by the move amount.";
+                text += ioPortShiftCheck->isChecked()
+                    ? " MixRack I/O Port sockets will also shift by the move amount."
+                    : " MixRack I/O Port sockets will stay with the channel.";
+            }
             moveHintLabel->setText(text);
         } else {
-            moveHintLabel->setText(patchCheck->isChecked()
-                ? "Mono move: affected range is all mono. Patching/preamp socket will move with the channel."
-                : "Mono move: affected range is all mono. Patching/preamp socket will shift by the move amount.");
+            if (patchCheck->isChecked()) {
+                moveHintLabel->setText(
+                    "Mono move: affected range is all mono. Patching/preamp socket will move with the channel.");
+            } else {
+                moveHintLabel->setText(ioPortShiftCheck->isChecked()
+                    ? "Mono move: affected range is all mono. Patching/preamp socket will shift by the move amount, including MixRack I/O Port sockets."
+                    : "Mono move: affected range is all mono. Patching/preamp socket will shift by the move amount, while MixRack I/O Port sockets stay with the channel.");
+            }
         }
 
         moveBtn->setEnabled(true);
@@ -4023,6 +4576,7 @@ static void showMoveDialog() {
     QObject::connect(dstSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
     QObject::connect(monoPairCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
     QObject::connect(patchCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
+    QObject::connect(ioPortShiftCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
     updateMoveUi();
 
     QObject::connect(closeBtn, &QPushButton::clicked, g_dialog, &QDialog::hide);
@@ -4031,6 +4585,7 @@ static void showMoveDialog() {
         int src = srcSpin->value() - 1;
         int dst = dstSpin->value() - 1;
         bool movePatchWithChannel = patchCheck->isChecked();
+        bool shiftMixRackIOPortWithMoveInScenarioA = ioPortShiftCheck->isChecked();
         bool moveMonoBlock = monoPairCheck->isChecked();
         MovePlan plan;
         char err[256];
@@ -4043,7 +4598,9 @@ static void showMoveDialog() {
         moveBtn->setEnabled(false);
         QApplication::processEvents();
 
-        bool ok = moveChannel(src, dst, movePatchWithChannel, moveMonoBlock);
+        bool ok = moveChannel(src, dst, movePatchWithChannel,
+                              shiftMixRackIOPortWithMoveInScenarioA,
+                              moveMonoBlock);
         statusLabel->setText(ok ? "Done!" : "Failed — check log.");
         updateMoveUi();
     });
@@ -4234,9 +4791,29 @@ static void dumpChannelData(int ch, const char* label) {
         fprintf(stderr, "[MC]      patch: srcType=%d src={type=%d, num=%d}\n",
                 patch.sourceType, patch.source.type, patch.source.number);
         PreampData pd;
-        if (readPreampDataForPatch(patch, pd))
+        int socketNum = -1;
+        if (readPreampDataForPatch(patch, pd) &&
+            getAnalogueSocketIndexForAudioSource(patch.source, socketNum))
             fprintf(stderr, "[MC]      preamp: socket=%u gain=%d pad=%d phantom=%d\n",
-                    patch.source.number, pd.gain, pd.pad, pd.phantom);
+                    (unsigned)socketNum, pd.gain, pd.pad, pd.phantom);
+    }
+
+    ChannelSnapshot abcdSnap;
+    if (snapshotChannel(ch, abcdSnap)) {
+        fprintf(stderr, "[MC]       ABCD: enabled=%d active=%u\n",
+                abcdSnap.abcdEnabled ? 1 : 0, abcdSnap.activeInputSource);
+        for (int i = 0; i < 4; i++) {
+            const auto& aid = abcdSnap.activeInputData[i];
+            if (!aid.assigned) continue;
+            fprintf(stderr, "[MC]   ABCD-%c: type=%u num=%u",
+                    'A' + i, aid.source.type, aid.source.number);
+            if (aid.validPreamp) {
+                fprintf(stderr, " gain=%d pad=%d phantom=%d",
+                        aid.preampData.gain, aid.preampData.pad, aid.preampData.phantom);
+            }
+            fprintf(stderr, "\n");
+        }
+        destroySnapshot(abcdSnap);
     }
 }
 
@@ -4323,7 +4900,7 @@ static void onLoad() {
                 }
 
                 fprintf(stderr, "[MC] Moving ch 1 → ch 4...\n");
-                moveChannel(0, 3, true);
+                moveChannel(0, 3, true, false);
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     // Post-move Dyn8 verification
