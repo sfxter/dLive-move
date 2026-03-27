@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,9 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QList>
+#include <QWidget>
+#include <QWindow>
 
 // =============================================================================
 // Safe memory read
@@ -223,10 +227,14 @@ static void* g_inputMixerWrapper = nullptr;  // cInputMixerWrapper*
 static void* g_channelMapper = nullptr;      // cChannelMapperBase* (for patching)
 static void* g_registryRouter = nullptr;     // gRegistryRouter
 static void* g_channelManager = nullptr;     // cChannelManager* (from cUIManagerHolder)
+static void* g_uiManagerHolder = nullptr;    // cUIManagerHolder* (for current selected channel)
+static void* g_channelSelectorManager = nullptr; // cChannelSelectorManager* (from UIManagerHolder scan)
+static void* g_multifunctionChannelInterface = nullptr; // cMultifunctionChannelInterface* (from UIManagerHolder scan)
 static void* g_audioSRPManager = nullptr;    // cAudioSendReceivePointManager* (from cUIManagerHolder)
 static void* g_dynRack = nullptr;            // cDynamicsRack* (from UIManagerHolder+0x40)
 static void* g_sceneClient = nullptr;       // cSceneManagerIntermediateClient* (from UIManagerHolder scan)
 static void* g_libraryMgrClient = nullptr;  // cLibraryManagerClient* (from UIManagerHolder+0x98)
+static void* g_gangingManager = nullptr;    // cGangingManager* (from UIManagerHolder scan)
 static int g_firstAnalogueInputIdx = -1;     // first cAnalogueInput index in router table
 static int g_firstDynNetObjIdx = -1;         // first cDynamicsNetObject index in router table
 static int g_dynNetObjIndices[256] = {};     // all found cDynamicsNetObject registry indices
@@ -243,6 +251,26 @@ struct sAudioSource { uint32_t type; uint32_t number; };
 struct PatchData {
     uint32_t     sourceType;  // from activeInputChannelSourceType[ch]
     sAudioSource source;      // from the appropriate array
+};
+
+struct GangStripKey {
+    uint32_t stripType = 0;
+    uint8_t channel = 0xFF;
+    uint8_t pad[3] = {0, 0, 0};
+};
+
+struct GangAttributesRaw {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+};
+
+struct GangSnapshot {
+    uint8_t gangNum = 0;
+    uint32_t stripType = 0;
+    std::vector<uint8_t> memberChannels;
+    GangAttributesRaw attrs = {};
+    bool valid = false;
+    bool affected = false;
 };
 
 static void resolveSymbols() {
@@ -529,6 +557,7 @@ static bool findAudioCoreDM() {
         auto getInstance = (fn_Instance)RESOLVE(0x10076d170);
         void* uiHolder = getInstance();
         if (uiHolder) {
+            g_uiManagerHolder = uiHolder;
             safeRead((uint8_t*)uiHolder + 0x78, &g_channelManager, sizeof(g_channelManager));
             safeRead((uint8_t*)uiHolder + 0x20, &g_audioSRPManager, sizeof(g_audioSRPManager));
             fprintf(stderr, "[MC] UIManagerHolder: channelMgr=%p audioSRPMgr=%p\n",
@@ -557,6 +586,58 @@ static bool findAudioCoreDM() {
             // cLibraryManagerClient at UIManagerHolder+0x98 (confirmed from PerformRecall disasm)
             safeRead((uint8_t*)uiHolder + 0x98, &g_libraryMgrClient, sizeof(g_libraryMgrClient));
             fprintf(stderr, "[MC] LibraryManagerClient=%p\n", g_libraryMgrClient);
+
+            // Find cGangingManager by vtable scan
+            uintptr_t gangingMgrVt = (uintptr_t)RESOLVE(0x106ced990) + 0x10; // vtable symbol + 0x10
+            for (int off = 0; off < 0x300; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                if ((uintptr_t)vt == gangingMgrVt) {
+                    g_gangingManager = ptr;
+                    fprintf(stderr, "[MC] GangingManager at UIManagerHolder+0x%x = %p\n", off, ptr);
+                    break;
+                }
+            }
+            if (!g_gangingManager) fprintf(stderr, "[MC] GangingManager not found in UIManagerHolder\n");
+
+            uintptr_t selectorMgrVt = (uintptr_t)RESOLVE(0x106c77ca0) + 0x10;
+            for (int off = 0; off < 0x300; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                if ((uintptr_t)vt == selectorMgrVt) {
+                    g_channelSelectorManager = ptr;
+                    fprintf(stderr, "[MC] ChannelSelectorManager at UIManagerHolder+0x%x = %p\n", off, ptr);
+                    break;
+                }
+            }
+            if (!g_channelSelectorManager)
+                fprintf(stderr, "[MC] ChannelSelectorManager not found in UIManagerHolder\n");
+
+            uintptr_t multiFuncGetSelected = (uintptr_t)RESOLVE(0x1001098470);
+            for (int off = 0; off < 0x300; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                if (!vt) continue;
+                uintptr_t slot0 = 0;
+                safeRead(vt, &slot0, sizeof(slot0));
+                if (slot0 > 0x100000000ULL && llabs((long long)slot0 - (long long)multiFuncGetSelected) < 0x2000000LL) {
+                    g_multifunctionChannelInterface = ptr;
+                    fprintf(stderr, "[MC] MultifunctionChannelInterface candidate at UIManagerHolder+0x%x = %p (slot0=%p)\n",
+                            off, ptr, (void*)slot0);
+                    break;
+                }
+            }
+            if (!g_multifunctionChannelInterface)
+                fprintf(stderr, "[MC] MultifunctionChannelInterface candidate not found in UIManagerHolder\n");
         } else {
             fprintf(stderr, "[MC] UIManagerHolder::Instance() returned null\n");
         }
@@ -1453,12 +1534,20 @@ static bool readPreampDataForSocket(int socketNum, PreampData& pd) {
 
     void* padPtr = nullptr;
     safeRead((uint8_t*)ai + 0xa0, &padPtr, sizeof(padPtr));
-    if (padPtr) safeRead(padPtr, &pd.pad, sizeof(pd.pad));
+    if (padPtr) {
+        uint8_t rawPad = 0;
+        safeRead(padPtr, &rawPad, sizeof(rawPad));
+        pd.pad = rawPad ? 1 : 0;
+    }
     else pd.pad = 0;
 
     void* phantomPtr = nullptr;
     safeRead((uint8_t*)ai + 0xa8, &phantomPtr, sizeof(phantomPtr));
-    if (phantomPtr) safeRead(phantomPtr, &pd.phantom, sizeof(pd.phantom));
+    if (phantomPtr) {
+        uint8_t rawPhantom = 0;
+        safeRead(phantomPtr, &rawPhantom, sizeof(rawPhantom));
+        pd.phantom = rawPhantom ? 1 : 0;
+    }
     else pd.phantom = 0;
 
     return true;
@@ -1472,7 +1561,8 @@ static bool readPreampDataForPatch(const PatchData& pd, PreampData& preamp) {
     return readPreampDataForSocket(socketNum, preamp);
 }
 
-static bool writePreampDataForSocket(int socketNum, const PreampData& pd) {
+static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
+                                     bool directBoolWrites = false) {
     void* ai = getAnalogueInput(socketNum);
     if (!ai) return false;
 
@@ -1490,10 +1580,28 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd) {
             socketNum, ai, pd.gain, pd.pad, pd.phantom);
     midiSetGain(ai, pd.gain);
     fprintf(stderr, "[MC]     Preamp write socket %d: gain applied\n", socketNum);
-    midiSetPad(ai, pd.pad != 0);
-    fprintf(stderr, "[MC]     Preamp write socket %d: pad applied\n", socketNum);
-    midiSetPhantom(ai, pd.phantom != 0);
-    fprintf(stderr, "[MC]     Preamp write socket %d: phantom applied\n", socketNum);
+    if (directBoolWrites) {
+        void* padPtr = nullptr;
+        safeRead((uint8_t*)ai + 0xa0, &padPtr, sizeof(padPtr));
+        if (padPtr) {
+            uint8_t pad = pd.pad ? 1 : 0;
+            safeWrite(padPtr, &pad, sizeof(pad));
+        }
+        fprintf(stderr, "[MC]     Preamp write socket %d: pad applied (direct)\n", socketNum);
+
+        void* phantomPtr = nullptr;
+        safeRead((uint8_t*)ai + 0xa8, &phantomPtr, sizeof(phantomPtr));
+        if (phantomPtr) {
+            uint8_t phantom = pd.phantom ? 1 : 0;
+            safeWrite(phantomPtr, &phantom, sizeof(phantom));
+        }
+        fprintf(stderr, "[MC]     Preamp write socket %d: phantom applied (direct)\n", socketNum);
+    } else {
+        midiSetPad(ai, pd.pad != 0);
+        fprintf(stderr, "[MC]     Preamp write socket %d: pad applied\n", socketNum);
+        midiSetPhantom(ai, pd.phantom != 0);
+        fprintf(stderr, "[MC]     Preamp write socket %d: phantom applied\n", socketNum);
+    }
 
     return true;
 }
@@ -1503,7 +1611,8 @@ static bool writePreampDataForPatch(const PatchData& pd, const PreampData& pream
     if (!patchDataUsesSocketBackedPreamp(pd) ||
         !getAnalogueSocketIndexForAudioSource(pd.source, socketNum))
         return false;
-    return writePreampDataForSocket(socketNum, preamp);
+    bool directBoolWrites = (pd.source.type == 2);
+    return writePreampDataForSocket(socketNum, preamp, directBoolWrites);
 }
 
 static bool isLocalAnalogueSource(const sAudioSource& source) {
@@ -1540,12 +1649,15 @@ static bool audioSourceIsSocketBackedPreamp(const sAudioSource& source) {
 }
 
 static bool patchDataUsesSocketBackedPreamp(const PatchData& pd) {
-    return isLocalAnaloguePatch(pd) || audioSourceIsMixRackIOPortPreamp(pd.source);
+    return audioSourceIsSocketBackedPreamp(pd.source);
 }
 
 static bool audioSourceIsMixRackIOPortPreamp(const sAudioSource& source) {
-    // Observed live mapping: type 5 is the MixRack I/O Port preamp bank.
-    return source.type == kMixRackIOPortAudioSourceType &&
+    // Observed live mappings:
+    //   type 5 -> MixRack I/O Port preamp bank
+    //   type 2 -> MixRack I/O Port preamp bank on the current live scenes
+    // Keep both treated as "stick with channel" by default in Scenario A.
+    return (source.type == kMixRackIOPortAudioSourceType || source.type == 2) &&
            audioSourceIsSocketBackedPreamp(source);
 }
 
@@ -1632,7 +1744,11 @@ static bool readPreampDataForAudioSource(const sAudioSource& source, PreampData&
 static bool writePreampDataForAudioSource(const sAudioSource& source, const PreampData& preamp) {
     int socketNum = -1;
     if (!getAnalogueSocketIndexForAudioSource(source, socketNum)) return false;
-    return writePreampDataForSocket(socketNum, preamp);
+    // Observed live issue: type-2 socket-backed sources can hang in
+    // cAnalogueInput::MIDISetPhantomPower offline even though gain writes succeed.
+    // Use direct boolean writes for pad/phantom on that bank to keep moves stable.
+    bool directBoolWrites = (source.type == 2);
+    return writePreampDataForSocket(socketNum, preamp, directBoolWrites);
 }
 
 static void* getManagedInputChannel(int ch) {
@@ -1844,6 +1960,66 @@ static void waitForStereoConfigReset() {
     QApplication::processEvents();
     usleep(500 * 1000);
     QApplication::processEvents();
+}
+
+static bool readSidechainRef(void* obj, uint8_t& stripType, uint8_t& channel) {
+    if (!obj) return false;
+    void* pStripType = nullptr;
+    void* pChannel   = nullptr;
+    safeRead((uint8_t*)obj + 0x138, &pStripType, sizeof(pStripType));
+    safeRead((uint8_t*)obj + 0x140, &pChannel, sizeof(pChannel));
+    if (!pStripType || !pChannel) return false;
+
+    uint32_t st32 = 0;
+    if (!safeRead((uint8_t*)pStripType, &st32, sizeof(st32))) return false;
+    if (!safeRead((uint8_t*)pChannel, &channel, sizeof(channel))) return false;
+    stripType = (uint8_t)st32;
+    return true;
+}
+
+static void writeSidechainRef(void* obj, int procIdx, int ch,
+                              uint8_t wantStripType, uint8_t wantChannel,
+                              const char* phaseTag = nullptr) {
+    if (!obj) return;
+
+    typedef void (*fn_InformOtherObjects)(void* obj, const void* msg);
+    auto informOthers = (fn_InformOtherObjects)RESOLVE(0x1000eb020);
+
+    void* pStripType = nullptr;
+    void* pChannel   = nullptr;
+    safeRead((uint8_t*)obj + 0x138, &pStripType, sizeof(pStripType));
+    safeRead((uint8_t*)obj + 0x140, &pChannel, sizeof(pChannel));
+    if (pStripType && pChannel) {
+        uint32_t st32 = wantStripType;
+        safeWrite((uint8_t*)pStripType, &st32, sizeof(st32));
+        safeWrite((uint8_t*)pChannel, &wantChannel, sizeof(wantChannel));
+        safeWrite((uint8_t*)obj + 0x168, &st32, sizeof(st32));
+        safeWrite((uint8_t*)obj + 0x16c, &wantChannel, sizeof(wantChannel));
+    }
+
+    void* embMsg = (uint8_t*)obj + 0x60;
+    uint16_t hdr10 = 0xFFFF;
+    uint32_t hdr14 = 0xFFFFFFFF;
+    uint32_t hdr1c = 0x1000;
+    safeWrite((uint8_t*)obj + 0x70, &hdr10, 2);
+    safeWrite((uint8_t*)obj + 0x74, &hdr14, 4);
+    safeWrite((uint8_t*)obj + 0x7c, &hdr1c, 4);
+
+    typedef void (*fn_SetLength)(void*, uint32_t);
+    auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
+    typedef void (*fn_SetUBYTE)(void*, uint8_t, uint32_t);
+    auto setUByte = (fn_SetUBYTE)RESOLVE(0x1000ebde0);
+    setLen(embMsg, 2);
+    setUByte(embMsg, wantStripType, 0);
+    setUByte(embMsg, wantChannel, 1);
+
+    uint8_t one = 1;
+    safeWrite((uint8_t*)obj + 0x174, &one, 1);
+
+    fprintf(stderr, "[MC]   %s%s on ch %d: stripType=%d channel=%d\n",
+            phaseTag ? phaseTag : "",
+            g_procB[procIdx].name, ch + 1, wantStripType, wantChannel);
+    if (informOthers) informOthers(obj, embMsg);
 }
 
 static void writeTypeBFields(void* obj, const ProcDescB& desc, const uint8_t* buf) {
@@ -2201,12 +2377,7 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
     // Type A: DirectlyRecallStatus + ReportData
     recallTypeAForChannel(ch, snap);
 
-    // Type B: write directly to object fields + call Refresh if available
-    // For sidechain objects (p==6,7), bypass SetStatus (which calls RefreshSource that
-    // validates via ChannelMapper and resets values). Instead: write raw fields, update
-    // old-value cache (0x168/0x16c), and call InformOtherObjects for UI notification.
-    typedef void (*fn_InformOtherObjects)(void* obj, const void* msg);
-    auto informOthers = (fn_InformOtherObjects)RESOLVE(0x1000eb020);
+    // Type B: write directly to object fields + call Refresh if available.
 
     for (int p = 0; p < NUM_PROC_B; p++) {
         if (!snap.validB[p]) continue;
@@ -2224,53 +2395,7 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
         if (p == 5 || p == 6) {
             uint8_t wantStripType = snap.dataB[p].buf[1];
             uint8_t wantChannel   = snap.dataB[p].buf[2];
-
-            // Write via pointer deref: *(obj+0x138) = stripType, *(obj+0x140) = channel
-            void* pStripType = nullptr;
-            void* pChannel   = nullptr;
-            safeRead((uint8_t*)obj + 0x138, &pStripType, sizeof(pStripType));
-            safeRead((uint8_t*)obj + 0x140, &pChannel,   sizeof(pChannel));
-            if (pStripType && pChannel) {
-                uint32_t st32 = wantStripType;
-                safeWrite((uint8_t*)pStripType, &st32, sizeof(st32));
-                safeWrite((uint8_t*)pChannel,   &wantChannel, sizeof(wantChannel));
-                // Update "old value" cache so RefreshSource won't see a diff and reset
-                safeWrite((uint8_t*)obj + 0x168, &st32, sizeof(st32));
-                safeWrite((uint8_t*)obj + 0x16c, &wantChannel, sizeof(wantChannel));
-            }
-
-            // Use the EMBEDDED cAHNetMessage at obj+0x60 (same as SetStatus does)
-            void* embMsg = (uint8_t*)obj + 0x60;
-
-            // Set header fields exactly like SetStatus at 0x1002e5700-0x1002e570f:
-            //   obj+0x70 = 0xFFFF  (embMsg+0x10)
-            //   obj+0x74 = 0xFFFFFFFF (embMsg+0x14)
-            //   obj+0x7c = 0x1000 (embMsg+0x1c = objectId for change notification)
-            uint16_t hdr10 = 0xFFFF;
-            uint32_t hdr14 = 0xFFFFFFFF;
-            uint32_t hdr1c = 0x1000;
-            safeWrite((uint8_t*)obj + 0x70, &hdr10, 2);
-            safeWrite((uint8_t*)obj + 0x74, &hdr14, 4);
-            safeWrite((uint8_t*)obj + 0x7c, &hdr1c, 4);
-
-            // SetLength(embMsg, 2) — 2 data bytes
-            typedef void (*fn_SetLength)(void*, uint32_t);
-            auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
-            setLen(embMsg, 2);
-
-            // Set data: [0]=stripType, [1]=channel
-            typedef void (*fn_SetUBYTE)(void*, uint8_t, uint32_t);
-            auto setUByte = (fn_SetUBYTE)RESOLVE(0x1000ebde0);
-            setUByte(embMsg, wantStripType, 0);
-            setUByte(embMsg, wantChannel, 1);
-
-            // Set dirty flag
-            uint8_t one = 1;
-            safeWrite((uint8_t*)obj + 0x174, &one, 1);
-
-            fprintf(stderr, "[MC]   SC-Write %s on ch %d: stripType=%d channel=%d\n",
-                    g_procB[p].name, ch+1, wantStripType, wantChannel);
-            informOthers(obj, embMsg);
+            writeSidechainRef(obj, p, ch, wantStripType, wantChannel, "SC-Write ");
             continue;
         }
 
@@ -2400,9 +2525,15 @@ struct MovePlan {
 static void* getMsgDataPtr(uint8_t* msg);
 static uint32_t getMsgLength(uint8_t* msg);
 static void dumpChannelData(int ch, const char* label);
-static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
+static bool buildMovePlan(int src, int dst, int requestedBlockSize,
                           MovePlan& plan, char* errBuf, size_t errBufLen);
+static int remapChannelIndex(const MovePlan& plan, int ch);
 static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan);
+static bool readGangSnapshot(uint8_t gangNum, GangSnapshot& snap);
+static bool gangSnapshotAffectsMove(const GangSnapshot& snap, const MovePlan& plan);
+static void clearGangMembershipHighLevel(const GangSnapshot& snap, const char* phaseTag);
+static void restoreGangMembershipHighLevel(const GangSnapshot& snap, const MovePlan* plan,
+                                           const char* phaseTag);
 static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
                                        bool shiftMixRackIOPortWithMoveInScenarioA);
 static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
@@ -2410,7 +2541,7 @@ static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int t
                                            bool shiftMixRackIOPortWithMoveInScenarioA);
 static bool moveChannel(int src, int dst, bool movePatchWithChannel,
                         bool shiftMixRackIOPortWithMoveInScenarioA,
-                        bool moveAdjacentMonoPair);
+                        int requestedBlockSize);
 static bool isInsertStatusProc(int procIdx) {
     return procIdx == 3 || procIdx == 4;
 }
@@ -2987,10 +3118,21 @@ static bool compareSnapshotsForMove(const ChannelSnapshot& expected, const Chann
         if (expected.validPatch != actual.validPatch) {
             fprintf(stderr, "[MC][VERIFY] ch %d patch presence mismatch\n", ch+1);
             ok = false;
-        } else if (expected.validPatch &&
-                   memcmp(&expected.patchData, &actual.patchData, sizeof(PatchData)) != 0) {
-            fprintf(stderr, "[MC][VERIFY] ch %d patch mismatch\n", ch+1);
-            ok = false;
+        } else if (expected.validPatch) {
+            if (expected.patchData.sourceType != actual.patchData.sourceType ||
+                expected.patchData.source.type != actual.patchData.source.type ||
+                expected.patchData.source.number != actual.patchData.source.number) {
+                fprintf(stderr,
+                        "[MC][VERIFY] ch %d patch mismatch exp={srcType=%u type=%u num=%u} got={srcType=%u type=%u num=%u}\n",
+                        ch + 1,
+                        expected.patchData.sourceType,
+                        expected.patchData.source.type,
+                        expected.patchData.source.number,
+                        actual.patchData.sourceType,
+                        actual.patchData.source.type,
+                        actual.patchData.source.number);
+                ok = false;
+            }
         }
     }
 
@@ -3117,7 +3259,12 @@ static bool runAutomatedMoveTest() {
 
     MovePlan plan;
     char err[256];
-    if (!buildMovePlan(src, dst, moveMonoBlock, plan, err, sizeof(err))) {
+    int requestedBlockSize = moveMonoBlock ? 2 : 1;
+    if (const char* blockEnv = getenv("MC_AUTOTEST_BLOCK_SIZE")) {
+        int parsed = atoi(blockEnv);
+        if (parsed > 0) requestedBlockSize = parsed;
+    }
+    if (!buildMovePlan(src, dst, requestedBlockSize, plan, err, sizeof(err))) {
         fprintf(stderr, "[MC][AUTOTEST] invalid test plan: %s\n", err[0] ? err : "unknown");
         return false;
     }
@@ -3169,7 +3316,7 @@ static bool runAutomatedMoveTest() {
     }
     bool moved = moveChannel(src, dst, movePatchWithChannel,
                              shiftMixRackIOPortWithMoveInScenarioA,
-                             moveMonoBlock);
+                             requestedBlockSize);
     bool ok = moved;
     if (moved) {
         for (auto& [tgtCh, snapIdx] : plan.targetMap) {
@@ -3192,7 +3339,7 @@ static bool runAutomatedMoveTest() {
     return ok;
 }
 
-static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
+static bool buildMovePlan(int src, int dst, int requestedBlockSize,
                           MovePlan& plan, char* errBuf = nullptr, size_t errBufLen = 0) {
     plan = MovePlan();
     plan.rawSrc = src;
@@ -3207,31 +3354,31 @@ static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
         setErr("invalid channel number");
         return false;
     }
+    if (requestedBlockSize < 1 || requestedBlockSize > 128) {
+        setErr("invalid block size");
+        return false;
+    }
 
     plan.srcStereo = isChannelStereo(src);
-    if (plan.srcStereo) {
+    if (requestedBlockSize == 1 && plan.srcStereo) {
         plan.blockSize = 2;
         plan.srcStart = src & ~1;
         plan.dstStart = dst & ~1;
-    } else if (moveAdjacentMonoPair) {
-        if (src >= 127) {
-            setErr("two-channel mono move needs a following channel");
-            return false;
-        }
-        if (isChannelStereo(src + 1)) {
-            setErr("source channels %d+%d are not two independent mono channels", src + 1, src + 2);
-            return false;
-        }
-        plan.blockSize = 2;
-        plan.srcStart = src;
-        plan.dstStart = dst;
-        plan.srcMonoBlock = true;
     } else {
-        plan.blockSize = 1;
+        plan.srcStereo = false;
+        plan.blockSize = requestedBlockSize;
         plan.srcStart = src;
         plan.dstStart = dst;
+        if (requestedBlockSize == 2 && src < 127 &&
+            !isChannelStereo(src) && !isChannelStereo(src + 1)) {
+            plan.srcMonoBlock = true;
+        }
     }
 
+    if (plan.srcStart + plan.blockSize - 1 > 127) {
+        setErr("source block would exceed channel 128");
+        return false;
+    }
     if (plan.dstStart < 0 || plan.dstStart + plan.blockSize - 1 > 127) {
         setErr("destination would exceed channel 128");
         return false;
@@ -3249,25 +3396,6 @@ static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
     } else {
         plan.lo = plan.dstStart;
         plan.hi = plan.srcStart + plan.blockSize - 1;
-    }
-
-    if (plan.blockSize == 1) {
-        for (int pairStart = (plan.lo & ~1); pairStart <= plan.hi; pairStart += 2) {
-            if (pairStart < 0 || pairStart + 1 > 127) continue;
-            if (!isChannelStereo(pairStart)) continue;
-            setErr("mono move crosses stereo pair %d+%d", pairStart + 1, pairStart + 2);
-            return false;
-        }
-    } else if (plan.srcMonoBlock) {
-        if ((plan.dstStart & 1) != 0 && isChannelStereo(plan.dstStart - 1)) {
-            if (errBuf && errBufLen) {
-                snprintf(errBuf, errBufLen,
-                         "destination %d+%d would split stereo pair %d+%d",
-                         plan.dstStart + 1, plan.dstStart + 2,
-                         plan.dstStart, plan.dstStart + 1);
-            }
-            return false;
-        }
     }
 
     if (plan.srcStart < plan.dstStart) {
@@ -3288,27 +3416,142 @@ static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
         }
     }
 
+    for (int pairStart = 0; pairStart < 128; pairStart += 2) {
+        if (!isChannelStereo(pairStart)) continue;
+        int leftDst = remapChannelIndex(plan, pairStart);
+        int rightDst = remapChannelIndex(plan, pairStart + 1);
+        if (leftDst < 0 || rightDst < 0 || rightDst != leftDst + 1 || (leftDst & 1) != 0) {
+            setErr("move would split stereo pair %d+%d", pairStart + 1, pairStart + 2);
+            return false;
+        }
+    }
+
     return true;
 }
 
-static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan) {
+static int remapChannelIndex(const MovePlan& plan, int ch) {
     int srcLo = plan.srcStart;
     int srcHi = plan.srcStart + plan.blockSize - 1;
     int dstLo = plan.dstStart;
     int dstHi = plan.dstStart + plan.blockSize - 1;
 
-    if (oldRef >= srcLo && oldRef <= srcHi)
-        return (uint8_t)(dstLo + (oldRef - srcLo));
+    if (ch < 0 || ch > 127) return -1;
+    if (ch >= srcLo && ch <= srcHi)
+        return dstLo + (ch - srcLo);
 
     if (srcLo < dstLo) {
-        if (oldRef > srcHi && oldRef <= dstHi)
-            return (uint8_t)(oldRef - plan.blockSize);
-    } else {
-        if (oldRef >= dstLo && oldRef < srcLo)
-            return (uint8_t)(oldRef + plan.blockSize);
+        if (ch > srcHi && ch <= dstHi)
+            return ch - plan.blockSize;
+    } else if (srcLo > dstLo) {
+        if (ch >= dstLo && ch < srcLo)
+            return ch + plan.blockSize;
     }
 
-    return oldRef;
+    return ch;
+}
+
+static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan) {
+    int remapped = remapChannelIndex(plan, (int)oldRef);
+    return remapped >= 0 ? (uint8_t)remapped : oldRef;
+}
+
+static GangStripKey makeGangStripKey(uint32_t stripType, uint8_t ch) {
+    GangStripKey key;
+    key.stripType = stripType;
+    key.channel = ch;
+    return key;
+}
+
+static bool readGangSnapshot(uint8_t gangNum, GangSnapshot& snap) {
+    snap = {};
+    snap.gangNum = gangNum;
+    if (!g_gangingManager) return false;
+
+    typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    if (!getGangDriver) return false;
+
+    void* driver = getGangDriver(g_gangingManager, gangNum);
+    if (!driver) return false;
+
+    snap.valid = true;
+    safeRead((uint8_t*)driver + 0x94, &snap.stripType, sizeof(snap.stripType));
+    safeRead((uint8_t*)driver + 0xA8, &snap.attrs, sizeof(snap.attrs));
+
+    uint8_t members[16];
+    memset(members, 0xFF, sizeof(members));
+    safeRead((uint8_t*)driver + 0x98, members, sizeof(members));
+    for (uint8_t member : members) {
+        if (member == 0xFF) continue;
+        snap.memberChannels.push_back(member);
+    }
+    return true;
+}
+
+static bool gangSnapshotAffectsMove(const GangSnapshot& snap, const MovePlan& plan) {
+    if (!snap.valid || snap.stripType != 1) return false;
+    for (uint8_t ch : snap.memberChannels) {
+        if (ch >= plan.lo && ch <= plan.hi)
+            return true;
+    }
+    return false;
+}
+
+static QList<GangStripKey> buildGangMemberList(const GangSnapshot& snap, const MovePlan* plan) {
+    QList<GangStripKey> out;
+    std::set<uint8_t> seen;
+    for (uint8_t memberCh : snap.memberChannels) {
+        uint8_t mappedCh = plan ? remapMovedChannelRef(memberCh, *plan) : memberCh;
+        if (!seen.insert(mappedCh).second)
+            continue;
+        out.append(makeGangStripKey(snap.stripType, mappedCh));
+    }
+    return out;
+}
+
+static void clearGangMembershipHighLevel(const GangSnapshot& snap, const char* phaseTag) {
+    if (!snap.valid || snap.memberChannels.empty() || !g_gangingManager) return;
+
+    typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
+    typedef void (*fn_SetGangMembersAndInform)(void* driver, const QList<GangStripKey>& members);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto setGangMembersAndInform = (fn_SetGangMembersAndInform)RESOLVE(0x1008f97f0);
+    if (!getGangDriver || !setGangMembersAndInform) return;
+
+    void* driver = getGangDriver(g_gangingManager, snap.gangNum);
+    if (!driver) return;
+
+    QList<GangStripKey> emptyMembers;
+    fprintf(stderr,
+            "[MC]   [%s] Clear input gang %d (%zu members)\n",
+            phaseTag, snap.gangNum + 1, snap.memberChannels.size());
+    setGangMembersAndInform(driver, emptyMembers);
+    QApplication::processEvents();
+}
+
+static void restoreGangMembershipHighLevel(const GangSnapshot& snap, const MovePlan* plan,
+                                           const char* phaseTag) {
+    if (!snap.valid || !g_gangingManager) return;
+
+    typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
+    typedef void (*fn_SetGangMembersAndInform)(void* driver, const QList<GangStripKey>& members);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto setGangMembersAndInform = (fn_SetGangMembersAndInform)RESOLVE(0x1008f97f0);
+    if (!getGangDriver || !setGangMembersAndInform) return;
+
+    void* driver = getGangDriver(g_gangingManager, snap.gangNum);
+    if (!driver) return;
+
+    QList<GangStripKey> remappedMembers = buildGangMemberList(snap, plan);
+    fprintf(stderr,
+            "[MC]   [%s] Restore input gang %d (%d members)\n",
+            phaseTag, snap.gangNum + 1, remappedMembers.size());
+    for (const auto& key : remappedMembers) {
+        fprintf(stderr, "[MC]     gang %d member ch %d\n",
+                snap.gangNum + 1, (int)key.channel + 1);
+    }
+    setGangMembersAndInform(driver, remappedMembers);
+    QApplication::processEvents();
 }
 
 static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
@@ -3351,10 +3594,10 @@ static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int t
 // =============================================================================
 static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                         bool shiftMixRackIOPortWithMoveInScenarioA = false,
-                        bool moveAdjacentMonoPair = false) {
+                        int requestedBlockSize = 1) {
     MovePlan plan;
     char planErr[256];
-    if (!buildMovePlan(src, dst, moveAdjacentMonoPair, plan, planErr, sizeof(planErr))) {
+    if (!buildMovePlan(src, dst, requestedBlockSize, plan, planErr, sizeof(planErr))) {
         fprintf(stderr, "[MC] Unsupported move: %s\n", planErr[0] ? planErr : "unknown error");
         return false;
     }
@@ -3370,6 +3613,14 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
     bool hadStereoConfigChange = false;
     std::vector<int> monoizedPairs;
     std::vector<int> stereoizedPairs;
+    struct ExternalSidechainRemap {
+        int ch;
+        int procIdx;
+        uint8_t stripType;
+        uint8_t oldChannel;
+        uint8_t newChannel;
+    };
+    std::vector<ExternalSidechainRemap> externalSidechainRemaps;
     const char* patchPolicy = movePatchWithChannel ? "move with channel" : "shift by move amount";
     const char* ioPortPolicy = movePatchWithChannel
         ? "move with channel"
@@ -3388,6 +3639,12 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                 plan.dstStart+1, plan.dstStart+2,
                 lo+1, hi+1,
                 patchPolicy, ioPortPolicy);
+    } else if (plan.blockSize > 1) {
+        fprintf(stderr, "[MC] === MOVE block %d-%d → %d-%d (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
+                plan.srcStart+1, plan.srcStart+plan.blockSize,
+                plan.dstStart+1, plan.dstStart+plan.blockSize,
+                lo+1, hi+1,
+                patchPolicy, ioPortPolicy);
     } else {
         fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
                 src+1, dst+1, lo+1, hi+1,
@@ -3404,6 +3661,31 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                 (unsigned long long)(monotonicMs() - moveStartMs), label);
     };
 
+    std::vector<GangSnapshot> affectedGangSnaps;
+    if (g_gangingManager) {
+        phase("Phase: snapshot input ganging");
+        for (uint8_t gangNum = 0; gangNum < 16; gangNum++) {
+            GangSnapshot gangSnap;
+            if (!readGangSnapshot(gangNum, gangSnap))
+                continue;
+            gangSnap.affected = gangSnapshotAffectsMove(gangSnap, plan);
+            if (!gangSnap.affected)
+                continue;
+            fprintf(stderr,
+                    "[MC]   Input gang %d snapshot: stripType=%u members=%zu\n",
+                    gangNum + 1, gangSnap.stripType, gangSnap.memberChannels.size());
+            affectedGangSnaps.push_back(gangSnap);
+        }
+    } else {
+        fprintf(stderr, "[MC] GangingManager unavailable; skipping gang snapshot/restore.\n");
+    }
+    auto restoreAffectedGangs = [&](const char* phaseTag, bool remapToMovedChannels) {
+        if (affectedGangSnaps.empty()) return;
+        phase(phaseTag);
+        for (const auto& gangSnap : affectedGangSnaps)
+            restoreGangMembershipHighLevel(gangSnap, remapToMovedChannels ? &plan : nullptr, phaseTag);
+    };
+
     // Snapshot all channels in range
     phase("Phase: snapshot move range");
     std::vector<ChannelSnapshot> snaps(rangeSize);
@@ -3413,7 +3695,29 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                 g_getChannelName(g_audioDM, 1, (uint8_t)ch));
         if (!snapshotChannel(ch, snaps[i])) {
             for (int j = 0; j < i; j++) destroySnapshot(snaps[j]);
+            restoreAffectedGangs("Phase: restore input ganging after abort", false);
             return false;
+        }
+    }
+
+    phase("Phase: plan external sidechain updates");
+    for (int ch = 0; ch < 128; ch++) {
+        if (ch >= lo && ch <= hi) continue;
+        void* inputCh = getInputChannel(ch);
+        if (!inputCh) continue;
+        for (int p = 5; p <= 6; p++) {
+            void* obj = getTypeBObj(inputCh, g_procB[p]);
+            if (!obj) continue;
+            uint8_t stripType = 0;
+            uint8_t oldChannel = 0;
+            if (!readSidechainRef(obj, stripType, oldChannel)) continue;
+            if (stripType != 1) continue;
+            uint8_t newChannel = remapMovedChannelRef(oldChannel, plan);
+            if (newChannel == oldChannel) continue;
+            fprintf(stderr,
+                    "[MC]   Plan external %s on ch %d: channel %d -> %d\n",
+                    g_procB[p].name, ch + 1, oldChannel, newChannel);
+            externalSidechainRemaps.push_back({ch, p, stripType, oldChannel, newChannel});
         }
     }
 
@@ -3458,6 +3762,7 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                             sourceLabel, srcCh + 1, tgtCh + 1,
                             data.gain, data.pad, data.phantom);
                     for (int i = 0; i < rangeSize; i++) destroySnapshot(snaps[i]);
+                    restoreAffectedGangs("Phase: restore input ganging after abort", false);
                     return false;
                 }
             }
@@ -3476,12 +3781,15 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
             if (!patchDataUsesSocketBackedPreamp(tgtPatch) ||
                 !getAnalogueSocketIndexForAudioSource(tgtPatch.source, socketNum))
                 continue;
-            if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh, 'M', snaps[si].preampData))
+            if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh, 'M', snaps[si].preampData)) {
+                restoreAffectedGangs("Phase: restore input ganging after abort", false);
                 return false;
+            }
         }
 
         for (auto& [tgtCh, si] : plan.targetMap) {
             int srcCh = lo + si;
+            if (!snaps[si].abcdEnabled) continue;
             for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
                 const auto& aid = snaps[si].activeInputData[activeInputSource - 1];
                 if (!aid.assigned || !aid.validPreamp) continue;
@@ -3493,6 +3801,7 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                 if (!getAnalogueSocketIndexForAudioSource(tgtSource, socketNum)) continue;
                 if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh,
                                        (char)('A' + activeInputSource - 1), aid.preampData)) {
+                    restoreAffectedGangs("Phase: restore input ganging after abort", false);
                     return false;
                 }
             }
@@ -3940,6 +4249,7 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
     phase("Phase: restore ABCD preamp sockets");
     for (auto& [tgtCh, si] : plan.targetMap) {
         int srcCh = lo + si;
+        if (!snaps[si].abcdEnabled) continue;
         for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
             const auto& aid = snaps[si].activeInputData[activeInputSource - 1];
             if (!aid.assigned || !aid.validPreamp) continue;
@@ -4381,6 +4691,27 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
         }
     }
 
+    if (!externalSidechainRemaps.empty()) {
+        phase("Phase: update external sidechain references");
+        std::vector<int> refreshedChannels;
+        for (const auto& fix : externalSidechainRemaps) {
+            void* inputCh = getInputChannel(fix.ch);
+            if (!inputCh) continue;
+            void* obj = getTypeBObj(inputCh, g_procB[fix.procIdx]);
+            if (!obj) continue;
+            writeSidechainRef(obj, fix.procIdx, fix.ch, fix.stripType, fix.newChannel,
+                              "External SC-Write ");
+            if (std::find(refreshedChannels.begin(), refreshedChannels.end(), fix.ch) == refreshedChannels.end())
+                refreshedChannels.push_back(fix.ch);
+        }
+        for (int ch : refreshedChannels) {
+            refreshSideChainStateForChannel(ch, "post-external-sidechain-refresh");
+            QApplication::processEvents();
+        }
+    }
+
+    restoreAffectedGangs("Phase: restore input ganging", true);
+
     for (int i = 0; i < rangeSize; i++) destroySnapshot(snaps[i]);
 
     if (!dyn8LibraryRecalls.empty()) {
@@ -4436,6 +4767,16 @@ static void dumpChannelData(int ch, const char* label);
 // UI Dialog
 // =============================================================================
 static QDialog* g_dialog = nullptr;
+static id g_moveShortcutMonitor = nil;
+struct CopyPasteBuffer {
+    bool valid = false;
+    bool stereo = false;
+    int blockSize = 0;
+    int srcStart = -1;
+    ChannelSnapshot snaps[2];
+};
+static CopyPasteBuffer g_copyBuffer;
+static bool shouldCaptureCopyPasteShortcut();
 
 static void showMoveDialog() {
     if (g_dialog) { g_dialog->show(); g_dialog->raise(); g_dialog->activateWindow(); return; }
@@ -4487,9 +4828,15 @@ static void showMoveDialog() {
     ioPortShiftCheck->setChecked(false);
     layout->addWidget(ioPortShiftCheck);
 
-    auto* monoPairCheck = new QCheckBox("Move two adjacent mono channels as one block");
-    monoPairCheck->setChecked(false);
-    layout->addWidget(monoPairCheck);
+    auto* blockRow = new QHBoxLayout();
+    auto* blockLabel = new QLabel("Block Size:");
+    auto* blockSizeSpin = new QSpinBox();
+    blockSizeSpin->setRange(1, 128);
+    blockSizeSpin->setValue(1);
+    blockRow->addWidget(blockLabel);
+    blockRow->addWidget(blockSizeSpin);
+    blockRow->addStretch(1);
+    layout->addLayout(blockRow);
 
     auto* moveHintLabel = new QLabel();
     moveHintLabel->setWordWrap(true);
@@ -4514,17 +4861,11 @@ static void showMoveDialog() {
         int srcCh = srcSpin->value() - 1;
         int dstCh = dstSpin->value() - 1;
         bool srcSt = isChannelStereo(srcCh);
-        bool canUseMonoPair = false;
-        if (!srcSt && srcCh < 127) {
-            canUseMonoPair = !isChannelStereo(srcCh + 1);
-        }
         ioPortShiftCheck->setEnabled(!patchCheck->isChecked());
-        monoPairCheck->setEnabled(canUseMonoPair);
-        if (!canUseMonoPair) monoPairCheck->setChecked(false);
 
         MovePlan plan;
         char err[256];
-        if (!buildMovePlan(srcCh, dstCh, monoPairCheck->isChecked(), plan, err, sizeof(err))) {
+        if (!buildMovePlan(srcCh, dstCh, blockSizeSpin->value(), plan, err, sizeof(err))) {
             moveHintLabel->setText(QString("Unsupported right now: %1.").arg(err));
             moveBtn->setEnabled(false);
             return;
@@ -4558,6 +4899,20 @@ static void showMoveDialog() {
                     : " MixRack I/O Port sockets will stay with the channel.";
             }
             moveHintLabel->setText(text);
+        } else if (plan.blockSize > 1) {
+            QString text = QString("Block move: ch %1-%2 will move together to %3-%4.")
+                .arg(plan.srcStart + 1).arg(plan.srcStart + plan.blockSize)
+                .arg(plan.dstStart + 1).arg(plan.dstStart + plan.blockSize);
+            text += " The move will be blocked if it would split any stereo pair.";
+            if (patchCheck->isChecked()) {
+                text += " Patching/preamp socket will move with the channel.";
+            } else {
+                text += " Patching/preamp socket will shift by the move amount.";
+                text += ioPortShiftCheck->isChecked()
+                    ? " MixRack I/O Port sockets will also shift by the move amount."
+                    : " MixRack I/O Port sockets will stay with the channel.";
+            }
+            moveHintLabel->setText(text);
         } else {
             if (patchCheck->isChecked()) {
                 moveHintLabel->setText(
@@ -4574,7 +4929,7 @@ static void showMoveDialog() {
 
     QObject::connect(srcSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
     QObject::connect(dstSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
-    QObject::connect(monoPairCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
+    QObject::connect(blockSizeSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
     QObject::connect(patchCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
     QObject::connect(ioPortShiftCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
     updateMoveUi();
@@ -4586,10 +4941,10 @@ static void showMoveDialog() {
         int dst = dstSpin->value() - 1;
         bool movePatchWithChannel = patchCheck->isChecked();
         bool shiftMixRackIOPortWithMoveInScenarioA = ioPortShiftCheck->isChecked();
-        bool moveMonoBlock = monoPairCheck->isChecked();
+        int requestedBlockSize = blockSizeSpin->value();
         MovePlan plan;
         char err[256];
-        if (!buildMovePlan(src, dst, moveMonoBlock, plan, err, sizeof(err))) {
+        if (!buildMovePlan(src, dst, requestedBlockSize, plan, err, sizeof(err))) {
             statusLabel->setText(QString("Unsupported: %1.").arg(err));
             moveBtn->setEnabled(false);
             return;
@@ -4600,7 +4955,7 @@ static void showMoveDialog() {
 
         bool ok = moveChannel(src, dst, movePatchWithChannel,
                               shiftMixRackIOPortWithMoveInScenarioA,
-                              moveMonoBlock);
+                              requestedBlockSize);
         statusLabel->setText(ok ? "Done!" : "Failed — check log.");
         updateMoveUi();
     });
@@ -4667,6 +5022,276 @@ static void showMoveDialog() {
     g_dialog->show();
 }
 
+static int getSelectedInputChannel(bool verbose = false) {
+    auto probeUIHolder = [&](const char* tag, void* holder) -> int {
+        if (!holder) return -1;
+        void* selectedChannel = nullptr;
+        if (!safeRead((uint8_t*)holder + 0x50, &selectedChannel, sizeof(selectedChannel)) ||
+            !selectedChannel || (uintptr_t)selectedChannel < 0x100000000ULL) {
+            if (verbose) fprintf(stderr, "[MC] %s: no selected cChannel pointer.\n", tag);
+            return -1;
+        }
+
+        typedef void* (*fn_GetManagedChannel)(const void* mgr, uint64_t stripKey);
+        auto getManagedChannel = (fn_GetManagedChannel)RESOLVE(0x1006aa580);
+        for (int ch = 0; g_channelManager && getManagedChannel && ch < 128; ch++) {
+            uint64_t key = MAKE_KEY(1, (uint8_t)ch);
+            if (getManagedChannel(g_channelManager, key) == selectedChannel) {
+                if (verbose) {
+                    fprintf(stderr, "[MC] %s: ptr=%p matched managed input channel %d\n",
+                            tag, selectedChannel, ch + 1);
+                }
+                return ch;
+            }
+        }
+
+        uint32_t chNum = 0xffffffffu;
+        uint8_t stripType = 0xff;
+        safeRead((uint8_t*)selectedChannel + 0x100, &chNum, sizeof(chNum));
+        safeRead((uint8_t*)selectedChannel + 0x104, &stripType, sizeof(stripType));
+        if (verbose) {
+            fprintf(stderr, "[MC] %s: ptr=%p stripType=%u channel=%u\n",
+                    tag, selectedChannel, (unsigned)stripType, (unsigned)chNum);
+        }
+        if (stripType == 1 && chNum < 128) return (int)chNum;
+        return -1;
+    };
+
+    typedef uint64_t (*fn_GetSelectedChannelPacked)(const void* mgr, int selectorIdx);
+    auto getSelectorSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(0x1001ed500);
+    auto getMultiSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(0x1001098470);
+
+    auto probePacked = [&](const char* tag, void* obj, fn_GetSelectedChannelPacked fn) -> int {
+        if (!obj || !fn) return -1;
+        for (int idx = 0; idx < 16; idx++) {
+            uint64_t raw = fn(obj, idx);
+            uint32_t ch = (uint32_t)(raw & 0xffffffffu);
+            uint8_t stripType = (uint8_t)((raw >> 32) & 0xffu);
+            if (verbose) {
+                fprintf(stderr, "[MC] %s[%d]: stripType=%u channel=%u\n",
+                        tag, idx, (unsigned)stripType, (unsigned)ch);
+            }
+            if (stripType == 1 && ch < 128)
+                return (int)ch;
+        }
+        return -1;
+    };
+
+    int selected = probeUIHolder("UIHolderSelectedChannel", g_uiManagerHolder);
+    if (selected >= 0) return selected;
+
+    selected = probePacked("SelectedChannel", g_channelSelectorManager, getSelectorSelectedChannel);
+    if (selected >= 0) return selected;
+
+    selected = probePacked("MultifunctionSelectedChannel", g_multifunctionChannelInterface, getMultiSelectedChannel);
+    if (selected >= 0) return selected;
+
+    if (!g_uiManagerHolder)
+        fprintf(stderr, "[MC] getSelectedInputChannel: UIManagerHolder unavailable.\n");
+    if (!g_channelSelectorManager)
+        fprintf(stderr, "[MC] getSelectedInputChannel: ChannelSelectorManager unavailable.\n");
+    if (!g_multifunctionChannelInterface)
+        fprintf(stderr, "[MC] getSelectedInputChannel: MultifunctionChannelInterface unavailable.\n");
+    if (!getSelectorSelectedChannel && !getMultiSelectedChannel) {
+        fprintf(stderr, "[MC] getSelectedInputChannel: selected-channel symbols unavailable.\n");
+    }
+    fprintf(stderr, "[MC] getSelectedInputChannel: no selected input channel found.\n");
+    return -1;
+}
+
+static void clearCopyBuffer() {
+    if (!g_copyBuffer.valid) return;
+    for (int i = 0; i < g_copyBuffer.blockSize; i++)
+        destroySnapshot(g_copyBuffer.snaps[i]);
+    g_copyBuffer = {};
+}
+
+static bool copySelectedChannelSettings() {
+    int ch = getSelectedInputChannel(true);
+    if (ch < 0) {
+        fprintf(stderr, "[MC] Copy channel settings: no selected input channel found.\n");
+        return false;
+    }
+
+    bool stereo = isChannelStereo(ch);
+    int srcStart = stereo ? (ch & ~1) : ch;
+    int blockSize = stereo ? 2 : 1;
+
+    clearCopyBuffer();
+    g_copyBuffer.stereo = stereo;
+    g_copyBuffer.blockSize = blockSize;
+    g_copyBuffer.srcStart = srcStart;
+
+    for (int i = 0; i < blockSize; i++) {
+        if (!snapshotChannel(srcStart + i, g_copyBuffer.snaps[i])) {
+            fprintf(stderr, "[MC] Copy channel settings failed while snapshotting ch %d.\n",
+                    srcStart + i + 1);
+            clearCopyBuffer();
+            return false;
+        }
+    }
+
+    g_copyBuffer.valid = true;
+    fprintf(stderr, "[MC] Copied %s settings from ch %d%s.\n",
+            stereo ? "stereo" : "mono",
+            srcStart + 1,
+            stereo ? QString("+%1").arg(srcStart + 2).toUtf8().constData() : "");
+    if (g_copyBuffer.snaps[0].validPatch || g_copyBuffer.snaps[0].validDyn8) {
+        fprintf(stderr, "[MC] Copy note: patch/ABCD/inserts/Dyn8 are intentionally not pasted by Cmd+V yet.\n");
+    }
+    return true;
+}
+
+static bool pasteCopiedChannelSettings() {
+    if (!g_copyBuffer.valid) {
+        fprintf(stderr, "[MC] Paste channel settings: clipboard is empty.\n");
+        return false;
+    }
+
+    int ch = getSelectedInputChannel(true);
+    if (ch < 0) {
+        fprintf(stderr, "[MC] Paste channel settings: no selected input channel found.\n");
+        return false;
+    }
+
+    bool targetStereo = isChannelStereo(ch);
+    int dstStart = g_copyBuffer.stereo ? (ch & ~1) : ch;
+    if (g_copyBuffer.stereo != targetStereo) {
+        fprintf(stderr,
+                "[MC] Paste channel settings rejected: source is %s but target ch %d is %s.\n",
+                g_copyBuffer.stereo ? "stereo" : "mono",
+                ch + 1,
+                targetStereo ? "stereo" : "mono");
+        return false;
+    }
+
+    fprintf(stderr, "[MC] Pasting %s settings to ch %d%s.\n",
+            g_copyBuffer.stereo ? "stereo" : "mono",
+            dstStart + 1,
+            g_copyBuffer.stereo ? QString("+%1").arg(dstStart + 2).toUtf8().constData() : "");
+
+    for (int i = 0; i < g_copyBuffer.blockSize; i++) {
+        int tgtCh = dstStart + i;
+        if (!recallChannel(tgtCh, g_copyBuffer.snaps[i], true)) {
+            fprintf(stderr, "[MC] Paste channel settings failed on ch %d.\n", tgtCh + 1);
+            return false;
+        }
+        if (g_copyBuffer.snaps[i].validB[1]) {
+            uint16_t wantDelay = ((uint16_t)g_copyBuffer.snaps[i].dataB[1].buf[1] << 8) |
+                                 g_copyBuffer.snaps[i].dataB[1].buf[2];
+            bool wantBypass = g_copyBuffer.snaps[i].dataB[1].buf[3] != 0;
+            setDelayForChannel(tgtCh, wantDelay, wantBypass);
+        }
+        writeProcOrderForChannel(tgtCh, g_copyBuffer.snaps[i]);
+        replayMixerAssignmentsForChannel(tgtCh, g_copyBuffer.snaps[i], "copy-paste");
+        refreshSideChainStateForChannel(tgtCh, "copy-paste");
+        if (g_copyBuffer.snaps[i].validPreamp) {
+            PatchData tgtPatch = {};
+            if (readPatchData(tgtCh, tgtPatch) &&
+                patchDataUsesSocketBackedPreamp(tgtPatch) &&
+                writePreampDataForPatch(tgtPatch, g_copyBuffer.snaps[i].preampData)) {
+                fprintf(stderr,
+                        "[MC]   Copy-paste preamp on ch %d: gain=%d pad=%d phantom=%d\n",
+                        tgtCh + 1,
+                        g_copyBuffer.snaps[i].preampData.gain,
+                        g_copyBuffer.snaps[i].preampData.pad,
+                        g_copyBuffer.snaps[i].preampData.phantom);
+            } else {
+                fprintf(stderr,
+                        "[MC]   Copy-paste preamp skipped on ch %d (no writable socket-backed preamp)\n",
+                        tgtCh + 1);
+            }
+        }
+    }
+    return true;
+}
+
+static void installMoveShortcuts() {
+    const QList<QWidget*> widgets = QApplication::topLevelWidgets();
+    for (QWidget* widget : widgets) {
+        if (!widget) continue;
+        if (!widget->property("mcMoveShortcutInstalled").toBool()) {
+            auto installOne = [widget](const QKeySequence& seq) {
+                auto* shortcut = new QShortcut(seq, widget);
+                shortcut->setContext(Qt::ApplicationShortcut);
+                QObject::connect(shortcut, &QShortcut::activated, widget, []() {
+                    fprintf(stderr, "[MC] Move shortcut activated.\n");
+                    showMoveDialog();
+                });
+            };
+            auto installAction = [widget](const QKeySequence& seq,
+                                          const char* label,
+                                          bool (*action)()) {
+                auto* shortcut = new QShortcut(seq, widget);
+                shortcut->setContext(Qt::ApplicationShortcut);
+                QObject::connect(shortcut, &QShortcut::activated, widget, [label, action]() {
+                    if (!shouldCaptureCopyPasteShortcut()) return;
+                    fprintf(stderr, "[MC] %s shortcut activated.\n", label);
+                    action();
+                });
+            };
+            installOne(QKeySequence(QStringLiteral("Ctrl+Shift+M")));
+            installOne(QKeySequence(QStringLiteral("Meta+Shift+M")));
+            installAction(QKeySequence(QStringLiteral("Ctrl+C")), "Copy", copySelectedChannelSettings);
+            installAction(QKeySequence(QStringLiteral("Meta+C")), "Copy", copySelectedChannelSettings);
+            installAction(QKeySequence(QStringLiteral("Ctrl+V")), "Paste", pasteCopiedChannelSettings);
+            installAction(QKeySequence(QStringLiteral("Meta+V")), "Paste", pasteCopiedChannelSettings);
+            widget->setProperty("mcMoveShortcutInstalled", true);
+            fprintf(stderr, "[MC] Installed move shortcuts on top-level widget '%s'.\n",
+                    widget->objectName().toUtf8().constData());
+        }
+    }
+}
+
+static bool shouldCaptureCopyPasteShortcut() {
+    QWidget* focus = QApplication::focusWidget();
+    if (!focus) return true;
+    return !(focus->inherits("QLineEdit") ||
+             focus->inherits("QTextEdit") ||
+             focus->inherits("QPlainTextEdit") ||
+             focus->inherits("QAbstractSpinBox"));
+}
+
+static void installNativeMacMoveShortcut() {
+    if (g_moveShortcutMonitor) return;
+    g_moveShortcutMonitor =
+        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                              handler:^NSEvent* _Nullable(NSEvent* event) {
+        if (!event) return event;
+        NSEventModifierFlags mods = (event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask);
+        bool cmdShift = (mods & NSEventModifierFlagCommand) && (mods & NSEventModifierFlagShift);
+        bool cmdOnly = (mods & NSEventModifierFlagCommand) && !(mods & NSEventModifierFlagShift) &&
+                       !(mods & NSEventModifierFlagControl) && !(mods & NSEventModifierFlagOption);
+        NSString* chars = [event charactersIgnoringModifiers];
+        if (cmdShift && chars &&
+            [chars caseInsensitiveCompare:@"m"] == NSOrderedSame) {
+            fprintf(stderr, "[MC] Move shortcut caught by native mac monitor.\n");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                showMoveDialog();
+            });
+            return nil;
+        }
+        if (cmdOnly && chars && shouldCaptureCopyPasteShortcut()) {
+            if ([chars caseInsensitiveCompare:@"c"] == NSOrderedSame) {
+                fprintf(stderr, "[MC] Copy shortcut caught by native mac monitor.\n");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    copySelectedChannelSettings();
+                });
+                return nil;
+            }
+            if ([chars caseInsensitiveCompare:@"v"] == NSOrderedSame) {
+                fprintf(stderr, "[MC] Paste shortcut caught by native mac monitor.\n");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    pasteCopiedChannelSettings();
+                });
+                return nil;
+            }
+        }
+        return event;
+    }];
+    fprintf(stderr, "[MC] Native mac move shortcut monitor installed (Cmd+Shift+M).\n");
+}
+
 // =============================================================================
 // Global key event filter (more reliable than QShortcut for injected code)
 // =============================================================================
@@ -4675,12 +5300,31 @@ public:
     using QObject::QObject;
 protected:
     bool eventFilter(QObject* obj, QEvent* event) override {
-        if (event->type() == QEvent::KeyPress) {
+        if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
             auto* ke = static_cast<QKeyEvent*>(event);
+            Qt::KeyboardModifiers mods = ke->modifiers();
+            bool ctrlShift = (mods & (Qt::ControlModifier | Qt::ShiftModifier)) ==
+                             (Qt::ControlModifier | Qt::ShiftModifier);
+            bool metaShift = (mods & (Qt::MetaModifier | Qt::ShiftModifier)) ==
+                             (Qt::MetaModifier | Qt::ShiftModifier);
+            bool ctrlOnly = (mods & Qt::ControlModifier) && !(mods & Qt::ShiftModifier) &&
+                            !(mods & Qt::MetaModifier) && !(mods & Qt::AltModifier);
+            bool metaOnly = (mods & Qt::MetaModifier) && !(mods & Qt::ShiftModifier) &&
+                            !(mods & Qt::ControlModifier) && !(mods & Qt::AltModifier);
             if (ke->key() == Qt::Key_M &&
-                (ke->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier)) ==
-                    (Qt::ControlModifier | Qt::ShiftModifier)) {
+                (ctrlShift || metaShift)) {
+                fprintf(stderr, "[MC] Move shortcut caught by global filter (type=%d).\n",
+                        (int)event->type());
                 showMoveDialog();
+                return true;
+            }
+            if ((ke->key() == Qt::Key_C || ke->key() == Qt::Key_V) &&
+                (ctrlOnly || metaOnly) && shouldCaptureCopyPasteShortcut()) {
+                bool isCopy = (ke->key() == Qt::Key_C);
+                fprintf(stderr, "[MC] %s shortcut caught by global filter (type=%d).\n",
+                        isCopy ? "Copy" : "Paste", (int)event->type());
+                if (isCopy) copySelectedChannelSettings();
+                else pasteCopiedChannelSettings();
                 return true;
             }
         }
@@ -4861,7 +5505,12 @@ static void onLoad() {
         // Install global event filter for Ctrl+Shift+M
         auto* filter = new MCEventFilter(qApp);
         qApp->installEventFilter(filter);
-        fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M).\n");
+        installMoveShortcuts();
+        installNativeMacMoveShortcut();
+        QObject::connect(qApp, &QGuiApplication::focusWindowChanged, qApp, [](QWindow*) {
+            installMoveShortcuts();
+        });
+        fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).\n");
 
         showMoveDialog();
 

@@ -16,6 +16,7 @@ LDFLAGS = -arch x86_64 -dynamiclib \
   -framework QtWidgets \
   -framework QtGui \
   -framework Foundation \
+  -framework AppKit \
   -rpath "$(QTPATH)"
 
 TARGET = libmovechannel.dylib
