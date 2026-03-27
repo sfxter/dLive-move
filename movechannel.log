@@ -1,33 +1,33 @@
 [MC] log file: /Users/sfx/Programavimas/dLive-patch/movechannel.log
 [MC] ===== MoveChannel dylib loaded =====
-[MC] slide = 0x193000
+[MC] slide = 0x4f91000
 dLive
 Version - V2.11 - Rev. 90473
 Build Date - Jul  4 2025, Time - 10:08:21
 
-qt.qpa.fonts: Populating font family aliases took 91 ms. Replace uses of missing font family "Liberation Sans" with one that exists to avoid this cost. 
-Booted in:  1934 ms
+qt.qpa.fonts: Populating font family aliases took 93 ms. Replace uses of missing font family "Liberation Sans" with one that exists to avoid this cost. 
+Booted in:  2002 ms
 Booted
-Booted in:  688 ms
+Booted in:  681 ms
 Booted
 QObject::connect: No such signal cUIManagerHolder::ShowSplash()
 QObject::connect:  (receiver name: 'UIManagerHolder')
 qml: Desktop  1512 x 944
-UID Complete in:  4850 ms
-2026-03-27 22:50:28.658 dLive Director V2.11[5465:3853179] WARNING: Secure coding is not enabled for restorable state! Enable secure coding by implementing NSApplicationDelegate.applicationSupportsSecureRestorableState: and returning YES.
+UID Complete in:  4820 ms
+2026-03-27 22:56:54.901 dLive Director V2.11[7774:3863088] WARNING: Secure coding is not enabled for restorable state! Enable secure coding by implementing NSApplicationDelegate.applicationSupportsSecureRestorableState: and returning YES.
 [MC] Initializing (after 1 polls)...
-[MC] AudioCoreDM at app[23][9] = 0x7f9578950000
+[MC] AudioCoreDM at app[23][9] = 0x7fb3c8930000
 [MC] Found 128 InputChannels, first at dm[47]
 [MC] Stereo status ch 1-8: 1=M 2=M 3=M 4=M 5=M 6=M 7=M 8=M 
-[MC] InputMixerWrapper at 0x7f959522cfa0
-[MC] ChannelMapperUSBDriver at dm[21] = 0x600000579800
-[MC] ChannelMapper at driver+0x20 = 0x7f9588018000 (vt=0x106e0abc8, expected=0x106e0abc8)
+[MC] InputMixerWrapper at 0x7fb3d2933ee0
+[MC] ChannelMapperUSBDriver at dm[21] = 0x6000019759e0
+[MC] ChannelMapper at driver+0x20 = 0x7fb3c90b8000 (vt=0x10bc08bc8, expected=0x10bc08bc8)
 [MC] AnalogueInput: first at router idx 85
-[MC] DigAtten router[70]: objId=0x0 handle=0x2d4a gain=0 obj=0x600003013190
-[MC] DigAtten router[71]: objId=0x0 handle=0x2d4a gain=0 obj=0x600003013260
-[MC] DigAtten router[72]: objId=0x0 handle=0x2d4a gain=0 obj=0x600003013330
-[MC] DigAtten router[73]: objId=0x0 handle=0x2d4a gain=0 obj=0x600003013400
-[MC] DigAtten router[74]: objId=0x0 handle=0x2d4a gain=0 obj=0x6000030134d0
+[MC] DigAtten router[70]: objId=0x0 handle=0x2d4a gain=0 obj=0x600002c29c70
+[MC] DigAtten router[71]: objId=0x0 handle=0x2d4a gain=0 obj=0x600002c29d40
+[MC] DigAtten router[72]: objId=0x0 handle=0x2d4a gain=0 obj=0x600002c29e10
+[MC] DigAtten router[73]: objId=0x0 handle=0x2d4a gain=0 obj=0x600002c29ee0
+[MC] DigAtten router[74]: objId=0x0 handle=0x2d4a gain=0 obj=0x600002c29fb0
 [MC] DigitalAttenuator: first at router idx 70, found 5
 [MC]   ch0[3] = cStereoImageDriver
 [MC]   ch0[17] = cInputDelayDriver
@@ -39,135 +39,69 @@ UID Complete in:  4850 ms
 [MC]   ch0[71] = cInputDelayDriver
 [MC]   ch0[75] = cStereoImageDriver
 [MC]   ch0[89] = cInputDelayDriver
+[MC]   ch0[93] = cStereoImageDriver
+[MC]   ch0[107] = cInputDelayDriver
 [MC]   ch0[111] = cStereoImageDriver
 [MC] DynamicsNetObject: first at router idx 2552, found 64 total
-[MC]   #0 registryIdx=2552 obj=0x7f9595244aa0 key58=0x000009f9
-[MC]   #1 registryIdx=2553 obj=0x7f9595244bd0 key58=0x000009fa
-[MC]   #2 registryIdx=2554 obj=0x7f9595244d00 key58=0x000009fb
-[MC]   #3 registryIdx=2555 obj=0x7f9595244e30 key58=0x000009fc
-[MC]   #4 registryIdx=2556 obj=0x7f9595244f60 key58=0x000009fd
-[MC]   #5 registryIdx=2557 obj=0x7f9595245090 key58=0x000009fe
-[MC]   #6 registryIdx=2558 obj=0x7f95952451c0 key58=0x000009ff
-[MC]   #7 registryIdx=2559 obj=0x7f95952452f0 key58=0x00000a00
-[MC] UIManagerHolder: channelMgr=0x60000611d260 audioSRPMgr=0x7f95952d9380
-[MC] DynamicsRack=0x7f95950de050
-[MC] SceneManagerIntermediateClient at UIManagerHolder+0x158 = 0x7f9594ad9400
-[MC] LibraryManagerClient=0x7f9595249bc0
-[MC] GangingManager at UIManagerHolder+0x288 = 0x600003877180
+[MC]   #0 registryIdx=2552 obj=0x7fb3d29d6da0 key58=0x000009f9
+[MC]   #1 registryIdx=2553 obj=0x7fb3d29d6ed0 key58=0x000009fa
+[MC]   #2 registryIdx=2554 obj=0x7fb3d29d7000 key58=0x000009fb
+[MC]   #3 registryIdx=2555 obj=0x7fb3d29d7130 key58=0x000009fc
+[MC]   #4 registryIdx=2556 obj=0x7fb3d29d7260 key58=0x000009fd
+[MC]   #5 registryIdx=2557 obj=0x7fb3d29d7390 key58=0x000009fe
+[MC]   #6 registryIdx=2558 obj=0x7fb3d29d74c0 key58=0x000009ff
+[MC]   #7 registryIdx=2559 obj=0x7fb3d29d75f0 key58=0x00000a00
+[MC] UIManagerHolder: channelMgr=0x600007d2db60 audioSRPMgr=0x7fb3834e8280
+[MC] DynamicsRack=0x7fb383455c90
+[MC] SceneManagerIntermediateClient at UIManagerHolder+0x158 = 0x7fb3d23b7200
+[MC] LibraryManagerClient=0x7fb3834d9b30
+[MC] GangingManager at UIManagerHolder+0x288 = 0x60000244cfc0
+[MC] CopyPasteResetSwitchInterpreter not found in UIManagerHolder
 [MC] ChannelSelectorManager not found in UIManagerHolder
 [MC] MultifunctionChannelInterface candidate not found in UIManagerHolder
 [MC] Ch 1 name: 'BD In'
-[MC] Installed move shortcuts on top-level widget 'SurfaceLockFormHolder'.
-[MC] Installed move shortcuts on top-level widget 'RTAFormHolder 1'.
-[MC] Installed move shortcuts on top-level widget 'OutputsFormHolder'.
-[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
-[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
-[MC] Installed move shortcuts on top-level widget 'HighlightWidget T:"" P:"NULL"'.
-[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
-[MC] Installed move shortcuts on top-level widget 'ProcessingFormHolder'.
-[MC] Installed move shortcuts on top-level widget 'RoutingFormHolder'.
-[MC] Installed move shortcuts on top-level widget ''.
 [MC] Installed move shortcuts on top-level widget ''.
 [MC] Installed move shortcuts on top-level widget 'UtilitySetupFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'RoutingFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'SurfaceLockFormHolder'.
 [MC] Installed move shortcuts on top-level widget ''.
-[MC] Installed move shortcuts on top-level widget 'SurfaceSetupFormHolder'.
-[MC] Installed move shortcuts on top-level widget 'MixrackSetupFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
+[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
+[MC] Installed move shortcuts on top-level widget 'RTAFormHolder 2'.
+[MC] Installed move shortcuts on top-level widget 'ProcessingFormHolder'.
+[MC] Installed move shortcuts on top-level widget ''.
 [MC] Installed move shortcuts on top-level widget 'HighlightWidget T:"" P:"NULL"'.
 [MC] Installed move shortcuts on top-level widget 'BackgroundImage'.
 [MC] Installed move shortcuts on top-level widget ''.
-[MC] Installed move shortcuts on top-level widget 'RTAFormHolder 2'.
+[MC] Installed move shortcuts on top-level widget 'cWarningBannerMessage'.
+[MC] Installed move shortcuts on top-level widget 'OutputsFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'RTAFormHolder 1'.
+[MC] Installed move shortcuts on top-level widget 'MixrackSetupFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'SurfaceSetupFormHolder'.
+[MC] Installed move shortcuts on top-level widget 'HighlightWidget T:"" P:"NULL"'.
 [MC] Native mac move shortcut monitor installed (Cmd+Shift+M).
 [MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).
 [MC] Installed move shortcuts on top-level widget ''.
 [MC] ===== MoveChannel ready =====
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(991.795,288.056) id:2000002 timeHeld:0)
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(991.795,288.056) id:2000002 timeHeld:0)
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(560.847,163.439) id:2000002 timeHeld:0)
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(560.847,163.439) id:2000002 timeHeld:0)
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(692.287,29.1733) id:2000002 timeHeld:0)
-TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(692.287,29.1733) id:2000002 timeHeld:0)
 [MC] Copy shortcut caught by native mac monitor.
-[MC] UIHolderSelectedChannel: ptr=0x7f9566f8f1f0 matched managed input channel 37
-[MC]   Snapshot DigitalTrim ch 37: gain=0 (0x0000)
-[MC]   Snapshot SideChain1 ch 37: stripType=1 channel=36
-[MC]   Snapshot SideChain2 ch 37: stripType=1 channel=36
-[MC]   Snapshot StereoImage ch 37: width=100 mode=0
-[MC]   Snapshot patch ch 37: srcType=0 src={type=0, num=31}
-[MC] Built send-point source cache with 2777 entries
-[MC]   Snapshot ABCD ch 37 source 1: type=0 num=31 preamp=1
-[MC]   InsertA ch 37: parentType=0 fxSend=0x600002219e30 fxRecv=0x6000022290a0
-[MC]   InsertB ch 37: parentType=0 fxSend=0x600002219e30 fxRecv=0x6000022290a0
-[MC] Copied mono settings from ch 37.
-[MC] Copy note: patch/ABCD/inserts/Dyn8 are intentionally not pasted by Cmd+V yet.
+[MC] UIHolderSelectedChannel: ptr=0x7fb382ffb0b0 matched stereo-aux strip type=5 channel=2
+[MC] Built-in CPR command unavailable: switch interpreter not found.
 [MC] Paste shortcut caught by native mac monitor.
-[MC] UIHolderSelectedChannel: ptr=0x7f9566f8f7a0 matched managed input channel 38
-[MC] Pasting mono settings to ch 38.
-[MC]   Recall DigiTube on ch 38 (obj=0x600003e62a00)
-[MC]   Recall HPF on ch 38 (obj=0x600003e62ac0)
-[MC]   Recall LPF on ch 38 (obj=0x60000321b720)
-[MC]   Recall Compressor on ch 38 (obj=0x7f959525fb70)
-[MC]   Recall GateSCPEQ on ch 38 (obj=0x60000341a850)
-[MC]   Recall Gate on ch 38 (obj=0x600003e62b80)
-[MC]   Recall PEQ on ch 38 (obj=0x7f959525f690)
-[MC]   Recall DigitalTrim on ch 38: gain=0 mute=0 pol=0
-[MC]   Recall Delay on ch 38: delay=0 bypass=0
-[MC]   ProcOrder: obj null, skip
-[MC]   Skip raw Insert1 on ch 38; live routing will be restored separately
-[MC]   Skip raw Insert2 on ch 38; live routing will be restored separately
-[MC]   SC-Write SideChain1 on ch 38: stripType=1 channel=36
-[MC]   SC-Write SideChain2 on ch 38: stripType=1 channel=36
-[MC]   Recall StereoImage on ch 38: width=100 mode=0
-[MC]   Write mixer data on ch 38
-[MC]   SyncMainGain ch 38 (group 4, chInGrp 5) gain=-32767
-[MC]   [copy-paste] Replay mixer assigns ch 38: mainOn=1 mainMonoOn=1
-[MC]   [copy-paste] Refresh compressor sidechain on ch 38 (obj=0x7f959525fb70)
-[MC]   [copy-paste] Refresh gate sidechain on ch 38 (obj=0x60000341a850)
-[MC]   [copy-paste] Refresh SideChain1 on ch 38 (obj=0x7f959506afa0)
-[MC]   [copy-paste] Refresh SideChain2 on ch 38 (obj=0x7f959506b120)
-[MC]     Preamp write begin socket 139 ai=0x600003c118c0 gain=4096 pad=0 phantom=0
-[MC]     Preamp write socket 139: gain applied
-[MC]     Preamp write socket 139: pad applied (direct)
-[MC]     Preamp write socket 139: phantom applied (direct)
-[MC]   Copy-paste preamp on ch 38: gain=4096 pad=0 phantom=0
+[MC] UIHolderSelectedChannel: ptr=0x7fb382ffb8d0 matched stereo-aux strip type=5 channel=3
+[MC] Built-in CPR command unavailable: switch interpreter not found.
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(310.915,679.895) id:2000002 timeHeld:0)
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(283.982,658.046) id:2000002 timeHeld:0)
 [MC] Copy shortcut caught by native mac monitor.
-[MC] UIHolderSelectedChannel: ptr=0x7f9566f8f1f0 matched managed input channel 37
-[MC]   Snapshot DigitalTrim ch 37: gain=0 (0x0000)
-[MC]   Snapshot SideChain1 ch 37: stripType=1 channel=36
-[MC]   Snapshot SideChain2 ch 37: stripType=1 channel=36
-[MC]   Snapshot StereoImage ch 37: width=100 mode=0
-[MC]   Snapshot patch ch 37: srcType=0 src={type=0, num=31}
-[MC]   Snapshot ABCD ch 37 source 1: type=0 num=31 preamp=1
-[MC]   InsertA ch 37: parentType=0 fxSend=0x600002219e30 fxRecv=0x6000022290a0
-[MC]   InsertB ch 37: parentType=0 fxSend=0x600002219e30 fxRecv=0x6000022290a0
-[MC] Copied mono settings from ch 37.
-[MC] Copy note: patch/ABCD/inserts/Dyn8 are intentionally not pasted by Cmd+V yet.
+[MC] UIHolderSelectedChannel: ptr=0x7fb382ffb0b0 matched stereo-aux strip type=5 channel=2
+[MC] Built-in CPR command unavailable: switch interpreter not found.
 [MC] Paste shortcut caught by native mac monitor.
-[MC] UIHolderSelectedChannel: ptr=0x7f9566f8f7a0 matched managed input channel 38
-[MC] Pasting mono settings to ch 38.
-[MC]   Recall DigiTube on ch 38 (obj=0x600003e62a00)
-[MC]   Recall HPF on ch 38 (obj=0x600003e62ac0)
-[MC]   Recall LPF on ch 38 (obj=0x60000321b720)
-[MC]   Recall Compressor on ch 38 (obj=0x7f959525fb70)
-[MC]   Recall GateSCPEQ on ch 38 (obj=0x60000341a850)
-[MC]   Recall Gate on ch 38 (obj=0x600003e62b80)
-[MC]   Recall PEQ on ch 38 (obj=0x7f959525f690)
-[MC]   Recall DigitalTrim on ch 38: gain=0 mute=0 pol=0
-[MC]   Recall Delay on ch 38: delay=0 bypass=0
-[MC]   ProcOrder: obj null, skip
-[MC]   Skip raw Insert1 on ch 38; live routing will be restored separately
-[MC]   Skip raw Insert2 on ch 38; live routing will be restored separately
-[MC]   SC-Write SideChain1 on ch 38: stripType=1 channel=36
-[MC]   SC-Write SideChain2 on ch 38: stripType=1 channel=36
-[MC]   Recall StereoImage on ch 38: width=100 mode=0
-[MC]   Write mixer data on ch 38
-[MC]   SyncMainGain ch 38 (group 4, chInGrp 5) gain=-32767
-[MC]   [copy-paste] Replay mixer assigns ch 38: mainOn=1 mainMonoOn=1
-[MC]   [copy-paste] Refresh compressor sidechain on ch 38 (obj=0x7f959525fb70)
-[MC]   [copy-paste] Refresh gate sidechain on ch 38 (obj=0x60000341a850)
-[MC]   [copy-paste] Refresh SideChain1 on ch 38 (obj=0x7f959506afa0)
-[MC]   [copy-paste] Refresh SideChain2 on ch 38 (obj=0x7f959506b120)
-[MC]     Preamp write begin socket 30 ai=0x600003e13f00 gain=4096 pad=0 phantom=0
-[MC]     Preamp write socket 30: gain applied
-[MC]     Preamp write socket 30: pad applied
-[MC]     Preamp write socket 30: phantom applied
-[MC]   Copy-paste preamp on ch 38: gain=4096 pad=0 phantom=0
+[MC] UIHolderSelectedChannel: ptr=0x7fb382ffb8d0 matched stereo-aux strip type=5 channel=3
+[MC] Built-in CPR command unavailable: switch interpreter not found.
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(225.777,592.361) id:2000002 timeHeld:0)
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(255.657,558.161) id:2000003 timeHeld:0)
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(274.788,585.002) id:2000002 timeHeld:0)
+[MC] Copy shortcut caught by native mac monitor.
+[MC] UIHolderSelectedChannel: ptr=0x7fb382ffb0b0 matched stereo-aux strip type=5 channel=2
+[MC] Built-in CPR command unavailable: switch interpreter not found.
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(147.913,584.288) id:2000002 timeHeld:0)
+TouchPointPressed without previous release event QQuickEventPoint(accepted:false state:Pressed scenePos:QPointF(178.516,551.708) id:2000003 timeHeld:0)

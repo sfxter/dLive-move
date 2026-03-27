@@ -230,6 +230,8 @@ static void* g_channelManager = nullptr;     // cChannelManager* (from cUIManage
 static void* g_uiManagerHolder = nullptr;    // cUIManagerHolder* (for current selected channel)
 static void* g_channelSelectorManager = nullptr; // cChannelSelectorManager* (from UIManagerHolder scan)
 static void* g_multifunctionChannelInterface = nullptr; // cMultifunctionChannelInterface* (from UIManagerHolder scan)
+static void* g_uiCopyPasteResetManager = nullptr; // cUICopyPasteResetManager* (from UIManagerHolder scan)
+static void* g_copyPasteResetSwitchInterpreter = nullptr; // cCopyPasteResetSwitchInterpreter*
 static void* g_audioSRPManager = nullptr;    // cAudioSendReceivePointManager* (from cUIManagerHolder)
 static void* g_dynRack = nullptr;            // cDynamicsRack* (from UIManagerHolder+0x40)
 static void* g_sceneClient = nullptr;       // cSceneManagerIntermediateClient* (from UIManagerHolder scan)
@@ -602,6 +604,22 @@ static bool findAudioCoreDM() {
                 }
             }
             if (!g_gangingManager) fprintf(stderr, "[MC] GangingManager not found in UIManagerHolder\n");
+
+            uintptr_t cprSwitchInterpVt = (uintptr_t)RESOLVE(0x106ce1fe8) + 0x10;
+            for (int off = 0; off < 0x300; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                if ((uintptr_t)vt == cprSwitchInterpVt) {
+                    g_copyPasteResetSwitchInterpreter = ptr;
+                    fprintf(stderr, "[MC] CopyPasteResetSwitchInterpreter at UIManagerHolder+0x%x = %p\n", off, ptr);
+                    break;
+                }
+            }
+            if (!g_copyPasteResetSwitchInterpreter)
+                fprintf(stderr, "[MC] CopyPasteResetSwitchInterpreter not found in UIManagerHolder\n");
 
             uintptr_t selectorMgrVt = (uintptr_t)RESOLVE(0x106c77ca0) + 0x10;
             for (int off = 0; off < 0x300; off += 8) {
@@ -5022,40 +5040,72 @@ static void showMoveDialog() {
     g_dialog->show();
 }
 
-static int getSelectedInputChannel(bool verbose = false) {
-    auto probeUIHolder = [&](const char* tag, void* holder) -> int {
-        if (!holder) return -1;
-        void* selectedChannel = nullptr;
-        if (!safeRead((uint8_t*)holder + 0x50, &selectedChannel, sizeof(selectedChannel)) ||
-            !selectedChannel || (uintptr_t)selectedChannel < 0x100000000ULL) {
-            if (verbose) fprintf(stderr, "[MC] %s: no selected cChannel pointer.\n", tag);
-            return -1;
-        }
+struct SelectedStripInfo {
+    bool valid = false;
+    uint32_t stripType = 0;
+    int channel = -1;
+    void* channelPtr = nullptr;
+};
 
-        typedef void* (*fn_GetManagedChannel)(const void* mgr, uint64_t stripKey);
-        auto getManagedChannel = (fn_GetManagedChannel)RESOLVE(0x1006aa580);
-        for (int ch = 0; g_channelManager && getManagedChannel && ch < 128; ch++) {
-            uint64_t key = MAKE_KEY(1, (uint8_t)ch);
-            if (getManagedChannel(g_channelManager, key) == selectedChannel) {
-                if (verbose) {
-                    fprintf(stderr, "[MC] %s: ptr=%p matched managed input channel %d\n",
-                            tag, selectedChannel, ch + 1);
+static SelectedStripInfo getSelectedStripInfo(bool verbose = false) {
+    SelectedStripInfo out;
+    if (!g_uiManagerHolder) return out;
+    if (!safeRead((uint8_t*)g_uiManagerHolder + 0x50, &out.channelPtr, sizeof(out.channelPtr)) ||
+        !out.channelPtr || (uintptr_t)out.channelPtr < 0x100000000ULL) {
+        if (verbose) fprintf(stderr, "[MC] UIHolderSelectedChannel: no selected cChannel pointer.\n");
+        out.channelPtr = nullptr;
+        return out;
+    }
+
+    typedef void* (*fn_GetManagedChannel)(const void* mgr, uint64_t stripKey);
+    auto getManagedChannel = (fn_GetManagedChannel)RESOLVE(0x1006aa580);
+    if (g_channelManager && getManagedChannel) {
+        struct StripProbeRange { uint32_t type; int maxChannels; const char* label; };
+        const StripProbeRange ranges[] = {
+            {1, 128, "input"},
+            {4, 64, "aux"},
+            {5, 64, "stereo-aux"},
+            {8, 8, "main"},
+            {10, 32, "matrix"},
+        };
+        for (const auto& range : ranges) {
+            for (int ch = 0; ch < range.maxChannels; ch++) {
+                uint64_t key = MAKE_KEY(range.type, (uint8_t)ch);
+                if (getManagedChannel(g_channelManager, key) == out.channelPtr) {
+                    out.valid = true;
+                    out.stripType = range.type;
+                    out.channel = ch;
+                    if (verbose) {
+                        fprintf(stderr,
+                                "[MC] UIHolderSelectedChannel: ptr=%p matched %s strip type=%u channel=%d\n",
+                                out.channelPtr, range.label, range.type, ch + 1);
+                    }
+                    return out;
                 }
-                return ch;
             }
         }
+    }
 
-        uint32_t chNum = 0xffffffffu;
-        uint8_t stripType = 0xff;
-        safeRead((uint8_t*)selectedChannel + 0x100, &chNum, sizeof(chNum));
-        safeRead((uint8_t*)selectedChannel + 0x104, &stripType, sizeof(stripType));
-        if (verbose) {
-            fprintf(stderr, "[MC] %s: ptr=%p stripType=%u channel=%u\n",
-                    tag, selectedChannel, (unsigned)stripType, (unsigned)chNum);
-        }
-        if (stripType == 1 && chNum < 128) return (int)chNum;
-        return -1;
-    };
+    uint32_t chNum = 0xffffffffu;
+    uint8_t stripType = 0xff;
+    safeRead((uint8_t*)out.channelPtr + 0x100, &chNum, sizeof(chNum));
+    safeRead((uint8_t*)out.channelPtr + 0x104, &stripType, sizeof(stripType));
+    if (verbose) {
+        fprintf(stderr, "[MC] UIHolderSelectedChannel: ptr=%p stripType=%u channel=%u\n",
+                out.channelPtr, (unsigned)stripType, (unsigned)chNum);
+    }
+    if (stripType < 0xff && chNum < 128) {
+        out.valid = true;
+        out.stripType = stripType;
+        out.channel = (int)chNum;
+    }
+    return out;
+}
+
+static int getSelectedInputChannel(bool verbose = false) {
+    SelectedStripInfo selectedStrip = getSelectedStripInfo(verbose);
+    if (selectedStrip.valid && selectedStrip.stripType == 1)
+        return selectedStrip.channel;
 
     typedef uint64_t (*fn_GetSelectedChannelPacked)(const void* mgr, int selectorIdx);
     auto getSelectorSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(0x1001ed500);
@@ -5077,10 +5127,7 @@ static int getSelectedInputChannel(bool verbose = false) {
         return -1;
     };
 
-    int selected = probeUIHolder("UIHolderSelectedChannel", g_uiManagerHolder);
-    if (selected >= 0) return selected;
-
-    selected = probePacked("SelectedChannel", g_channelSelectorManager, getSelectorSelectedChannel);
+    int selected = probePacked("SelectedChannel", g_channelSelectorManager, getSelectorSelectedChannel);
     if (selected >= 0) return selected;
 
     selected = probePacked("MultifunctionSelectedChannel", g_multifunctionChannelInterface, getMultiSelectedChannel);
@@ -5106,7 +5153,35 @@ static void clearCopyBuffer() {
     g_copyBuffer = {};
 }
 
+static bool isAuxStripType(uint32_t stripType) {
+    return (stripType & ~1u) == 4u;
+}
+
+static bool sendBuiltInCopyPasteResetCommand(uint32_t task, uint32_t target, const SelectedStripInfo& strip) {
+    if (!strip.valid || strip.channel < 0 || strip.channel > 255) return false;
+    if (!g_copyPasteResetSwitchInterpreter) {
+        fprintf(stderr, "[MC] Built-in CPR command unavailable: switch interpreter not found.\n");
+        return false;
+    }
+    typedef void (*fn_SendCopyPasteResetCommand)(void* obj, uint32_t task, uint32_t target, uint64_t stripKey);
+    auto sendCommand = (fn_SendCopyPasteResetCommand)RESOLVE(0x10040a720);
+    if (!sendCommand) {
+        fprintf(stderr, "[MC] Built-in CPR command unavailable: symbol missing.\n");
+        return false;
+    }
+    uint64_t stripKey = MAKE_KEY(strip.stripType, (uint8_t)strip.channel);
+    fprintf(stderr, "[MC] Built-in CPR command: task=%u target=%u stripType=%u channel=%d\n",
+            task, target, strip.stripType, strip.channel + 1);
+    sendCommand(g_copyPasteResetSwitchInterpreter, task, target, stripKey);
+    return true;
+}
+
 static bool copySelectedChannelSettings() {
+    SelectedStripInfo selectedStrip = getSelectedStripInfo(true);
+    if (selectedStrip.valid && isAuxStripType(selectedStrip.stripType)) {
+        return sendBuiltInCopyPasteResetCommand(1, 2, selectedStrip);
+    }
+
     int ch = getSelectedInputChannel(true);
     if (ch < 0) {
         fprintf(stderr, "[MC] Copy channel settings: no selected input channel found.\n");
@@ -5143,6 +5218,11 @@ static bool copySelectedChannelSettings() {
 }
 
 static bool pasteCopiedChannelSettings() {
+    SelectedStripInfo selectedStrip = getSelectedStripInfo(true);
+    if (selectedStrip.valid && isAuxStripType(selectedStrip.stripType)) {
+        return sendBuiltInCopyPasteResetCommand(2, 2, selectedStrip);
+    }
+
     if (!g_copyBuffer.valid) {
         fprintf(stderr, "[MC] Paste channel settings: clipboard is empty.\n");
         return false;
