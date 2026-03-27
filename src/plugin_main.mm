@@ -6,6 +6,9 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <chrono>
 #include <vector>
 #include <set>
 
@@ -43,6 +46,24 @@ static bool safeRead(const void* addr, void* dest, size_t len) {
 // Image slide resolution
 // =============================================================================
 static intptr_t g_slide = 0;
+static const char* kMoveChannelLogPath = "/Users/sfx/Programavimas/dLive-patch/movechannel.log";
+
+static void setupLogging() {
+    int fd = open(kMoveChannelLogPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    if (dup2(fd, STDERR_FILENO) >= 0) {
+        setvbuf(stderr, nullptr, _IONBF, 0);
+        dprintf(STDERR_FILENO, "[MC] log file: %s\n", kMoveChannelLogPath);
+    }
+    close(fd);
+}
+
+static uint64_t monotonicMs() {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<milliseconds>(
+        steady_clock::now().time_since_epoch()).count();
+}
 
 static void resolveSlide() {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -137,9 +158,6 @@ static ProcDescB g_procB[] = {
         {0xa0, FT_UBYTE_BOOL, 3},
         {0xa8, FT_UBYTE_BOOL, 4},
     }},
-    // cStereoImage: DISABLED — ch[19] is a small int, not a pointer. Need to find correct offset.
-    // vtable+16 = 0x106c7a818, driver vtable+16 = 0x106c7a860
-    // {"StereoImage", ??, 0x106c7a818, 4, 0x01, ?, 0, 2, { ... }},
     // cDelay (via cInputDelayDriver at ch[17], net obj at driver[1])
     // ptr-deref: +0x98→delay(UWORD), +0xa0→bypass(UBYTE_BOOL)
     {"Delay", 17, 0x106c78078, 4, 0x01, 1, 0, 2, {
@@ -171,6 +189,12 @@ static ProcDescB g_procB[] = {
     {"SideChain2", 15, 0, 3, 0x01, 1, 0, 2, {
         {0x138, FT_UBYTE, 1},
         {0x140, FT_UBYTE, 2},
+    }},
+    // cStereoImage (via cStereoImageDriver at ch[3]→driver[1]): len=4, version=0x01
+    // ptr-deref: +0xa0→width(UWORD), +0xa8→mode(UBYTE)
+    {"StereoImage", 3, 0, 4, 0x01, 1, 0, 2, {
+        {0xA0, FT_UWORD, 1},
+        {0xA8, FT_UBYTE, 3},
     }},
 };
 static const int NUM_PROC_B = sizeof(g_procB) / sizeof(g_procB[0]);
@@ -588,6 +612,34 @@ static void* getDyn8RecvPoint(int unitIdx) {
     return readQListFirst(duc, 0xa0);
 }
 
+static void* getDyn8SendPointFromManager(int unitIdx) {
+    if (!g_audioSRPManager || unitIdx < 0 || unitIdx >= 64) return nullptr;
+    typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    return getSendPoint(g_audioSRPManager, 0x27, (uint16_t)unitIdx);
+}
+
+static void* getDyn8RecvPointFromManager(int unitIdx) {
+    if (!g_audioSRPManager || unitIdx < 0 || unitIdx >= 64) return nullptr;
+    typedef void* (*fn_GetReceivePoint)(void* mgr, uint32_t targetType, uint16_t targetNum);
+    auto getReceivePoint = (fn_GetReceivePoint)RESOLVE(0x1006c8a30);
+    return getReceivePoint(g_audioSRPManager, 0x25, (uint16_t)unitIdx);
+}
+
+static void* getDefaultInsertSendPoint() {
+    if (!g_audioSRPManager) return nullptr;
+    void* pt = nullptr;
+    safeRead((uint8_t*)g_audioSRPManager + 0x350, &pt, sizeof(pt));
+    return pt;
+}
+
+static void* getDefaultInsertReceivePoint() {
+    if (!g_audioSRPManager) return nullptr;
+    void* pt = nullptr;
+    safeRead((uint8_t*)g_audioSRPManager + 0x358, &pt, sizeof(pt));
+    return pt;
+}
+
 // Recall scene by number (1-based). Blocks briefly for the recall to take effect.
 static void recallScene(int sceneNum) {
     if (!g_sceneClient) {
@@ -606,6 +658,114 @@ static void recallScene(int sceneNum) {
     performGo(g_sceneClient);
     fprintf(stderr, "[MC] recallScene(%d): SetGoSceneIndex(%d) + PerformGo called\n", sceneNum, idx);
 }
+
+static bool isChannelStereo(int ch);
+static void waitForStereoConfigReset();
+static bool readStereoConfig(uint8_t config[64]);
+static bool writeStereoConfig(const uint8_t config[64]);
+static bool isInsertStatusProc(int procIdx);
+
+static void waitForSceneRecall() {
+    QApplication::processEvents();
+    usleep(1500 * 1000);
+    QApplication::processEvents();
+    usleep(1500 * 1000);
+    QApplication::processEvents();
+}
+
+static bool waitForStereoConfigMatch(const uint8_t want[64], int timeoutMs, const char* tag) {
+    const int stepMs = 100;
+    int waited = 0;
+    uint8_t live[64];
+    while (waited <= timeoutMs) {
+        QApplication::processEvents();
+        if (readStereoConfig(live) && memcmp(live, want, 64) == 0) {
+            fprintf(stderr, "[MC] %s: stereo config observed after %d ms\n", tag, waited);
+            return true;
+        }
+        usleep(stepMs * 1000);
+        waited += stepMs;
+    }
+    fprintf(stderr, "[MC] %s: timed out waiting for stereo config match\n", tag);
+    return false;
+}
+
+static bool sendStereoConfigViaDiscovery(const uint8_t config[64], const char* tag) {
+    typedef void* (*fn_DiscoveryInstance)();
+    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(0x10059c610);
+    typedef void* (*fn_GetSBDiscovery)(void*);
+    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(0x10059c9a0);
+    typedef void (*fn_SendInputConfigSetMessage)(void* sbObj, const void* cfg, bool flag);
+    auto sendInputConfigSetMessage = (fn_SendInputConfigSetMessage)RESOLVE(0x1005b0db0);
+
+    void* disc = discoveryInstance ? discoveryInstance() : nullptr;
+    if (!disc || !getStageBox || !sendInputConfigSetMessage) {
+        fprintf(stderr, "[MC] %s: discovery send path unavailable\n", tag);
+        return false;
+    }
+
+    void* sbObj = getStageBox(disc);
+    if (!sbObj) {
+        fprintf(stderr, "[MC] %s: stagebox discovery object unavailable\n", tag);
+        return false;
+    }
+
+    sendInputConfigSetMessage(sbObj, config, false);
+    fprintf(stderr, "[MC] %s: SendInputConfigurationSetMessage dispatched\n", tag);
+    return true;
+}
+
+static bool applyStereoConfigAndRefresh(const uint8_t config[64], const char* tag) {
+    if (!sendStereoConfigViaDiscovery(config, tag)) {
+        fprintf(stderr, "[MC] %s: discovery stereo apply failed\n", tag);
+        return false;
+    }
+    waitForStereoConfigMatch(config, 5000, tag);
+    waitForStereoConfigReset();
+    fprintf(stderr, "[MC] %s: stereo config applied via discovery path\n", tag);
+    return true;
+}
+
+static bool prepareScene21MoveTest() {
+    uint8_t config[64];
+    if (!readStereoConfig(config)) {
+        fprintf(stderr, "[MC][AUTOTEST] prepareScene21MoveTest: failed to read stereo config\n");
+        return false;
+    }
+
+    bool changed = false;
+    auto setPair = [&](int pair, bool stereo) {
+        uint8_t want = stereo ? 1 : 0;
+        if (config[pair] != want) {
+            fprintf(stderr, "[MC][AUTOTEST] prep layout: pair %d (ch %d+%d) %s -> %s\n",
+                    pair, pair * 2 + 1, pair * 2 + 2,
+                    config[pair] ? "STEREO" : "MONO",
+                    stereo ? "STEREO" : "MONO");
+            config[pair] = want;
+            changed = true;
+        }
+    };
+
+    setPair(0, false); // ch 1+2 mono
+    setPair(1, true);  // ch 3+4 stereo
+    setPair(2, false); // ch 5+6 mono
+
+    if (changed && !applyStereoConfigAndRefresh(config, "[MC][AUTOTEST] prepareScene21MoveTest"))
+        return false;
+
+    fprintf(stderr, "[MC][AUTOTEST] recalling scene 21 after layout prep\n");
+    recallScene(21);
+    waitForSceneRecall();
+
+    for (int ch = 0; ch < 6; ch++) {
+        const char* name = g_getChannelName(g_audioDM, 1, (uint8_t)ch);
+        fprintf(stderr, "[MC][AUTOTEST] scene21 ready ch %d: '%s' stereo=%d\n",
+                ch + 1, name ? name : "", isChannelStereo(ch) ? 1 : 0);
+    }
+    return true;
+}
+
+static void setInputChannelInsertFlags(int ch, int ip, bool assigned, bool dynamics, const char* phaseTag);
 
 // Find Dyn8 unit index by matching the insert's connected send point
 // with DynamicsRack unit send points (parentType==5)
@@ -837,6 +997,153 @@ static bool libraryDeleteDyn8(const char* presetName) {
     return true;
 }
 
+static void probeLibraryTypesForChannel(int ch) {
+    typedef uint8_t (*fn_GetLibraryObjectIndex)(uint32_t type, uint32_t object);
+    auto getLibraryObjectIndex = (fn_GetLibraryObjectIndex)RESOLVE(0x1005a1c70);
+    if (!getLibraryObjectIndex) return;
+
+    struct ProbeObj { uint32_t obj; const char* name; };
+    static const ProbeObj objs[] = {
+        {0, "Trim"},
+        {1, "HPF"},
+        {2, "LPF"},
+        {3, "Gate"},
+        {4, "GateSC"},
+        {5, "PEQ"},
+        {6, "Comp"},
+        {7, "Delay"},
+        {8, "Preamp"},
+        {12, "StereoImage"},
+        {13, "PreampModel"},
+        {15, "Dyn8"},
+        {16, "Patching"},
+    };
+
+    fprintf(stderr, "[MC] Library type probe for ch %d...\n", ch + 1);
+    for (uint32_t type = 0; type < 24; type++) {
+        bool any = false;
+        fprintf(stderr, "[MC]   type %u:", type);
+        for (const auto& obj : objs) {
+            uint8_t idx = getLibraryObjectIndex(type, obj.obj);
+            if (idx == 0xff) continue;
+            any = true;
+            fprintf(stderr, " %s=%u", obj.name, idx);
+        }
+        if (!any)
+            fprintf(stderr, " (no input-ish objects)");
+        fprintf(stderr, "\n");
+    }
+}
+
+static void* makeQListBoolN(size_t count, bool val) {
+    uint8_t* buf = (uint8_t*)malloc(sizeof(QListDataHeader) + sizeof(void*) * count);
+    auto* hdr = (QListDataHeader*)buf;
+    hdr->ref = 1;
+    hdr->alloc = (int)count;
+    hdr->begin = 0;
+    hdr->end = (int)count;
+    void** arr = (void**)(buf + sizeof(QListDataHeader));
+    for (size_t i = 0; i < count; i++)
+        arr[i] = val ? (void*)1 : (void*)0;
+    void** qlist = (void**)malloc(sizeof(void*));
+    *qlist = buf;
+    return qlist;
+}
+
+static void* makeQListQStringN(const std::vector<void*>& qstrs) {
+    uint8_t* buf = (uint8_t*)malloc(sizeof(QListDataHeader) + sizeof(void*) * qstrs.size());
+    auto* hdr = (QListDataHeader*)buf;
+    hdr->ref = 1;
+    hdr->alloc = (int)qstrs.size();
+    hdr->begin = 0;
+    hdr->end = (int)qstrs.size();
+    void** arr = (void**)(buf + sizeof(QListDataHeader));
+    for (size_t i = 0; i < qstrs.size(); i++)
+        arr[i] = qstrs[i];
+    void** qlist = (void**)malloc(sizeof(void*));
+    *qlist = buf;
+    return qlist;
+}
+
+static void* getChannelLibraryTargetQString(uint32_t libType, uint32_t libObj, uint64_t stripKey) {
+    typedef void (*fn_GetTargetName)(void* retQStr, uint32_t libType, uint32_t libObj, uint64_t stripKey);
+    auto getTargetName = (fn_GetTargetName)RESOLVE(0x1000d88f0);
+    if (!getTargetName) return nullptr;
+    void* qstr = nullptr;
+    getTargetName(&qstr, libType, libObj, stripKey);
+    return qstr;
+}
+
+static const uint32_t kInputChannelLibraryType = 7;
+static const uint32_t kInputChannelLibraryObjects[] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13,
+};
+
+static bool libraryStoreInputChannel(int srcCh, const char* presetName) {
+    if (!g_libraryMgrClient) return false;
+
+    uint64_t stripKey = MAKE_KEY(1, (uint8_t)srcCh);
+    std::vector<void*> targets;
+    for (uint32_t obj : kInputChannelLibraryObjects) {
+        void* qstr = getChannelLibraryTargetQString(kInputChannelLibraryType, obj, stripKey);
+        if (qstr) targets.push_back(qstr);
+    }
+    if (targets.empty()) return false;
+
+    void* nameQStr = makeQString(presetName);
+    void* libKey = makeLibraryKey(nameQStr, 1, kInputChannelLibraryType);
+    void* qlistStr = makeQListQStringN(targets);
+    void* qlistBool = makeQListBoolN(targets.size(), true);
+
+    typedef void (*fn_CreateLibrary)(void* client, void* libKey, void* qlistStr, void* qlistBool, uint64_t stripKey);
+    auto createLibrary = (fn_CreateLibrary)RESOLVE(0x1006f2020);
+    fprintf(stderr, "[MC] libraryStoreInputChannel: storing ch %d as '%s' (%zu objs)\n",
+            srcCh + 1, presetName, targets.size());
+    createLibrary(g_libraryMgrClient, libKey, qlistStr, qlistBool, stripKey);
+
+    free(*(void**)qlistStr); free(qlistStr);
+    free(*(void**)qlistBool); free(qlistBool);
+    free(libKey);
+    return true;
+}
+
+static bool libraryRecallInputChannel(int tgtCh, const char* presetName) {
+    if (!g_libraryMgrClient) return false;
+
+    uint64_t stripKey = MAKE_KEY(1, (uint8_t)tgtCh);
+    void* nameQStr = makeQString(presetName);
+    void* libKey = makeLibraryKey(nameQStr, 1, kInputChannelLibraryType);
+    typedef void (*fn_RecallFromLib)(void* client, void* libKey, uint32_t libObj,
+                                     void* objNameQStrPtr, void* qlistBool, uint64_t stripKey, bool);
+    auto recallFromLib = (fn_RecallFromLib)RESOLVE(0x1006f3f80);
+
+    fprintf(stderr, "[MC] libraryRecallInputChannel: recalling '%s' onto ch %d\n",
+            presetName, tgtCh + 1);
+    for (uint32_t obj : kInputChannelLibraryObjects) {
+        void* objNameQStr = getChannelLibraryTargetQString(kInputChannelLibraryType, obj, stripKey);
+        if (!objNameQStr) continue;
+        void* qlistBool = makeEmptyQList();
+        recallFromLib(g_libraryMgrClient, libKey, obj, &objNameQStr, qlistBool, stripKey, false);
+        free(qlistBool);
+    }
+
+    free(libKey);
+    return true;
+}
+
+static bool libraryDeleteInputChannel(const char* presetName) {
+    if (!g_libraryMgrClient) return false;
+    void* nameQStr = makeQString(presetName);
+    if (!nameQStr) return false;
+    void* libKey = makeLibraryKey(nameQStr, 1, kInputChannelLibraryType);
+    typedef void (*fn_DeleteLibrary)(void* client, void* libKey);
+    auto deleteLibrary = (fn_DeleteLibrary)RESOLVE(0x1006f1cb0);
+    fprintf(stderr, "[MC] libraryDeleteInputChannel: deleting '%s'\n", presetName);
+    deleteLibrary(g_libraryMgrClient, libKey);
+    free(libKey);
+    return true;
+}
+
 static void* getInputChannel(int ch) {
     void* ptr = nullptr;
     safeRead(&g_dmFields[g_firstInputChIdx + ch], &ptr, sizeof(ptr));
@@ -852,6 +1159,7 @@ static bool isChannelStereo(int ch) {
 
 // Forward declaration for safeWrite (defined later)
 static bool safeWrite(void* addr, const void* src, size_t len);
+static void waitForStereoConfigReset();
 
 // =============================================================================
 // Stereo Configuration helpers
@@ -919,29 +1227,12 @@ static bool changeStereoConfig(int ch, bool makeStereo) {
     // Modify the config byte
     config[pair] = makeStereo ? 1 : 0;
 
-    // Write back to discovery object
-    if (!writeStereoConfig(config)) {
-        fprintf(stderr, "[MC] changeStereoConfig: failed to write config\n");
+    if (!sendStereoConfigViaDiscovery(config, "[MC] changeStereoConfig")) {
+        fprintf(stderr, "[MC] changeStereoConfig: failed to send config via discovery\n");
         return false;
     }
-
-    // Call cAudioCoreDM::NewInputStereoConfiguration(sIPStereoConfigurationData*)
-    // this=rdi (g_audioDM), config=rsi
-    typedef void (*fn_NewStereoConfig)(void* dm, const uint8_t* config);
-    auto newStereoConfig = (fn_NewStereoConfig)RESOLVE(0x1001a0f10);
-    newStereoConfig(g_audioDM, config);
-    fprintf(stderr, "[MC] changeStereoConfig: NewInputStereoConfiguration called\n");
-
-    // Call cApplication::NewInputConfiguration(bool)
-    // this=rdi (app instance), bool=rsi
-    void* app = g_AppInstance();
-    if (app) {
-        typedef void (*fn_NewInputConfig)(void* app, bool flag);
-        auto newInputConfig = (fn_NewInputConfig)RESOLVE(0x100d6e0c0);
-        newInputConfig(app, true);
-        fprintf(stderr, "[MC] changeStereoConfig: NewInputConfiguration called\n");
-    }
-
+    waitForStereoConfigMatch(config, 5000, "[MC] changeStereoConfig");
+    waitForStereoConfigReset();
     return true;
 }
 
@@ -1007,7 +1298,7 @@ static void* findProcessingObjByVtable(void* inputCh, uintptr_t vtableStatic, in
     void* expectedVt = (void*)((uintptr_t)RESOLVE(vtableStatic) + 16);
     void** fields = (void**)inputCh;
     // Scan typical processing object offsets (skip 0-1 which are vtable/base, and very high offsets)
-    for (int i = 2; i < 120; i++) {
+    for (int i = 2; i < 800; i++) {
         void* field = nullptr;
         if (!safeRead(&fields[i], &field, sizeof(field))) continue;
         if (!field || (uintptr_t)field < 0x100000000ULL || (uintptr_t)field > 0x800000000000ULL) continue;
@@ -1114,16 +1405,24 @@ struct PreampData {
     uint8_t phantom;
 };
 
-static void* getAnalogueInput(int ch) {
-    if (!g_registryRouter || g_firstAnalogueInputIdx < 0 || ch < 0 || ch > 127) return nullptr;
+static bool samePreampData(const PreampData& a, const PreampData& b) {
+    return a.gain == b.gain && a.pad == b.pad && a.phantom == b.phantom;
+}
+
+static bool isLocalAnaloguePatch(const PatchData& pd) {
+    return pd.sourceType == 0 && pd.source.type == 0;
+}
+
+static void* getAnalogueInput(int socketNum) {
+    if (!g_registryRouter || g_firstAnalogueInputIdx < 0 || socketNum < 0 || socketNum > 127) return nullptr;
     uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
     void* entry = nullptr;
-    safeRead(base + (g_firstAnalogueInputIdx + ch) * 8, &entry, sizeof(entry));
+    safeRead(base + (g_firstAnalogueInputIdx + socketNum) * 8, &entry, sizeof(entry));
     return entry;
 }
 
-static bool readPreampData(int ch, PreampData& pd) {
-    void* ai = getAnalogueInput(ch);
+static bool readPreampDataForSocket(int socketNum, PreampData& pd) {
+    void* ai = getAnalogueInput(socketNum);
     if (!ai) return false;
 
     void* gainPtr = nullptr;
@@ -1144,8 +1443,13 @@ static bool readPreampData(int ch, PreampData& pd) {
     return true;
 }
 
-static bool writePreampData(int ch, const PreampData& pd) {
-    void* ai = getAnalogueInput(ch);
+static bool readPreampDataForPatch(const PatchData& pd, PreampData& preamp) {
+    if (!isLocalAnaloguePatch(pd)) return false;
+    return readPreampDataForSocket((int)pd.source.number, preamp);
+}
+
+static bool writePreampDataForSocket(int socketNum, const PreampData& pd) {
+    void* ai = getAnalogueInput(socketNum);
     if (!ai) return false;
 
     // Use MIDISetGain / MIDISetPad / MIDISetPhantomPower for proper notification
@@ -1162,6 +1466,11 @@ static bool writePreampData(int ch, const PreampData& pd) {
     midiSetPhantom(ai, pd.phantom != 0);
 
     return true;
+}
+
+static bool writePreampDataForPatch(const PatchData& pd, const PreampData& preamp) {
+    if (!isLocalAnaloguePatch(pd)) return false;
+    return writePreampDataForSocket((int)pd.source.number, preamp);
 }
 
 // =============================================================================
@@ -1294,6 +1603,16 @@ static bool safeWrite(void* addr, const void* src, size_t len) {
     return kr == KERN_SUCCESS;
 }
 
+static void waitForStereoConfigReset() {
+    // Stereo reconfiguration rebuilds parts of the input-channel object graph
+    // asynchronously. A short settle window avoids recalling into half-reset
+    // objects, which can leave the right-hand channel of a former stereo pair
+    // mirroring stale state from its neighbor.
+    QApplication::processEvents();
+    usleep(500 * 1000);
+    QApplication::processEvents();
+}
+
 static void writeTypeBFields(void* obj, const ProcDescB& desc, const uint8_t* buf) {
     uint8_t* base = (uint8_t*)obj;
     for (int f = 0; f < desc.numFields; f++) {
@@ -1389,7 +1708,16 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
     for (int p = 0; p < NUM_PROC_B; p++) {
         snap.validB[p] = false;
         void* obj = getTypeBObj(inputCh, g_procB[p]);
-        if (!obj) continue;
+        if (!obj) {
+            if (p == 2) { // ProcOrder behaves like a default-false flag when absent
+                memset(snap.dataB[p].buf, 0, sizeof(snap.dataB[p].buf));
+                snap.dataB[p].buf[0] = g_procB[p].versionByte;
+                snap.dataB[p].len = g_procB[p].msgLength;
+                snap.dataB[p].buf[1] = 0;
+                snap.validB[p] = true;
+            }
+            continue;
+        }
 
         memset(snap.dataB[p].buf, 0, sizeof(snap.dataB[p].buf));
         snap.dataB[p].buf[0] = g_procB[p].versionByte;
@@ -1402,7 +1730,12 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
                 break;
             }
         }
-        snap.validB[p] = ok;
+        if (!ok && p == 2) {
+            snap.dataB[p].buf[1] = 0;
+            snap.validB[p] = true;
+        } else {
+            snap.validB[p] = ok;
+        }
         if (ok && strstr(g_procB[p].name, "SideChain")) {
             fprintf(stderr, "[MC]   Snapshot %s ch %d: stripType=%d channel=%d\n",
                     g_procB[p].name, ch+1, snap.dataB[p].buf[1], snap.dataB[p].buf[2]);
@@ -1411,6 +1744,12 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
             uint16_t gain = ((uint16_t)snap.dataB[p].buf[1] << 8) | snap.dataB[p].buf[2];
             fprintf(stderr, "[MC]   Snapshot %s ch %d: gain=%d (0x%04x)\n",
                     g_procB[p].name, ch+1, (int16_t)gain, gain);
+        }
+        if (ok && strcmp(g_procB[p].name, "StereoImage") == 0) {
+            uint16_t width = ((uint16_t)snap.dataB[p].buf[1] << 8) | snap.dataB[p].buf[2];
+            uint8_t mode = snap.dataB[p].buf[3];
+            fprintf(stderr, "[MC]   Snapshot %s ch %d: width=%u mode=%u\n",
+                    g_procB[p].name, ch+1, width, mode);
         }
         if (!ok) {
             fprintf(stderr, "[MC]   Snapshot %s ch %d: FAILED (obj=%p)\n", g_procB[p].name, ch+1, obj);
@@ -1430,15 +1769,14 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
             snap.mixerData = nullptr;
         }
     }
-
     // Patching
     snap.validPatch = readPatchData(ch, snap.patchData);
     if (snap.validPatch)
         fprintf(stderr, "[MC]   Snapshot patch ch %d: srcType=%d src={type=%d, num=%d}\n",
                 ch+1, snap.patchData.sourceType, snap.patchData.source.type, snap.patchData.source.number);
 
-    // Preamp (gain, pad, phantom)
-    snap.validPreamp = readPreampData(ch, snap.preampData);
+    // Preamp lives on the patched socket, not on the destination channel index.
+    snap.validPreamp = snap.validPatch && readPreampDataForPatch(snap.patchData, snap.preampData);
 
     // Insert routing: find FX unit assigned to each insert point
     // Chain: cChannel::GetInsertReturnPoint(insertPt) → returnPt+0x20 → sendPt
@@ -1552,23 +1890,35 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
     return true;
 }
 
-static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp = false) {
+static void recallTypeAForChannel(int ch, const ChannelSnapshot& snap, bool reportData = true) {
     void* inputCh = getInputChannel(ch);
-    if (!inputCh) { fprintf(stderr, "[MC] Ch %d: InputChannel is null!\n", ch); return false; }
+    if (!inputCh) return;
 
-    // Type A: DirectlyRecallStatus + ReportData
     for (int p = 0; p < NUM_PROC_A; p++) {
         if (!snap.validA[p]) continue;
         void* obj = getProcessingObj(inputCh, g_procA[p].chOffset);
-        if (!obj) { fprintf(stderr, "[MC]   %s: obj null, skip\n", g_procA[p].name); continue; }
+        if (!obj) {
+            fprintf(stderr, "[MC]   %s: obj null, skip\n", g_procA[p].name);
+            continue;
+        }
 
         fprintf(stderr, "[MC]   Recall %s on ch %d (obj=%p)\n", g_procA[p].name, ch+1, obj);
         auto recall = (fn_method_msg)RESOLVE(g_procA[p].directlyRecallAddr);
         recall(obj, snap.msgA[p]);
 
-        auto report = (fn_method_void)RESOLVE(g_procA[p].reportDataAddr);
-        report(obj);
+        if (reportData) {
+            auto report = (fn_method_void)RESOLVE(g_procA[p].reportDataAddr);
+            report(obj);
+        }
     }
+}
+
+static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp = false) {
+    void* inputCh = getInputChannel(ch);
+    if (!inputCh) { fprintf(stderr, "[MC] Ch %d: InputChannel is null!\n", ch); return false; }
+
+    // Type A: DirectlyRecallStatus + ReportData
+    recallTypeAForChannel(ch, snap);
 
     // Type B: write directly to object fields + call Refresh if available
     // For sidechain objects (p==6,7), bypass SetStatus (which calls RefreshSource that
@@ -1581,10 +1931,16 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
         if (!snap.validB[p]) continue;
         void* obj = getTypeBObj(inputCh, g_procB[p]);
         if (!obj) { fprintf(stderr, "[MC]   %s: obj null, skip\n", g_procB[p].name); continue; }
+        if (isInsertStatusProc(p)) {
+            fprintf(stderr, "[MC]   Skip raw %s on ch %d; live routing will be restored separately\n",
+                    g_procB[p].name, ch+1);
+            continue;
+        }
 
         // Sidechain: write raw fields then use the EMBEDDED message at obj+0x60
-        // exactly like SetStatus does, but skip RefreshSource which resets values
-        if (p == 6 || p == 7) {
+        // exactly like SetStatus does, but skip RefreshSource which resets values.
+        // SideChain1/2 are g_procB[5] and g_procB[6].
+        if (p == 5 || p == 6) {
             uint8_t wantStripType = snap.dataB[p].buf[1];
             uint8_t wantChannel   = snap.dataB[p].buf[2];
 
@@ -1668,6 +2024,20 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
             continue;
         }
 
+        // StereoImage: write raw fields + InformObjectsOfNewSettings for UI/runtime refresh
+        if (strcmp(g_procB[p].name, "StereoImage") == 0) {
+            uint16_t wantWidth = ((uint16_t)snap.dataB[p].buf[1] << 8) | snap.dataB[p].buf[2];
+            uint8_t wantMode = snap.dataB[p].buf[3];
+            writeTypeBFields(obj, g_procB[p], snap.dataB[p].buf);
+            typedef void (*fn_method_void)(void* obj);
+            auto informNewSettings = (fn_method_void)RESOLVE(0x1002f5850);
+            if (informNewSettings)
+                informNewSettings(obj);
+            fprintf(stderr, "[MC]   Recall StereoImage on ch %d: width=%u mode=%u\n",
+                    ch+1, wantWidth, wantMode);
+            continue;
+        }
+
         fprintf(stderr, "[MC]   Write %s on ch %d (obj=%p) data=[%02x %02x %02x %02x %02x %02x %02x]\n",
                 g_procB[p].name, ch+1, obj,
                 snap.dataB[p].buf[0], snap.dataB[p].buf[1], snap.dataB[p].buf[2],
@@ -1703,16 +2073,6 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
         }
     }
 
-    // Preamp: write gain/pad/phantom via MIDISet* (works offline, notifies UI)
-    // Skip in Scenario B — SetInputChannelSource moves preamp with the socket
-    if (!skipPreamp && snap.validPreamp) {
-        if (writePreampData(ch, snap.preampData))
-            fprintf(stderr, "[MC]   Write preamp on ch %d: gain=%d pad=%d phantom=%d\n",
-                    ch+1, snap.preampData.gain, snap.preampData.pad, snap.preampData.phantom);
-        else
-            fprintf(stderr, "[MC]   WARN: preamp write failed on ch %d\n", ch+1);
-    }
-
     g_setChannelName(g_audioDM, 1, (uint8_t)ch, snap.name);
     g_setChannelColour(g_audioDM, 1, (uint8_t)ch, snap.colour);
 
@@ -1739,23 +2099,954 @@ static void destroySnapshot(ChannelSnapshot& snap) {
     snap.validDyn8 = false;
 }
 
+struct MovePlan {
+    int rawSrc;
+    int rawDst;
+    int srcStart;
+    int dstStart;
+    int blockSize;
+    int lo;
+    int hi;
+    bool srcStereo;
+    bool srcMonoBlock;
+    std::vector<std::pair<int, int>> targetMap;  // (target channel, snapshot index)
+
+    MovePlan()
+        : rawSrc(-1), rawDst(-1), srcStart(-1), dstStart(-1),
+          blockSize(1), lo(-1), hi(-1), srcStereo(false), srcMonoBlock(false) {}
+};
+
+static void* getMsgDataPtr(uint8_t* msg);
+static uint32_t getMsgLength(uint8_t* msg);
+static void dumpChannelData(int ch, const char* label);
+static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
+                          MovePlan& plan, char* errBuf, size_t errBufLen);
+static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan);
+static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh);
+static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
+                                           bool movePatchWithChannel);
+static bool moveChannel(int src, int dst, bool movePatchWithChannel, bool moveAdjacentMonoPair);
+static bool isInsertStatusProc(int procIdx) {
+    return procIdx == 3 || procIdx == 4;
+}
+static bool assignDyn8InsertWithSetInserts(int ch, int unitIdx, int ip, int variant, const char* phaseTag);
+static void refreshDyn8InsertAssignment(int unitIdx, int tgtCh, const char* phaseTag);
+
+static void* getSystemController() {
+    if (!g_audioDM) return nullptr;
+    void* controller = nullptr;
+    safeRead((uint8_t*)g_audioDM + 0xb0, &controller, sizeof(controller));
+    return controller;
+}
+
+static void* getCompressorSystem() {
+    void* controller = getSystemController();
+    if (!controller) return nullptr;
+    void* system = nullptr;
+    safeRead((uint8_t*)controller + 0x60, &system, sizeof(system));
+    return system;
+}
+
+static void* getGateSystem() {
+    void* controller = getSystemController();
+    if (!controller) return nullptr;
+    void* system = nullptr;
+    safeRead((uint8_t*)controller + 0x68, &system, sizeof(system));
+    return system;
+}
+
+static void* getBiquadSystem() {
+    void* controller = getSystemController();
+    if (!controller) return nullptr;
+    void* system = nullptr;
+    safeRead((uint8_t*)controller + 0x70, &system, sizeof(system));
+    return system;
+}
+
+static void resetInputProcessingGangMaster(int ch, const char* phaseTag) {
+    typedef void (*fn_ResetGangMaster)(void*, uint8_t);
+    typedef void (*fn_CompSyncAllInputStereoGangData)(void*);
+    typedef void (*fn_GateSyncAllInputStereoGangData)(void*);
+    typedef void (*fn_BiquadSyncAllInputFilterStereoGangData)(void*);
+    typedef void (*fn_BiquadSyncAllInputPEQStereoGangData)(void*);
+
+    auto resetComp = (fn_ResetGangMaster)RESOLVE(0x100e62ee0);
+    auto resetGate = (fn_ResetGangMaster)RESOLVE(0x100304900);
+    auto resetBiquad = (fn_ResetGangMaster)RESOLVE(0x100b15f70);
+    auto syncComp = (fn_CompSyncAllInputStereoGangData)RESOLVE(0x100e62e40);
+    auto syncGate = (fn_GateSyncAllInputStereoGangData)RESOLVE(0x1003048b0);
+    auto syncBiquadFilter = (fn_BiquadSyncAllInputFilterStereoGangData)RESOLVE(0x100b15ed0);
+    auto syncBiquadPEQ = (fn_BiquadSyncAllInputPEQStereoGangData)RESOLVE(0x100b15f30);
+
+    void* comp = getCompressorSystem();
+    void* gate = getGateSystem();
+    void* biquad = getBiquadSystem();
+
+    fprintf(stderr,
+            "[MC]   [%s] ResetInputChannelGangMaster ch %d comp=%p gate=%p biquad=%p\n",
+            phaseTag, ch + 1, comp, gate, biquad);
+
+    if (comp && resetComp) resetComp(comp, (uint8_t)ch);
+    if (gate && resetGate) resetGate(gate, (uint8_t)ch);
+    if (biquad && resetBiquad) resetBiquad(biquad, (uint8_t)ch);
+
+    if (comp && syncComp) syncComp(comp);
+    if (gate && syncGate) syncGate(gate);
+    if (biquad && syncBiquadFilter) syncBiquadFilter(biquad);
+    if (biquad && syncBiquadPEQ) syncBiquadPEQ(biquad);
+}
+
+static void refreshSideChainStateForChannel(int ch, const char* phaseTag) {
+    void* inputCh = getInputChannel(ch);
+    if (!inputCh) return;
+
+    typedef void (*fn_method_void)(void*);
+    auto informCompSideChain = (fn_method_void)RESOLVE(0x1001f39d0);
+    auto informGateSideChain = (fn_method_void)RESOLVE(0x1002d1970);
+    auto identifyAndRefreshSideChain = (fn_method_void)RESOLVE(0x1002e4e80);
+
+    void* compObj = getProcessingObj(inputCh, g_procA[3].chOffset);
+    if (compObj && informCompSideChain) {
+        fprintf(stderr, "[MC]   [%s] Refresh compressor sidechain on ch %d (obj=%p)\n",
+                phaseTag, ch + 1, compObj);
+        informCompSideChain(compObj);
+    }
+
+    void* gateSCObj = getProcessingObj(inputCh, g_procA[4].chOffset);
+    if (gateSCObj && informGateSideChain) {
+        fprintf(stderr, "[MC]   [%s] Refresh gate sidechain on ch %d (obj=%p)\n",
+                phaseTag, ch + 1, gateSCObj);
+        informGateSideChain(gateSCObj);
+    }
+
+    for (int p = 5; p <= 6; p++) {
+        void* scObj = getTypeBObj(inputCh, g_procB[p]);
+        if (!scObj || !identifyAndRefreshSideChain) continue;
+        fprintf(stderr, "[MC]   [%s] Refresh %s on ch %d (obj=%p)\n",
+                phaseTag, g_procB[p].name, ch + 1, scObj);
+        identifyAndRefreshSideChain(scObj);
+    }
+}
+
+static void setDelayForChannel(int ch, uint16_t delay, bool bypass) {
+    void* inputCh = getInputChannel(ch);
+    if (!inputCh) return;
+    void* obj = getTypeBObj(inputCh, g_procB[1]); // Delay
+    if (!obj) return;
+
+    typedef void (*fn_setDelay)(void*, uint16_t);
+    auto setDelayInform = (fn_setDelay)RESOLVE(0x100202590);
+    typedef void (*fn_setBypass)(void*, bool);
+    auto setBypassInform = (fn_setBypass)RESOLVE(0x100202660);
+
+    setDelayInform(obj, delay);
+    setBypassInform(obj, bypass);
+}
+
+static void replayMixerAssignmentsForChannel(int ch,
+                                             const ChannelSnapshot& snap,
+                                             const char* phaseTag) {
+    if (!g_inputMixerWrapper || !snap.validMixer || !snap.mixerData) return;
+
+    int group = ch >> 3;
+    int chInGrp = ch & 7;
+    void* mixer = nullptr;
+    safeRead((uint8_t*)g_inputMixerWrapper + 0x90 + group * 8, &mixer, sizeof(mixer));
+    if (!mixer) return;
+
+    typedef void (*fn_SetMainOnSwitch)(void* mixer, uint8_t chInGrp, bool on);
+    typedef void (*fn_SetMainMonoOnSwitch)(void* mixer, uint8_t chInGrp, bool on);
+    typedef void (*fn_InformObjectsOfNewMainOnSetting)(void* mixer, uint8_t chInGrp, bool on);
+    typedef void (*fn_InformObjectsOfNewMainMonoOnSetting)(void* mixer, uint8_t chInGrp, bool on);
+    typedef void (*fn_SetDCAGroupAssign)(void* mixer, uint8_t dca, uint8_t chInGrp, bool assign);
+    typedef void (*fn_InformObjectsOfNewInDCAGroupSetting)(void* mixer, uint8_t dca, uint8_t chInGrp, bool assign);
+
+    auto setMainOnSwitch = (fn_SetMainOnSwitch)RESOLVE(0x100037e10);
+    auto setMainMonoOnSwitch = (fn_SetMainMonoOnSwitch)RESOLVE(0x100037e70);
+    auto informMainOnSetting = (fn_InformObjectsOfNewMainOnSetting)RESOLVE(0x10003faf0);
+    auto informMainMonoOnSetting = (fn_InformObjectsOfNewMainMonoOnSetting)RESOLVE(0x10003fb60);
+    auto setDCAGroupAssign = (fn_SetDCAGroupAssign)RESOLVE(0x100039c40);
+    auto informInDCAGroupSetting = (fn_InformObjectsOfNewInDCAGroupSetting)RESOLVE(0x10003fee0);
+
+    bool wantMainOn = snap.mixerData[0xA86] != 0;
+    bool wantMainMonoOn = snap.mixerData[0xA87] != 0;
+
+    fprintf(stderr,
+            "[MC]   [%s] Replay mixer assigns ch %d: mainOn=%d mainMonoOn=%d\n",
+            phaseTag, ch + 1, wantMainOn ? 1 : 0, wantMainMonoOn ? 1 : 0);
+
+    if (setMainOnSwitch) setMainOnSwitch(mixer, (uint8_t)chInGrp, wantMainOn);
+    if (informMainOnSetting) informMainOnSetting(mixer, (uint8_t)chInGrp, wantMainOn);
+
+    if (setMainMonoOnSwitch) setMainMonoOnSwitch(mixer, (uint8_t)chInGrp, wantMainMonoOn);
+    if (informMainMonoOnSetting) informMainMonoOnSetting(mixer, (uint8_t)chInGrp, wantMainMonoOn);
+
+    if (setDCAGroupAssign) {
+        for (int dca = 0; dca < 32; dca++) {
+            bool wantAssign = snap.mixerData[0x001 + dca] != 0;
+            setDCAGroupAssign(mixer, (uint8_t)dca, (uint8_t)chInGrp, wantAssign);
+            if (informInDCAGroupSetting)
+                informInDCAGroupSetting(mixer, (uint8_t)dca, (uint8_t)chInGrp, wantAssign);
+        }
+    }
+}
+
+static void replayInsertRouting(const MovePlan& plan,
+                                const std::vector<ChannelSnapshot>& snaps,
+                                const char* phaseTag) {
+    if (!g_channelManager || !g_audioSRPManager) return;
+
+    typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    typedef void (*fn_PerformTasks)(void* audioSRPMgr, void* taskList);
+    auto performTasks = (fn_PerformTasks)RESOLVE(0x1006d19c0);
+    typedef void* (*fn_CreateSendTargetTask)(void* ret, void* channel, void* fxRecvPt, int ip, int enable);
+    auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(0x1006da210);
+    typedef void* (*fn_CreateReturnSourceTask)(void* ret, void* channel, void* fxSendPt, int ip);
+    auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(0x1006da450);
+    typedef void (*fn_MergeTaskLists)(void* dst, void* src);
+    auto mergeTaskLists = (fn_MergeTaskLists)RESOLVE(0x10069cd60);
+    bool traceDyn8Route = false;
+    if (const char* traceEnv = getenv("MC_TRACE_DYN8_ROUTE")) {
+        traceDyn8Route = (atoi(traceEnv) != 0);
+    }
+    bool useAssignFlags = true;
+    if (const char* assignEnv = getenv("MC_DYN8_ASSIGN_FLAGS")) {
+        useAssignFlags = (atoi(assignEnv) != 0);
+    }
+    bool useDyn8SetInserts = false;
+    if (const char* setInsertsEnv = getenv("MC_DYN8_USE_SETINSERTS")) {
+        useDyn8SetInserts = (atoi(setInsertsEnv) != 0);
+    }
+    bool useStereoDyn8SetInserts = false;
+    if (const char* stereoSetInsertsEnv = getenv("MC_DYN8_STEREO_SETINSERTS")) {
+        useStereoDyn8SetInserts = (atoi(stereoSetInsertsEnv) != 0);
+    }
+
+    auto routeInsert = [&](int tgtCh, const ChannelSnapshot::InsertInfo& ins, int ip, bool clearPass) {
+        if (!ins.hasInsert) return;
+        if (!clearPass) {
+            if (ins.parentType == 0) return;
+        }
+
+        void* tgtChannel = getChannel(g_channelManager, 1, (uint8_t)tgtCh);
+        if (!tgtChannel) return;
+
+        void* routeSendPt = ins.fxSendPt;
+        void* routeRecvPt = ins.fxReceivePt;
+        int enable = clearPass ? 0 : 1;
+
+        if (!clearPass && ins.parentType == 5) {
+            int dynIdx = findDyn8UnitIdx(ins.fxSendPt);
+            void* mgrSend = getDyn8SendPointFromManager(dynIdx);
+            void* mgrRecv = getDyn8RecvPointFromManager(dynIdx);
+            fprintf(stderr,
+                    "[MC]   [%s] Dyn8 manager points for ch %d unit %d: send=%p recv=%p (snapshot send=%p recv=%p)\n",
+                    phaseTag, tgtCh + 1, dynIdx, mgrSend, mgrRecv, ins.fxSendPt, ins.fxReceivePt);
+            if (mgrSend) routeSendPt = mgrSend;
+            if (mgrRecv) routeRecvPt = mgrRecv;
+
+            if (useStereoDyn8SetInserts && isChannelStereo(tgtCh) && ((tgtCh & 1) == 0) && ip == 0 && dynIdx >= 0) {
+                if (assignDyn8InsertWithSetInserts(tgtCh, dynIdx, ip, 0, phaseTag)) {
+                    if (traceDyn8Route) {
+                        usleep(100 * 1000);
+                        ChannelSnapshot live;
+                        if (snapshotChannel(tgtCh, live)) {
+                            fprintf(stderr,
+                                    "[MC]   [%s] Dyn8 stereo trace after SetInserts ch %d: validDyn8=%d Insert%c type=%d send=%p recv=%p\n",
+                                    phaseTag, tgtCh + 1, live.validDyn8, 'A' + ip,
+                                    live.insertInfo[ip].parentType,
+                                    live.insertInfo[ip].fxSendPt,
+                                    live.insertInfo[ip].fxReceivePt);
+                            destroySnapshot(live);
+                        }
+                    }
+                    return;
+                }
+            }
+
+            if (useDyn8SetInserts && !isChannelStereo(tgtCh) && dynIdx >= 0) {
+                if (assignDyn8InsertWithSetInserts(tgtCh, dynIdx, ip, 0, phaseTag)) {
+                    if (traceDyn8Route) {
+                        usleep(100 * 1000);
+                        ChannelSnapshot live;
+                        if (snapshotChannel(tgtCh, live)) {
+                            fprintf(stderr,
+                                    "[MC]   [%s] Dyn8 trace after SetInserts ch %d: validDyn8=%d Insert%c type=%d send=%p recv=%p\n",
+                                    phaseTag, tgtCh + 1, live.validDyn8, 'A' + ip,
+                                    live.insertInfo[ip].parentType,
+                                    live.insertInfo[ip].fxSendPt,
+                                    live.insertInfo[ip].fxReceivePt);
+                            destroySnapshot(live);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        if (clearPass) {
+            routeSendPt = getDefaultInsertSendPoint();
+            routeRecvPt = getDefaultInsertReceivePoint();
+        }
+
+        if (clearPass) {
+            fprintf(stderr, "[MC]   [%s] Insert%c final clear on ch %d ← fxSend=%p fxRecv=%p\n",
+                    phaseTag, 'A'+ip, tgtCh+1, routeSendPt, routeRecvPt);
+        } else {
+            fprintf(stderr, "[MC]   [%s] Insert%c: ch %d ← fxSend=%p fxRecv=%p (type=%d)\n",
+                    phaseTag, 'A'+ip, tgtCh+1, routeSendPt, routeRecvPt, ins.parentType);
+        }
+
+        if (useAssignFlags) {
+            if (clearPass) {
+                setInputChannelInsertFlags(tgtCh, ip, false, false, phaseTag);
+            } else if (useStereoDyn8SetInserts && ins.parentType == 5 && isChannelStereo(tgtCh) && ((tgtCh & 1) == 1) && ip == 0) {
+                // Stereo Dyn8 pair is assigned through the even channel's SetInserts call.
+                setInputChannelInsertFlags(tgtCh, ip, true, true, phaseTag);
+            } else if (ins.parentType == 5) {
+                setInputChannelInsertFlags(tgtCh, ip, true, true, phaseTag);
+            } else if (ins.parentType != 0) {
+                setInputChannelInsertFlags(tgtCh, ip, true, false, phaseTag);
+            }
+        }
+
+        if (!clearPass && useStereoDyn8SetInserts && ins.parentType == 5 &&
+            isChannelStereo(tgtCh) && ((tgtCh & 1) == 1) && ip == 0) {
+            fprintf(stderr,
+                    "[MC]   [%s] Stereo Dyn8 route on odd ch %d handled by even pair mate\n",
+                    phaseTag, tgtCh + 1);
+            return;
+        }
+
+        if (!clearPass && ins.parentType == 5 && routeRecvPt && routeSendPt) {
+            uint8_t sendTasks[64];
+            uint8_t returnTasks[64];
+            memset(sendTasks, 0, sizeof(sendTasks));
+            memset(returnTasks, 0, sizeof(returnTasks));
+            createSendTargetTask(sendTasks, tgtChannel, routeRecvPt, ip, enable);
+            createReturnSourceTask(returnTasks, tgtChannel, routeSendPt, ip);
+            mergeTaskLists(sendTasks, returnTasks);
+            performTasks(g_audioSRPManager, sendTasks);
+        } else {
+            if (routeRecvPt) {
+                uint8_t buf[64];
+                memset(buf, 0, sizeof(buf));
+                createSendTargetTask(buf, tgtChannel, routeRecvPt, ip, enable);
+                performTasks(g_audioSRPManager, buf);
+            }
+            if (routeSendPt) {
+                uint8_t buf[64];
+                memset(buf, 0, sizeof(buf));
+                createReturnSourceTask(buf, tgtChannel, routeSendPt, ip);
+                performTasks(g_audioSRPManager, buf);
+            }
+        }
+
+        if (traceDyn8Route && !clearPass && ins.parentType == 5) {
+            usleep(100 * 1000);
+            ChannelSnapshot live;
+            if (snapshotChannel(tgtCh, live)) {
+                fprintf(stderr,
+                        "[MC]   [%s] Dyn8 trace after route ch %d: validDyn8=%d Insert%c type=%d send=%p recv=%p\n",
+                        phaseTag, tgtCh + 1, live.validDyn8, 'A' + ip,
+                        live.insertInfo[ip].parentType,
+                        live.insertInfo[ip].fxSendPt,
+                        live.insertInfo[ip].fxReceivePt);
+                destroySnapshot(live);
+            }
+        }
+    };
+
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        int liveIdx = tgtCh - plan.lo;
+        for (int ip = 0; ip < 2; ip++)
+            routeInsert(tgtCh, snaps[liveIdx].insertInfo[ip], ip, true);
+    }
+    if (plan.srcStart > plan.dstStart) {
+        for (auto it = plan.targetMap.rbegin(); it != plan.targetMap.rend(); ++it) {
+            for (int ip = 0; ip < 2; ip++)
+                routeInsert(it->first, snaps[it->second].insertInfo[ip], ip, false);
+        }
+    } else {
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            for (int ip = 0; ip < 2; ip++)
+                routeInsert(tgtCh, snaps[si].insertInfo[ip], ip, false);
+        }
+    }
+}
+
+static bool assignDyn8InsertWithSetInserts(int ch, int unitIdx, int ip, int variant, const char* phaseTag) {
+    if (!g_channelManager) return false;
+
+    typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    struct InsertPts {
+        void* recvA;
+        void* recvB;
+        void* sendA;
+        void* sendB;
+    };
+    typedef void (*fn_SetInserts)(void* channel, InsertPts insertPts, int insertPoint);
+    auto setInserts = (fn_SetInserts)RESOLVE(0x1006d9920);
+
+    void* cChannel = getChannel(g_channelManager, 1, (uint8_t)ch);
+    void* recvPt = getDyn8RecvPointFromManager(unitIdx);
+    void* sendPt = getDyn8SendPointFromManager(unitIdx);
+    if (!cChannel || !recvPt || !sendPt) {
+        fprintf(stderr,
+                "[MC]   [%s] SetInserts Dyn8 attach skipped on ch %d unit %d (ch=%p recv=%p send=%p)\n",
+                phaseTag, ch + 1, unitIdx, cChannel, recvPt, sendPt);
+        return false;
+    }
+
+    bool stereo = isChannelStereo(ch);
+    void* defaultRecv = getDefaultInsertReceivePoint();
+    void* defaultSend = getDefaultInsertSendPoint();
+
+    InsertPts pts = {};
+    switch (variant) {
+        case 1:
+            pts = {sendPt, sendPt, recvPt, recvPt};
+            break;
+        default:
+            pts.recvA = recvPt;
+            pts.sendA = sendPt;
+            if (stereo) {
+                pts.recvB = getDyn8RecvPointFromManager(unitIdx + 1);
+                pts.sendB = getDyn8SendPointFromManager(unitIdx + 1);
+            } else {
+                pts.recvB = defaultRecv;
+                pts.sendB = defaultSend;
+            }
+            break;
+    }
+    fprintf(stderr,
+            "[MC]   [%s] SetInserts Dyn8 attach variant=%d on ch %d ip=%d unit=%d recvA=%p recvB=%p sendA=%p sendB=%p stereo=%d\n",
+            phaseTag, variant, ch + 1, ip, unitIdx,
+            pts.recvA, pts.recvB, pts.sendA, pts.sendB,
+            stereo ? 1 : 0);
+    setInserts(cChannel, pts, ip);
+    return true;
+}
+
+static void setInputChannelInsertFlags(int ch, int ip, bool assigned, bool dynamics, const char* phaseTag) {
+    void* inputCh = getInputChannel(ch);
+    if (!inputCh) {
+        fprintf(stderr, "[MC]   [%s] AssignInsert skipped on ch %d ip=%d (no input channel)\n",
+                phaseTag, ch + 1, ip);
+        return;
+    }
+
+    typedef void (*fn_AssignInsert)(void* inputCh, bool assigned, bool dynamics);
+    auto assignInsert1 = (fn_AssignInsert)RESOLVE(0x100290490);
+    auto assignInsert2 = (fn_AssignInsert)RESOLVE(0x1002905b0);
+    auto fn = ip == 0 ? assignInsert1 : assignInsert2;
+    fprintf(stderr,
+            "[MC]   [%s] AssignInsert%c on ch %d assigned=%d dynamics=%d\n",
+            phaseTag, 'A' + ip, ch + 1, assigned ? 1 : 0, dynamics ? 1 : 0);
+    fn(inputCh, assigned, dynamics);
+}
+
+static void refreshDyn8InsertAssignment(int unitIdx, int tgtCh, const char* phaseTag) {
+    void* duc = getDynUnitClient(unitIdx);
+    if (!duc) {
+        fprintf(stderr,
+                "[MC]   [%s] Dyn8 refresh skipped for unit %d / ch %d (no DUC)\n",
+                phaseTag, unitIdx, tgtCh + 1);
+        return;
+    }
+
+    typedef void (*fn_InputConfigurationChanged)(void* duc);
+    typedef void (*fn_ReceivePointUpdated)(void* duc);
+    auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(0x1005e8a00);
+    auto receivePointUpdated = (fn_ReceivePointUpdated)RESOLVE(0x1005e81b0);
+
+    fprintf(stderr,
+            "[MC]   [%s] Dyn8 refresh unit %d / ch %d via InputConfigurationChanged + ReceivePointUpdated (duc=%p)\n",
+            phaseTag, unitIdx, tgtCh + 1, duc);
+    inputConfigurationChanged(duc);
+    receivePointUpdated(duc);
+}
+
+static bool writeProcOrderForChannel(int ch, const ChannelSnapshot& snap) {
+    if (!snap.validB[2]) return true;
+
+    uint8_t wantVal = snap.dataB[2].buf[1];
+    int attempts = wantVal ? 50 : 1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        void* inputCh = getInputChannel(ch);
+        if (inputCh) {
+            void* procOrderObj = getTypeBObj(inputCh, g_procB[2]);
+            if (procOrderObj) {
+                uint8_t procBuf[16] = {};
+                procBuf[0] = g_procB[2].versionByte;
+                procBuf[1] = wantVal;
+                writeTypeBFields(procOrderObj, g_procB[2], procBuf);
+                fprintf(stderr, "[MC]   ProcOrder settle write on ch %d: value=%u (attempt %d)\n",
+                        ch+1, wantVal, attempt + 1);
+                return true;
+            }
+        }
+
+        if (attempt + 1 < attempts) {
+            QApplication::processEvents();
+            usleep(100 * 1000);
+        }
+    }
+
+    if (wantVal) {
+        fprintf(stderr, "[MC]   WARN: ProcOrder object unavailable on ch %d while restoring value=%u\n",
+                ch+1, wantVal);
+        return false;
+    }
+    return true;
+}
+
+static bool compareSnapshotsForMove(const ChannelSnapshot& expected, const ChannelSnapshot& actual,
+                                    int ch, bool comparePatch) {
+    bool ok = true;
+
+    if (strcmp(expected.name, actual.name) != 0) {
+        fprintf(stderr, "[MC][VERIFY] ch %d name mismatch: expected '%s' got '%s'\n",
+                ch+1, expected.name, actual.name);
+        ok = false;
+    }
+    if (expected.colour != actual.colour) {
+        fprintf(stderr, "[MC][VERIFY] ch %d colour mismatch: expected %u got %u\n",
+                ch+1, expected.colour, actual.colour);
+        ok = false;
+    }
+    if (expected.isStereo != actual.isStereo) {
+        fprintf(stderr, "[MC][VERIFY] ch %d stereo mismatch: expected %d got %d\n",
+                ch+1, expected.isStereo, actual.isStereo);
+        ok = false;
+    }
+
+    for (int p = 0; p < NUM_PROC_A; p++) {
+        if (expected.validA[p] != actual.validA[p]) {
+            fprintf(stderr, "[MC][VERIFY] ch %d %s presence mismatch\n", ch+1, g_procA[p].name);
+            ok = false;
+            continue;
+        }
+        if (!expected.validA[p]) continue;
+
+        uint32_t expLen = getMsgLength(expected.msgA[p]);
+        uint32_t actLen = getMsgLength(actual.msgA[p]);
+        if (expLen != actLen) {
+            fprintf(stderr, "[MC][VERIFY] ch %d %s len mismatch: expected %u got %u\n",
+                    ch+1, g_procA[p].name, expLen, actLen);
+            ok = false;
+            continue;
+        }
+
+        void* expData = getMsgDataPtr(expected.msgA[p]);
+        void* actData = getMsgDataPtr(actual.msgA[p]);
+        if ((expLen > 0) && (!expData || !actData || memcmp(expData, actData, expLen) != 0)) {
+            fprintf(stderr, "[MC][VERIFY] ch %d %s payload mismatch\n", ch+1, g_procA[p].name);
+            ok = false;
+        }
+    }
+
+    for (int p = 0; p < NUM_PROC_B; p++) {
+        if (isInsertStatusProc(p)) continue;
+        if (p == 2) {
+            uint8_t expVal = expected.validB[p] ? expected.dataB[p].buf[1] : 0;
+            uint8_t actVal = actual.validB[p] ? actual.dataB[p].buf[1] : 0;
+            if (expVal != actVal) {
+                fprintf(stderr, "[MC][VERIFY] ch %d %s mismatch: expected %u got %u\n",
+                        ch+1, g_procB[p].name, expVal, actVal);
+                ok = false;
+            }
+            continue;
+        }
+        if (expected.validB[p] != actual.validB[p]) {
+            fprintf(stderr, "[MC][VERIFY] ch %d %s presence mismatch\n", ch+1, g_procB[p].name);
+            ok = false;
+            continue;
+        }
+        if (!expected.validB[p]) continue;
+        if ((expected.dataB[p].len != actual.dataB[p].len) ||
+            memcmp(expected.dataB[p].buf, actual.dataB[p].buf, expected.dataB[p].len) != 0) {
+            fprintf(stderr, "[MC][VERIFY] ch %d %s payload mismatch exp=[", ch+1, g_procB[p].name);
+            for (int i = 0; i < expected.dataB[p].len; i++) fprintf(stderr, "%s%02x", i ? " " : "", expected.dataB[p].buf[i]);
+            fprintf(stderr, "] got=[");
+            for (int i = 0; i < actual.dataB[p].len; i++) fprintf(stderr, "%s%02x", i ? " " : "", actual.dataB[p].buf[i]);
+            fprintf(stderr, "]\n");
+            ok = false;
+        }
+    }
+
+    if (expected.validMixer != actual.validMixer) {
+        fprintf(stderr, "[MC][VERIFY] ch %d mixer presence mismatch\n", ch+1);
+        ok = false;
+    } else if (expected.validMixer && expected.mixerData && actual.mixerData &&
+               memcmp(expected.mixerData, actual.mixerData, SINPUTATTRS_SIZE) != 0) {
+        fprintf(stderr, "[MC][VERIFY] ch %d mixer payload mismatch\n", ch+1);
+        ok = false;
+    }
+
+    if (expected.validPreamp != actual.validPreamp) {
+        fprintf(stderr, "[MC][VERIFY] ch %d preamp presence mismatch\n", ch+1);
+        ok = false;
+    } else if (expected.validPreamp) {
+        if (expected.preampData.gain != actual.preampData.gain ||
+            expected.preampData.pad != actual.preampData.pad ||
+            expected.preampData.phantom != actual.preampData.phantom) {
+            fprintf(stderr, "[MC][VERIFY] ch %d preamp mismatch\n", ch+1);
+            ok = false;
+        }
+    }
+
+    if (comparePatch) {
+        if (expected.validPatch != actual.validPatch) {
+            fprintf(stderr, "[MC][VERIFY] ch %d patch presence mismatch\n", ch+1);
+            ok = false;
+        } else if (expected.validPatch &&
+                   memcmp(&expected.patchData, &actual.patchData, sizeof(PatchData)) != 0) {
+            fprintf(stderr, "[MC][VERIFY] ch %d patch mismatch\n", ch+1);
+            ok = false;
+        }
+    }
+
+    for (int ip = 0; ip < 2; ip++) {
+        if (expected.insertInfo[ip].hasInsert != actual.insertInfo[ip].hasInsert ||
+            expected.insertInfo[ip].parentType != actual.insertInfo[ip].parentType) {
+            fprintf(stderr,
+                    "[MC][VERIFY] ch %d Insert%c routing mismatch exp={has=%d type=%d send=%p recv=%p} got={has=%d type=%d send=%p recv=%p}\n",
+                    ch+1, 'A'+ip,
+                    expected.insertInfo[ip].hasInsert, expected.insertInfo[ip].parentType,
+                    expected.insertInfo[ip].fxSendPt, expected.insertInfo[ip].fxReceivePt,
+                    actual.insertInfo[ip].hasInsert, actual.insertInfo[ip].parentType,
+                    actual.insertInfo[ip].fxSendPt, actual.insertInfo[ip].fxReceivePt);
+            ok = false;
+        }
+    }
+
+    if (expected.validDyn8 != actual.validDyn8) {
+        fprintf(stderr, "[MC][VERIFY] ch %d Dyn8 presence mismatch\n", ch+1);
+        ok = false;
+    } else if (expected.validDyn8 &&
+               memcmp(expected.dyn8Data, actual.dyn8Data, sizeof(expected.dyn8Data)) != 0) {
+        fprintf(stderr, "[MC][VERIFY] ch %d Dyn8 data mismatch\n", ch+1);
+        ok = false;
+    }
+
+    return ok;
+}
+
+static bool runAutomatedMoveTest() {
+    const char* srcEnv = getenv("MC_AUTOTEST_SRC");
+    const char* dstEnv = getenv("MC_AUTOTEST_DST");
+    if (!srcEnv || !dstEnv) return false;
+
+    int src = atoi(srcEnv) - 1;  // user-facing 1-based
+    int dst = atoi(dstEnv) - 1;
+    bool movePatchWithChannel = false;
+    if (const char* patchEnv = getenv("MC_AUTOTEST_MOVE_PATCH")) {
+        movePatchWithChannel = (atoi(patchEnv) != 0);
+    }
+
+    bool forceStereo = false;
+    bool moveMonoBlock = false;
+    bool prepareRange = true;
+    if (const char* modeEnv = getenv("MC_AUTOTEST_MODE")) {
+        if (strcmp(modeEnv, "stereo") == 0)
+            forceStereo = true;
+        if (strcmp(modeEnv, "mono2") == 0 || strcmp(modeEnv, "mono_pair") == 0)
+            moveMonoBlock = true;
+    }
+    if (const char* noPrepEnv = getenv("MC_AUTOTEST_NO_PREP")) {
+        if (atoi(noPrepEnv) != 0)
+            prepareRange = false;
+    }
+    bool prepScene21 = false;
+    if (const char* sceneEnv = getenv("MC_AUTOTEST_PREP_SCENE21")) {
+        prepScene21 = (atoi(sceneEnv) != 0);
+    }
+
+    if (prepScene21 && !prepareScene21MoveTest()) {
+        fprintf(stderr, "[MC][AUTOTEST] failed to prepare scene 21 test layout\n");
+        return false;
+    }
+
+    if (const char* probeLibEnv = getenv("MC_PROBE_LIBRARY_TYPES")) {
+        if (atoi(probeLibEnv) != 0)
+            probeLibraryTypesForChannel(src);
+    }
+
+    if (forceStereo && !isChannelStereo(src)) {
+        fprintf(stderr, "[MC][AUTOTEST] forcing source pair %d+%d to stereo before move\n", (src & ~1) + 1, (src & ~1) + 2);
+        if (!changeStereoConfig(src, true)) {
+            fprintf(stderr, "[MC][AUTOTEST] failed to force stereo config on source pair\n");
+            return false;
+        }
+    }
+
+    MovePlan plan;
+    char err[256];
+    if (!buildMovePlan(src, dst, moveMonoBlock, plan, err, sizeof(err))) {
+        fprintf(stderr, "[MC][AUTOTEST] invalid test plan: %s\n", err[0] ? err : "unknown");
+        return false;
+    }
+
+    if (prepareRange) {
+        fprintf(stderr, "[MC][AUTOTEST] preparing range %d-%d for move test\n", plan.lo+1, plan.hi+1);
+        for (int ch = plan.lo; ch <= plan.hi; ch++) {
+            char nameBuf[64];
+            snprintf(nameBuf, sizeof(nameBuf), "MC-%02d", ch + 1);
+            g_setChannelName(g_audioDM, 1, (uint8_t)ch, nameBuf);
+            g_setChannelColour(g_audioDM, 1, (uint8_t)ch, (uint8_t)((ch % 16) + 1));
+            setDelayForChannel(ch, (uint16_t)(50 + (ch - plan.lo) * 37), false);
+        }
+    } else {
+        fprintf(stderr, "[MC][AUTOTEST] using existing live range %d-%d without preparation\n", plan.lo+1, plan.hi+1);
+    }
+
+    std::vector<ChannelSnapshot> expected(plan.hi - plan.lo + 1);
+    for (int i = 0; i < (int)expected.size(); i++) {
+        if (!snapshotChannel(plan.lo + i, expected[i])) {
+            fprintf(stderr, "[MC][AUTOTEST] failed to snapshot prepared channel %d\n", plan.lo + i + 1);
+            for (int j = 0; j <= i; j++) destroySnapshot(expected[j]);
+            return false;
+        }
+        dumpChannelData(plan.lo + i, "Autotest-Before");
+    }
+
+    for (int i = 0; i < (int)expected.size(); i++) {
+        for (int p = 5; p <= 6; p++) {
+            if (!expected[i].validB[p]) continue;
+            expected[i].dataB[p].buf[2] = remapMovedChannelRef(expected[i].dataB[p].buf[2], plan);
+        }
+    }
+    for (auto& [tgtCh, snapIdx] : plan.targetMap) {
+        int srcCh = plan.lo + snapIdx;
+        if (!expected[snapIdx].validPatch) continue;
+        expected[snapIdx].patchData =
+            getTargetPatchDataForMove(expected[snapIdx].patchData, srcCh, tgtCh, movePatchWithChannel);
+    }
+    bool moved = moveChannel(src, dst, movePatchWithChannel, moveMonoBlock);
+    bool ok = moved;
+    if (moved) {
+        for (auto& [tgtCh, snapIdx] : plan.targetMap) {
+            ChannelSnapshot live;
+            if (!snapshotChannel(tgtCh, live)) {
+                fprintf(stderr, "[MC][AUTOTEST] failed to snapshot target %d after move\n", tgtCh + 1);
+                ok = false;
+                continue;
+            }
+            dumpChannelData(tgtCh, "Autotest-After");
+            if (!compareSnapshotsForMove(expected[snapIdx], live, tgtCh, true))
+                ok = false;
+            destroySnapshot(live);
+        }
+    }
+
+    for (auto& snap : expected) destroySnapshot(snap);
+
+    fprintf(stderr, "[MC][AUTOTEST] RESULT: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool buildMovePlan(int src, int dst, bool moveAdjacentMonoPair,
+                          MovePlan& plan, char* errBuf = nullptr, size_t errBufLen = 0) {
+    plan = MovePlan();
+    plan.rawSrc = src;
+    plan.rawDst = dst;
+
+    if (errBuf && errBufLen) errBuf[0] = '\0';
+    auto setErr = [&](const char* fmt, int a = 0, int b = 0) {
+        if (errBuf && errBufLen) snprintf(errBuf, errBufLen, fmt, a, b);
+    };
+
+    if (src < 0 || src > 127 || dst < 0 || dst > 127) {
+        setErr("invalid channel number");
+        return false;
+    }
+
+    plan.srcStereo = isChannelStereo(src);
+    if (plan.srcStereo) {
+        plan.blockSize = 2;
+        plan.srcStart = src & ~1;
+        plan.dstStart = dst & ~1;
+    } else if (moveAdjacentMonoPair) {
+        if (src >= 127) {
+            setErr("two-channel mono move needs a following channel");
+            return false;
+        }
+        if (isChannelStereo(src + 1)) {
+            setErr("source channels %d+%d are not two independent mono channels", src + 1, src + 2);
+            return false;
+        }
+        plan.blockSize = 2;
+        plan.srcStart = src;
+        plan.dstStart = dst;
+        plan.srcMonoBlock = true;
+    } else {
+        plan.blockSize = 1;
+        plan.srcStart = src;
+        plan.dstStart = dst;
+    }
+
+    if (plan.dstStart < 0 || plan.dstStart + plan.blockSize - 1 > 127) {
+        setErr("destination would exceed channel 128");
+        return false;
+    }
+
+    if (plan.srcStart == plan.dstStart) {
+        plan.lo = plan.srcStart;
+        plan.hi = plan.srcStart + plan.blockSize - 1;
+        return true;
+    }
+
+    if (plan.srcStart < plan.dstStart) {
+        plan.lo = plan.srcStart;
+        plan.hi = plan.dstStart + plan.blockSize - 1;
+    } else {
+        plan.lo = plan.dstStart;
+        plan.hi = plan.srcStart + plan.blockSize - 1;
+    }
+
+    if (plan.blockSize == 1) {
+        for (int pairStart = (plan.lo & ~1); pairStart <= plan.hi; pairStart += 2) {
+            if (pairStart < 0 || pairStart + 1 > 127) continue;
+            if (!isChannelStereo(pairStart)) continue;
+            setErr("mono move crosses stereo pair %d+%d", pairStart + 1, pairStart + 2);
+            return false;
+        }
+    } else if (plan.srcMonoBlock) {
+        if ((plan.dstStart & 1) != 0 && isChannelStereo(plan.dstStart - 1)) {
+            if (errBuf && errBufLen) {
+                snprintf(errBuf, errBufLen,
+                         "destination %d+%d would split stereo pair %d+%d",
+                         plan.dstStart + 1, plan.dstStart + 2,
+                         plan.dstStart, plan.dstStart + 1);
+            }
+            return false;
+        }
+    }
+
+    if (plan.srcStart < plan.dstStart) {
+        for (int tgt = plan.lo; tgt < plan.dstStart; tgt++) {
+            int srcCh = tgt + plan.blockSize;
+            plan.targetMap.push_back({tgt, srcCh - plan.lo});
+        }
+        for (int i = 0; i < plan.blockSize; i++) {
+            plan.targetMap.push_back({plan.dstStart + i, plan.srcStart + i - plan.lo});
+        }
+    } else {
+        for (int i = 0; i < plan.blockSize; i++) {
+            plan.targetMap.push_back({plan.dstStart + i, plan.srcStart + i - plan.lo});
+        }
+        for (int tgt = plan.dstStart + plan.blockSize; tgt <= plan.hi; tgt++) {
+            int srcCh = tgt - plan.blockSize;
+            plan.targetMap.push_back({tgt, srcCh - plan.lo});
+        }
+    }
+
+    return true;
+}
+
+static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan) {
+    int srcLo = plan.srcStart;
+    int srcHi = plan.srcStart + plan.blockSize - 1;
+    int dstLo = plan.dstStart;
+    int dstHi = plan.dstStart + plan.blockSize - 1;
+
+    if (oldRef >= srcLo && oldRef <= srcHi)
+        return (uint8_t)(dstLo + (oldRef - srcLo));
+
+    if (srcLo < dstLo) {
+        if (oldRef > srcHi && oldRef <= dstHi)
+            return (uint8_t)(oldRef - plan.blockSize);
+    } else {
+        if (oldRef >= dstLo && oldRef < srcLo)
+            return (uint8_t)(oldRef + plan.blockSize);
+    }
+
+    return oldRef;
+}
+
+static PatchData remapPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh) {
+    PatchData out = pd;
+    if (!isLocalAnaloguePatch(pd))
+        return out;
+
+    int delta = tgtCh - srcCh;
+    int newNumber = (int)pd.source.number + delta;
+    if (newNumber < 0 || newNumber > 127) {
+        fprintf(stderr,
+                "[MC]   WARN: patch remap src socket %u + delta %d is out of range for ch %d; keeping original\n",
+                pd.source.number, delta, tgtCh + 1);
+        return out;
+    }
+
+    out.source.number = (uint32_t)newNumber;
+    fprintf(stderr,
+            "[MC]   Patch remap srcCh %d -> tgtCh %d: local socket %u -> %u\n",
+            srcCh + 1, tgtCh + 1, pd.source.number, out.source.number);
+    return out;
+}
+
+static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int tgtCh,
+                                           bool movePatchWithChannel) {
+    return movePatchWithChannel ? pd : remapPatchDataForMove(pd, srcCh, tgtCh);
+}
+
 // =============================================================================
 // Move Channel
 // =============================================================================
-static bool moveChannel(int src, int dst, bool keepPatching = true) {
-    if (src == dst) { fprintf(stderr, "[MC] Same position, nothing to do.\n"); return true; }
-    if (src < 0 || src > 127 || dst < 0 || dst > 127) {
-        fprintf(stderr, "[MC] Invalid channel numbers.\n"); return false;
+static bool moveChannel(int src, int dst, bool movePatchWithChannel = false, bool moveAdjacentMonoPair = false) {
+    MovePlan plan;
+    char planErr[256];
+    if (!buildMovePlan(src, dst, moveAdjacentMonoPair, plan, planErr, sizeof(planErr))) {
+        fprintf(stderr, "[MC] Unsupported move: %s\n", planErr[0] ? planErr : "unknown error");
+        return false;
     }
 
-    int lo = src < dst ? src : dst;
-    int hi = src < dst ? dst : src;
-    int rangeSize = hi - lo + 1;
+    if (plan.srcStart == plan.dstStart) {
+        fprintf(stderr, "[MC] Same position after normalization, nothing to do.\n");
+        return true;
+    }
 
-    fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s] ===\n",
-            src+1, dst+1, lo+1, hi+1, keepPatching ? "keep at position" : "shift with channel");
+    int lo = plan.lo;
+    int hi = plan.hi;
+    int rangeSize = hi - lo + 1;
+    bool hadStereoConfigChange = false;
+    std::vector<int> monoizedPairs;
+    std::vector<int> stereoizedPairs;
+
+    if (plan.srcStereo) {
+        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (normalized %d+%d → %d+%d, range %d-%d) [patching: %s] ===\n",
+                src+1, dst+1,
+                plan.srcStart+1, plan.srcStart+2,
+                plan.dstStart+1, plan.dstStart+2,
+                lo+1, hi+1,
+                movePatchWithChannel ? "move with channel" : "shift by move amount");
+    } else if (plan.srcMonoBlock) {
+        fprintf(stderr, "[MC] === MOVE mono block %d+%d → %d+%d (range %d-%d) [patching: %s] ===\n",
+                plan.srcStart+1, plan.srcStart+2,
+                plan.dstStart+1, plan.dstStart+2,
+                lo+1, hi+1,
+                movePatchWithChannel ? "move with channel" : "shift by move amount");
+    } else {
+        fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s] ===\n",
+                src+1, dst+1, lo+1, hi+1,
+                movePatchWithChannel ? "move with channel" : "shift by move amount");
+    }
+    if (plan.srcStereo) {
+        fprintf(stderr, "[MC] Stereo source pair: %d+%d → %d+%d\n",
+                plan.srcStart+1, plan.srcStart+2, plan.dstStart+1, plan.dstStart+2);
+    }
+
+    uint64_t moveStartMs = monotonicMs();
+    auto phase = [&](const char* label) {
+        fprintf(stderr, "[MC][%6llums] %s\n",
+                (unsigned long long)(monotonicMs() - moveStartMs), label);
+    };
 
     // Snapshot all channels in range
+    phase("Phase: snapshot move range");
     std::vector<ChannelSnapshot> snaps(rangeSize);
     for (int i = 0; i < rangeSize; i++) {
         int ch = lo + i;
@@ -1770,24 +3061,12 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
     // Remap sidechain channel references to account for position shifts.
     // After the move: src goes to dst, and channels in between shift by 1.
     // Any sidechain reference pointing to a channel in [lo..hi] needs remapping.
-    auto remapCh = [&](uint8_t oldRef) -> uint8_t {
-        if (oldRef == (uint8_t)src) return (uint8_t)dst;
-        if (src < dst) {
-            // Channels (src,dst] shift up by 1 position (i.e., their index decreases by 1)
-            if (oldRef > (uint8_t)src && oldRef <= (uint8_t)dst)
-                return oldRef - 1;
-        } else {
-            // Channels [dst,src) shift down by 1 position (i.e., their index increases by 1)
-            if (oldRef >= (uint8_t)dst && oldRef < (uint8_t)src)
-                return oldRef + 1;
-        }
-        return oldRef;
-    };
+    phase("Phase: remap sidechain references");
     for (int i = 0; i < rangeSize; i++) {
-        for (int p = 6; p <= 7; p++) { // SideChain1 (p=6), SideChain2 (p=7)
+        for (int p = 5; p <= 6; p++) { // SideChain1 (p=5), SideChain2 (p=6)
             if (!snaps[i].validB[p]) continue;
             uint8_t oldCh = snaps[i].dataB[p].buf[2];
-            uint8_t newCh = remapCh(oldCh);
+            uint8_t newCh = remapMovedChannelRef(oldCh, plan);
             if (oldCh != newCh) {
                 fprintf(stderr, "[MC]   Remap %s snap[%d] channel %d → %d\n",
                         g_procB[p].name, lo+i+1, oldCh, newCh);
@@ -1796,37 +3075,146 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
         }
     }
 
-    // Build Dyn8 transfer map: which snapshot's Dyn8 message goes to which target unit
-    struct Dyn8Transfer { int tgtUnitIdx; int snapIdx; };
-    std::vector<Dyn8Transfer> dyn8Transfers;
-    {
-        std::vector<std::pair<int,int>> dyn8Map; // (tgtCh, snapIdx)
-        if (src < dst) {
-            for (int i = 0; i < rangeSize - 1; i++)
-                dyn8Map.push_back({lo + i, 1 + i});
-            dyn8Map.push_back({hi, 0});
-        } else {
-            dyn8Map.push_back({lo, rangeSize - 1});
-            for (int i = 0; i < rangeSize - 1; i++)
-                dyn8Map.push_back({lo + 1 + i, i});
+    if (!movePatchWithChannel) {
+        struct PlannedPreampWrite {
+            uint32_t socketNum;
+            int srcCh;
+            int tgtCh;
+            PreampData data;
+        };
+        std::vector<PlannedPreampWrite> plannedWrites;
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            if (!snaps[si].validPatch || !snaps[si].validPreamp) continue;
+            int srcCh = lo + si;
+            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
+            if (!isLocalAnaloguePatch(tgtPatch)) continue;
+
+            for (const auto& planned : plannedWrites) {
+                if (planned.socketNum != tgtPatch.source.number) continue;
+                if (!samePreampData(planned.data, snaps[si].preampData)) {
+                    fprintf(stderr,
+                            "[MC] ERROR: Scenario A preamp conflict on target socket %u:"
+                            " ch %d -> %d wants gain=%d pad=%d phantom=%d,"
+                            " but ch %d -> %d wants gain=%d pad=%d phantom=%d\n",
+                            tgtPatch.source.number,
+                            planned.srcCh + 1, planned.tgtCh + 1,
+                            planned.data.gain, planned.data.pad, planned.data.phantom,
+                            srcCh + 1, tgtCh + 1,
+                            snaps[si].preampData.gain, snaps[si].preampData.pad, snaps[si].preampData.phantom);
+                    for (int i = 0; i < rangeSize; i++) destroySnapshot(snaps[i]);
+                    return false;
+                }
+            }
+
+            plannedWrites.push_back({tgtPatch.source.number, srcCh, tgtCh, snaps[si].preampData});
         }
-        for (auto& [tgtCh, si] : dyn8Map) {
-            if (!snaps[si].validDyn8) continue;
+    }
+
+    bool useDyn8LibraryExperiment = false;
+    if (const char* libEnv = getenv("MC_AUTOTEST_DYN8_LIBRARY")) {
+        useDyn8LibraryExperiment = (atoi(libEnv) != 0);
+    }
+    bool useInputLibraryExperiment = false;
+    if (const char* libEnv = getenv("MC_AUTOTEST_INPUT_LIBRARY")) {
+        useInputLibraryExperiment = (atoi(libEnv) != 0);
+    }
+
+    // Dyn8 is an external insert pool. Keep each channel bound to its original
+    // pool unit when it moves instead of rebinding the insert to the target slot.
+    struct Dyn8Transfer {
+        int tgtUnitIdx;
+        int tgtCh;
+        int snapIdx;
+        int ip;
+        bool validData;
+        uint8_t dyn8Data[0x94];
+    };
+    struct Dyn8LibraryRecall {
+        int tgtCh;
+        int tgtUnitIdx;
+        int snapIdx;
+        char presetName[128];
+        char storedObjName[128];
+    };
+    struct InputLibraryRecall {
+        int tgtCh;
+        int snapIdx;
+        char presetName[128];
+    };
+    std::vector<Dyn8Transfer> dyn8Transfers;
+    std::vector<Dyn8LibraryRecall> dyn8LibraryRecalls;
+    std::vector<InputLibraryRecall> inputLibraryRecalls;
+    phase("Phase: preserve Dyn8 state");
+    {
+        for (auto& [tgtCh, si] : plan.targetMap) {
             for (int ip = 0; ip < 2; ip++) {
                 if (snaps[si].insertInfo[ip].hasInsert && snaps[si].insertInfo[ip].parentType == 5) {
-                    Dyn8Transfer xfer;
-                    xfer.tgtUnitIdx = tgtCh; // target's OWN Dyn8 unit (unit index == channel index)
+                    int dynIdx = findDyn8UnitIdx(snaps[si].insertInfo[ip].fxSendPt);
+                    if (dynIdx < 0) {
+                        fprintf(stderr,
+                                "[MC] Dyn8 preserve: snap[%d] Insert%c on ch %d could not resolve unit index\n",
+                                si, 'A' + ip, tgtCh + 1);
+                        continue;
+                    }
+                    Dyn8Transfer xfer = {};
+                    xfer.tgtUnitIdx = dynIdx;
+                    xfer.tgtCh = tgtCh;
                     xfer.snapIdx = si;
-                    // dyn8Data is in the snapshot, no need to copy
+                    xfer.ip = ip;
+                    xfer.validData = false;
+                    void* dynNetObj = getDynNetObj(dynIdx);
+                    if (dynNetObj) {
+                        safeRead((uint8_t*)dynNetObj + 0x98, xfer.dyn8Data, sizeof(xfer.dyn8Data));
+                        xfer.validData = true;
+                    }
+                    fprintf(stderr,
+                            "[MC] Dyn8 preserve: snap[%d] keeps Insert%c unit %d while moving to ch %d (data=%d)\n",
+                            si, 'A' + ip, dynIdx, tgtCh + 1, xfer.validData ? 1 : 0);
                     dyn8Transfers.push_back(xfer);
-                    fprintf(stderr, "[MC] Dyn8 transfer: snap[%d] (unit %d) → target unit %d (ch %d)\n",
-                            si, snaps[si].dyn8UnitIdx, tgtCh, tgtCh+1);
-                    break;
+                    if (useDyn8LibraryExperiment) {
+                        Dyn8LibraryRecall recall = {};
+                        recall.tgtCh = tgtCh;
+                        recall.tgtUnitIdx = dynIdx;
+                        recall.snapIdx = si;
+                        snprintf(recall.presetName, sizeof(recall.presetName),
+                                 "MC-DYN8-%d-%d-%d-%d",
+                                 (int)getpid(), plan.srcStart + 1, plan.dstStart + 1, tgtCh + 1);
+                        getDynUnitName(dynIdx, recall.storedObjName, sizeof(recall.storedObjName));
+                        if (libraryStoreDyn8(dynIdx, recall.presetName)) {
+                            fprintf(stderr,
+                                    "[MC] Dyn8 library experiment: stored Insert%c unit %d for target ch %d as '%s'\n",
+                                    'A' + ip, dynIdx, tgtCh + 1, recall.presetName);
+                            dyn8LibraryRecalls.push_back(recall);
+                        } else {
+                            fprintf(stderr,
+                                    "[MC] Dyn8 library experiment: failed to store Insert%c unit %d for target ch %d\n",
+                                    'A' + ip, dynIdx, tgtCh + 1);
+                        }
+                    }
                 }
             }
         }
     }
-
+    auto refreshStereoDyn8Assignments = [&](const char* phaseTag) {
+        if (g_dynRack) {
+            typedef void (*fn_InputConfigurationChanged)(void* rack);
+            auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(0x1005ce2f0);
+            fprintf(stderr,
+                    "[MC]   [%s] DynamicsRack InputConfigurationChanged (rack=%p)\n",
+                    phaseTag, g_dynRack);
+            inputConfigurationChanged(g_dynRack);
+        }
+        std::set<std::pair<int, int>> refreshedSlots;
+        for (auto& xfer : dyn8Transfers) {
+            if (!snaps[xfer.snapIdx].isStereo) continue;
+            if ((xfer.tgtCh & 1) != 0) continue;
+            if (!refreshedSlots.insert({xfer.tgtCh / 2, xfer.ip}).second) continue;
+            assignDyn8InsertWithSetInserts(xfer.tgtCh, xfer.tgtUnitIdx, xfer.ip, 0, phaseTag);
+            refreshDyn8InsertAssignment(xfer.tgtUnitIdx, xfer.tgtCh, phaseTag);
+            refreshDyn8InsertAssignment(xfer.tgtUnitIdx + 1, xfer.tgtCh + 1, phaseTag);
+        }
+        QApplication::processEvents();
+    };
     // =========================================================================
     // Stereo alignment: change stereo config at destination pairs if needed
     // Must happen AFTER snapshot (which preserves settings) but BEFORE recall.
@@ -1835,46 +3223,69 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
     // Channels OUTSIDE the move range but in affected pairs must be separately
     // snapshotted and restored here.
     // =========================================================================
+    phase("Phase: stereo alignment");
     {
-        // Build target mapping: targetCh[i] gets snapshot snapIdx
-        std::vector<std::pair<int,int>> targetMap; // (targetCh, snapIdx)
-        if (src < dst) {
-            for (int i = 0; i < rangeSize - 1; i++)
-                targetMap.push_back({lo + i, 1 + i});
-            targetMap.push_back({hi, 0});
-        } else {
-            targetMap.push_back({lo, rangeSize - 1});
-            for (int i = 0; i < rangeSize - 1; i++)
-                targetMap.push_back({lo + 1 + i, i});
-        }
-
         // Read current stereo config
         uint8_t config[64];
         bool configRead = readStereoConfig(config);
         bool configChanged = false;
 
         if (configRead) {
-            // For each target channel, check if source's stereo status matches target's pair
-            // A pair's state is determined by the snapshot that lands on its even channel.
             std::set<int> pairsToChange;
-            for (auto& [tgtCh, si] : targetMap) {
-                int tgtPair = tgtCh / 2;
+            for (int tgtPair = lo / 2; tgtPair <= hi / 2; tgtPair++) {
+                int evenCh = tgtPair * 2;
+                int si = -1;
+                for (auto& [tgtCh, snapIdx] : plan.targetMap) {
+                    if (tgtCh == evenCh) {
+                        si = snapIdx;
+                        break;
+                    }
+                }
+                if (si < 0) continue;
+
                 bool snapStereo = snaps[si].isStereo;
                 bool tgtCurrentStereo = (config[tgtPair] != 0);
 
                 if (snapStereo != tgtCurrentStereo) {
-                    if (tgtCh == tgtPair * 2) {
-                        config[tgtPair] = snapStereo ? 1 : 0;
-                        pairsToChange.insert(tgtPair);
-                        fprintf(stderr, "[MC] Stereo align: pair %d (ch %d+%d) → %s (from snap '%s')\n",
-                                tgtPair, tgtPair*2+1, tgtPair*2+2,
-                                snapStereo ? "STEREO" : "MONO", snaps[si].name);
-                        configChanged = true;
-                    }
+                    config[tgtPair] = snapStereo ? 1 : 0;
+                    pairsToChange.insert(tgtPair);
+                    if (!snapStereo)
+                        monoizedPairs.push_back(tgtPair);
+                    else
+                        stereoizedPairs.push_back(tgtPair);
+                    fprintf(stderr, "[MC] Stereo align: pair %d (ch %d+%d) → %s (from snap '%s')\n",
+                            tgtPair, tgtPair*2+1, tgtPair*2+2,
+                            snapStereo ? "STEREO" : "MONO", snaps[si].name);
+                    configChanged = true;
                 }
             }
 
             if (configChanged) {
+                hadStereoConfigChange = true;
+                if (useInputLibraryExperiment) {
+                    for (int pair : monoizedPairs) {
+                        for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                            for (auto& [tgtCh, si] : plan.targetMap) {
+                                if (tgtCh != ch) continue;
+                                int srcCh = lo + si;
+                                InputLibraryRecall recall = {};
+                                recall.tgtCh = tgtCh;
+                                recall.snapIdx = si;
+                                snprintf(recall.presetName, sizeof(recall.presetName),
+                                         "MC-ICH-%d-%d-%d-%d",
+                                         (int)getpid(), plan.srcStart + 1, plan.dstStart + 1, tgtCh + 1);
+                                if (libraryStoreInputChannel(srcCh, recall.presetName)) {
+                                    inputLibraryRecalls.push_back(recall);
+                                } else {
+                                    fprintf(stderr,
+                                            "[MC] input library experiment: failed to store ch %d for target %d\n",
+                                            srcCh + 1, tgtCh + 1);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
                 // Find channels OUTSIDE the move range [lo..hi] that are in affected pairs
                 // and snapshot them so we can restore after the stereo config change.
                 std::vector<std::pair<int, ChannelSnapshot>> extraSnaps;
@@ -1903,19 +3314,9 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
 
                 fprintf(stderr, "[MC] Applying stereo config changes (%zu pairs, %zu extra snapshots)...\n",
                         pairsToChange.size(), extraSnaps.size());
-                if (!writeStereoConfig(config)) {
-                    fprintf(stderr, "[MC] WARNING: failed to write stereo config!\n");
+                if (!applyStereoConfigAndRefresh(config, "[MC] moveChannel stereo align")) {
+                    fprintf(stderr, "[MC] WARNING: failed to apply stereo config via discovery path!\n");
                 } else {
-                    typedef void (*fn_NewStereoConfig)(void* dm, const uint8_t* config);
-                    auto newStereoConfig = (fn_NewStereoConfig)RESOLVE(0x1001a0f10);
-                    newStereoConfig(g_audioDM, config);
-
-                    void* app = g_AppInstance();
-                    if (app) {
-                        typedef void (*fn_NewInputConfig)(void* app, bool flag);
-                        auto newInputConfig = (fn_NewInputConfig)RESOLVE(0x100d6e0c0);
-                        newInputConfig(app, true);
-                    }
                     fprintf(stderr, "[MC] Stereo config applied.\n");
 
                     // Restore extra snapshots (channels outside move range)
@@ -1935,41 +3336,18 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
         }
     }
 
-    // Write in new order
-    // In Scenario B (!keepPatching), skip preamp — SetInputChannelSource moves it with socket
-    bool skipPreamp = !keepPatching;
-    if (src < dst) {
-        // Move DOWN: src→dst, others shift up
-        for (int i = 0; i < rangeSize - 1; i++) {
-            fprintf(stderr, "[MC] Recall '%s' → pos %d\n", snaps[1+i].name, lo+i+1);
-            recallChannel(lo + i, snaps[1 + i], skipPreamp);
-        }
-        fprintf(stderr, "[MC] Recall '%s' → pos %d\n", snaps[0].name, hi+1);
-        recallChannel(hi, snaps[0], skipPreamp);
-    } else {
-        // Move UP: src→dst, others shift down
-        fprintf(stderr, "[MC] Recall '%s' → pos %d\n", snaps[rangeSize-1].name, lo+1);
-        recallChannel(lo, snaps[rangeSize - 1], skipPreamp);
-        for (int i = 0; i < rangeSize - 1; i++) {
-            fprintf(stderr, "[MC] Recall '%s' → pos %d\n", snaps[i].name, lo+1+i+1);
-            recallChannel(lo + 1 + i, snaps[i], skipPreamp);
-        }
+    // Write in new order. Preamp state is restored separately after patching,
+    // because gain/pad/phantom live on the assigned socket, not on the strip.
+    bool skipPreamp = true;
+    phase("Phase: recall channels to target positions");
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        fprintf(stderr, "[MC] Recall '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+        recallChannel(tgtCh, snaps[si], skipPreamp);
     }
 
-    // Patching: Scenario B — shift socket assignments with channels
-    if (!keepPatching) {
-        fprintf(stderr, "[MC] Writing patching (Scenario B)...\n");
-        // Build array mapping: targetCh[i] gets the patchData from snapIdx
-        std::vector<std::pair<int,int>> patchOrder; // (targetCh, snapIdx)
-        if (src < dst) {
-            for (int i = 0; i < rangeSize - 1; i++)
-                patchOrder.push_back({lo + i, 1 + i});
-            patchOrder.push_back({hi, 0});
-        } else {
-            patchOrder.push_back({lo, rangeSize - 1});
-            for (int i = 0; i < rangeSize - 1; i++)
-                patchOrder.push_back({lo + 1 + i, i});
-        }
+    phase("Phase: rewrite patching");
+    fprintf(stderr, "[MC] Writing patching (%s)...\n",
+            movePatchWithChannel ? "move sockets with channel" : "shift sockets by move amount");
         // Use CSV import path: cChannel::SetInputChannelSource via task system
         // This is what Import CSV uses — full update + UI refresh
         typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
@@ -1982,277 +3360,519 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
                                                   void* sendPt, void* sendPt2);
         auto setInputSource = (fn_SetInputChannelSource)RESOLVE(0x1006d8410);
 
-        for (auto& [tgtCh, si] : patchOrder) {
+        for (auto& [tgtCh, si] : plan.targetMap) {
             if (!snaps[si].validPatch) continue;
-            sAudioSource& src = snaps[si].patchData.source;
+            int srcCh = lo + si;
+            PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
+
+            bool tgtStereo = isChannelStereo(tgtCh);
+            if (tgtStereo && (tgtCh & 1)) {
+                fprintf(stderr,
+                        "[MC]   Patch ch %d skipped; stereo pair handled by ch %d\n",
+                        tgtCh + 1, tgtCh);
+                continue;
+            }
+
+            sAudioSource& src = tgtPatch.source;
             fprintf(stderr, "[MC]   Patch ch %d: srcType=%d src={type=%d, num=%d}\n",
-                    tgtCh+1, snaps[si].patchData.sourceType,
+                    tgtCh+1, tgtPatch.sourceType,
                     src.type, src.number);
 
             if (!g_channelManager || !g_audioSRPManager) {
                 fprintf(stderr, "[MC]   WARN: channelMgr or audioSRPMgr not available, falling back to writePatchData\n");
-                writePatchData(tgtCh, snaps[si].patchData);
+                writePatchData(tgtCh, tgtPatch);
                 continue;
             }
 
-            // Get cChannel* for target
             void* ch = getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh);
             if (!ch) {
                 fprintf(stderr, "[MC]   WARN: GetChannel(%d) returned null\n", tgtCh);
-                writePatchData(tgtCh, snaps[si].patchData);
+                writePatchData(tgtCh, tgtPatch);
                 continue;
             }
 
-            // Get cAudioSendPoint* for desired source
-            void* sendPt = getSendPoint(g_audioSRPManager, src.type, (uint16_t)src.number);
-            fprintf(stderr, "[MC]   ch=%p sendPt=%p\n", ch, sendPt);
+            void* sendPtA = getSendPoint(g_audioSRPManager, src.type, (uint16_t)src.number);
+            void* sendPtB = nullptr;
 
-            // SetInputChannelSource: eActiveInputSource=1 (primary input)
-            setInputSource(ch, 1, sendPt, nullptr);
+            if (tgtStereo) {
+                int pairMateCh = tgtCh + 1;
+                int mateSnapIdx = -1;
+                for (auto& [mappedTgtCh, mappedSi] : plan.targetMap) {
+                    if (mappedTgtCh == pairMateCh) {
+                        mateSnapIdx = mappedSi;
+                        break;
+                    }
+                }
+                if (mateSnapIdx >= 0 && snaps[mateSnapIdx].validPatch) {
+                    int mateSrcCh = lo + mateSnapIdx;
+                    PatchData matePatch = getTargetPatchDataForMove(
+                        snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh, movePatchWithChannel);
+                    sAudioSource& mateSrc = matePatch.source;
+                    sendPtB = getSendPoint(g_audioSRPManager, mateSrc.type, (uint16_t)mateSrc.number);
+                    fprintf(stderr,
+                            "[MC]   Stereo patch pair ch %d+%d: A={type=%d,num=%d}->%p B={type=%d,num=%d}->%p\n",
+                            tgtCh + 1, pairMateCh + 1,
+                            src.type, src.number, sendPtA,
+                            mateSrc.type, mateSrc.number, sendPtB);
+                } else {
+                    fprintf(stderr,
+                            "[MC]   WARN: stereo target ch %d missing pair mate patch snapshot; falling back to single source\n",
+                            tgtCh + 1);
+                }
+            } else {
+                fprintf(stderr, "[MC]   ch=%p sendPt=%p\n", ch, sendPtA);
+            }
+
+            setInputSource(ch, 1, sendPtA, sendPtB);
         }
         fprintf(stderr, "[MC]   Patching applied via SetInputChannelSource.\n");
+    phase("Phase: restore preamp sockets");
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        if (!snaps[si].validPreamp || !snaps[si].validPatch) continue;
+        int srcCh = lo + si;
+        PatchData tgtPatch = getTargetPatchDataForMove(snaps[si].patchData, srcCh, tgtCh, movePatchWithChannel);
+        if (!isLocalAnaloguePatch(tgtPatch)) continue;
+        if (writePreampDataForPatch(tgtPatch, snaps[si].preampData)) {
+            fprintf(stderr,
+                    "[MC]   Restore preamp for ch %d on socket %u: gain=%d pad=%d phantom=%d\n",
+                    tgtCh + 1, tgtPatch.source.number,
+                    snaps[si].preampData.gain, snaps[si].preampData.pad, snaps[si].preampData.phantom);
+        } else {
+            fprintf(stderr,
+                    "[MC]   WARN: preamp restore failed for ch %d on socket %u\n",
+                    tgtCh + 1, tgtPatch.source.number);
+        }
     }
+
+    auto replayDyn8Settings = [&](const char* phaseTag) {
+        if (dyn8Transfers.empty()) return;
+
+        fprintf(stderr, "[MC] Dyn8 system-level transfer phase '%s' (%zu entries)...\n",
+                phaseTag, dyn8Transfers.size());
+        typedef void (*fn_setAllDataUI)(void* obj, void* sDynData);
+        auto setAllDataUI = (fn_setAllDataUI)RESOLVE(0x100239970);
+        typedef void (*fn_setDynData)(void* system, void* key, void* data);
+        auto setDynData = (fn_setDynData)RESOLVE(0x100239240);
+        typedef void (*fn_fullDriverUpdate)(void* system);
+        auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(0x10023c6c0);
+
+        for (auto& xfer : dyn8Transfers) {
+            void* tgtDynObj = getDynNetObj(xfer.tgtUnitIdx);
+            if (!tgtDynObj) {
+                fprintf(stderr, "[MC]   [%s] Dyn8 unit %d: getDynNetObj returned null!\n",
+                        phaseTag, xfer.tgtUnitIdx);
+                continue;
+            }
+            if (!xfer.validData) {
+                fprintf(stderr, "[MC]   [%s] Dyn8 snap[%d] Insert%c unit %d: no valid data!\n",
+                        phaseTag, xfer.snapIdx, 'A' + xfer.ip, xfer.tgtUnitIdx);
+                continue;
+            }
+
+            void* dynSystem = nullptr;
+            safeRead((uint8_t*)tgtDynObj + 0x90, &dynSystem, sizeof(dynSystem));
+            uint8_t dynKey[8] = {};
+            safeRead((uint8_t*)tgtDynObj + 0x88, dynKey, 8);
+
+            fprintf(stderr, "[MC]   [%s] Dyn8 unit %d: obj=%p system=%p key={%u,%u} type=%u\n",
+                    phaseTag, xfer.tgtUnitIdx, tgtDynObj, dynSystem,
+                    *(uint32_t*)dynKey, (uint32_t)dynKey[4],
+                    *(uint32_t*)xfer.dyn8Data);
+
+            setAllDataUI(tgtDynObj, xfer.dyn8Data);
+
+            if (dynSystem) {
+                setDynData(dynSystem, dynKey, xfer.dyn8Data);
+                uint8_t one = 1;
+                safeWrite((uint8_t*)dynSystem + 0xca9, &one, 1);
+                fullDriverUpdate(dynSystem);
+                fprintf(stderr, "[MC]   [%s] SetDynamicsData + FullDriverUpdate done\n", phaseTag);
+            } else {
+                fprintf(stderr, "[MC]   [%s] WARNING: cDynamicsSystem is null!\n", phaseTag);
+            }
+
+            void* duc = getDynUnitClient(xfer.tgtUnitIdx);
+            if (duc) {
+                typedef void (*fn_cAHNetMessage_ctor)(void* msg);
+                typedef void (*fn_cAHNetMessage_dtor)(void* msg);
+                typedef void (*fn_SetLength)(void* msg, uint32_t len);
+                typedef void (*fn_SetDataBufferUBYTE)(void* msg, uint8_t val, uint32_t offset);
+                typedef void (*fn_PackBandsWide)(void* msg, void* data, int param);
+                typedef void (*fn_PackSideChain)(void* msg, void* data, int param);
+                typedef void (*fn_EntrypointMessage)(void* duc, void* msg);
+
+                auto msgCtor     = (fn_cAHNetMessage_ctor)RESOLVE(0x1000e9790);
+                auto msgDtor     = (fn_cAHNetMessage_dtor)RESOLVE(0x1000e9810);
+                auto setLen      = (fn_SetLength)RESOLVE(0x1000e9ee0);
+                auto setUBYTE    = (fn_SetDataBufferUBYTE)RESOLVE(0x1000ebde0);
+                auto packBands   = (fn_PackBandsWide)RESOLVE(0x1000cded0);
+                auto packSC      = (fn_PackSideChain)RESOLVE(0x1000cdfd0);
+                auto entrypoint  = (fn_EntrypointMessage)RESOLVE(0x1005e9140);
+
+                uint32_t ducKey = 0;
+                safeRead((uint8_t*)duc + 0x68, &ducKey, 4);
+                bool sendInsertIn = false;
+                if (const char* env = getenv("MC_DYN8_INSERTIN")) {
+                    sendInsertIn = (atoi(env) != 0);
+                }
+                bool callCreateInsertIn = false;
+                if (const char* env = getenv("MC_DYN8_CREATE_INSERT_IN")) {
+                    callCreateInsertIn = (atoi(env) != 0);
+                }
+                typedef void (*fn_CreateInsertInAssignment)(void* duc);
+                auto createInsertInAssignment = (fn_CreateInsertInAssignment)RESOLVE(0x1005e8330);
+
+                uint8_t msgBuf[64];
+
+                memset(msgBuf, 0, sizeof(msgBuf));
+                msgCtor(msgBuf);
+                *(uint16_t*)(msgBuf + 0x10) = 0;
+                *(uint32_t*)(msgBuf + 0x14) = ducKey;
+                *(uint32_t*)(msgBuf + 0x18) = ducKey;
+                *(uint32_t*)(msgBuf + 0x1c) = 0x1001;
+                setLen(msgBuf, 1);
+                setUBYTE(msgBuf, xfer.dyn8Data[0], 0);
+                entrypoint(duc, msgBuf);
+                msgDtor(msgBuf);
+
+                memset(msgBuf, 0, sizeof(msgBuf));
+                msgCtor(msgBuf);
+                *(uint16_t*)(msgBuf + 0x10) = 0;
+                *(uint32_t*)(msgBuf + 0x14) = ducKey;
+                *(uint32_t*)(msgBuf + 0x18) = ducKey;
+                *(uint32_t*)(msgBuf + 0x1c) = 0x1002;
+                setLen(msgBuf, 8);
+                packBands(msgBuf, xfer.dyn8Data, 0);
+                entrypoint(duc, msgBuf);
+                msgDtor(msgBuf);
+
+                memset(msgBuf, 0, sizeof(msgBuf));
+                msgCtor(msgBuf);
+                *(uint16_t*)(msgBuf + 0x10) = 0;
+                *(uint32_t*)(msgBuf + 0x14) = ducKey;
+                *(uint32_t*)(msgBuf + 0x18) = ducKey;
+                *(uint32_t*)(msgBuf + 0x1c) = 0x1003;
+                setLen(msgBuf, 0xa);
+                packSC(msgBuf, xfer.dyn8Data, 0);
+                entrypoint(duc, msgBuf);
+                msgDtor(msgBuf);
+
+                if (sendInsertIn) {
+                    memset(msgBuf, 0, sizeof(msgBuf));
+                    msgCtor(msgBuf);
+                    *(uint16_t*)(msgBuf + 0x10) = 0;
+                    *(uint32_t*)(msgBuf + 0x14) = ducKey;
+                    *(uint32_t*)(msgBuf + 0x18) = ducKey;
+                    *(uint32_t*)(msgBuf + 0x1c) = 0x1004;
+                    setLen(msgBuf, 1);
+                    setUBYTE(msgBuf, 1, 0);
+                    entrypoint(duc, msgBuf);
+                    msgDtor(msgBuf);
+                    fprintf(stderr, "[MC]   [%s] DUC %p: sent 0x1004 InsertIn(true)\n", phaseTag, duc);
+                }
+
+                if (callCreateInsertIn) {
+                    fprintf(stderr, "[MC]   [%s] DUC %p: calling CreateInsertInAssignment()\n",
+                            phaseTag, duc);
+                    createInsertInAssignment(duc);
+                }
+
+                fprintf(stderr, "[MC]   [%s] DUC %p: sent 0x1001+0x1002+0x1003 via EntrypointMessage\n",
+                        phaseTag, duc);
+            } else {
+                fprintf(stderr, "[MC]   [%s] WARNING: getDynUnitClient(%d) returned null!\n",
+                        phaseTag, xfer.tgtUnitIdx);
+            }
+
+            uint8_t afterRecall[0x94] = {0};
+            safeRead((uint8_t*)tgtDynObj + 0x98, afterRecall, 0x94);
+            int match = 0;
+            for (int b = 0; b < 0x94; b++) {
+                if (afterRecall[b] == xfer.dyn8Data[b]) match++;
+            }
+            fprintf(stderr, "[MC]   [%s] Insert%c unit %d: %d/148 bytes match source\n",
+                    phaseTag, 'A' + xfer.ip, xfer.tgtUnitIdx, match);
+        }
+    };
 
     // Insert routing: reassign FX units to new channel positions
     // Strategy: first unassign ALL unique FX units, then reassign to new channels.
     // This avoids the "FX unit is already assigned" conflict when moving shared FX units.
     // Hidden struct return ABI: rdi=&retList, rsi=this, rdx/ecx=params
     {
+        phase("Phase: initial insert and Dyn8 routing");
         fprintf(stderr, "[MC] Reassigning insert FX units...\n");
-        typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-        auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
-
-        // Build snap→target mapping
-        std::vector<std::pair<int,int>> insertOrder;
-        if (src < dst) {
-            for (int i = 0; i < rangeSize - 1; i++)
-                insertOrder.push_back({lo + i, 1 + i});
-            insertOrder.push_back({hi, 0});
-        } else {
-            insertOrder.push_back({lo, rangeSize - 1});
-            for (int i = 0; i < rangeSize - 1; i++)
-                insertOrder.push_back({lo + 1 + i, i});
-        }
-
-        // All insert types use audio routing + SetAssigned on InsertNetObject:
-        // - Dyn8 (parentType==5): SetAssigned(true) + route to TARGET's Dyn8 unit
-        // - Rack FX / External (parentType==2,6): route to same FX unit
-        // - Unassigned (parentType==0): SetAssigned(false) + route to default points
-        typedef void (*fn_PerformTasks)(void* audioSRPMgr, void* taskList);
-        auto performTasks = (fn_PerformTasks)RESOLVE(0x1006d19c0);
-        typedef void* (*fn_CreateSendTargetTask)(void* ret, void* channel, void* fxRecvPt, int ip, int enable);
-        auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(0x1006da210);
-        typedef void* (*fn_CreateReturnSourceTask)(void* ret, void* channel, void* fxSendPt, int ip);
-        auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(0x1006da450);
-        typedef void (*fn_SetAssigned)(void* insertNetObj, bool assigned, bool param2);
-        auto setAssigned = (fn_SetAssigned)RESOLVE(0x1002a3c50);
-
-        for (auto& [tgtCh, si] : insertOrder) {
-            void* tgtChannel = getChannel(g_channelManager, 1, (uint8_t)tgtCh);
-            if (!tgtChannel) continue;
-
-            for (int ip = 0; ip < 2; ip++) {
-                auto& ins = snaps[si].insertInfo[ip];
-                if (!ins.hasInsert) continue;
-
-                void* routeSendPt = ins.fxSendPt;
-                void* routeRecvPt = ins.fxReceivePt;
-                int enable = 1;
-
-                // cChannel::SetInserts handles both assign and unassign
-                struct sInsertPts { void* t1; void* t2; void* s1; void* s2; };
-                typedef void (*fn_SetInserts)(void* channel, sInsertPts pts, int insertPoint);
-                auto setInserts = (fn_SetInserts)RESOLVE(0x1006d9920);
-
-                if (ins.parentType == 5 && tgtCh >= 0 && tgtCh < 64) {
-                    // Dyn8: call SetInserts with correct struct.
-                    // OLD BUG: {recv,recv,send,send} duplicated the Dyn8 point for
-                    // both t1 and t2. SetInserts checks BOTH pts[0]+0x28 and pts[1]+0x28
-                    // for parentType==5 (dynamics), causing double-unassign on the same
-                    // DUC which corrupts dormant units.
-                    // FIX: Use the channel's own insert return/send points for pts[1]/pts[3].
-                    // These have a non-dynamics parent, so the pts[1] check is skipped.
-                    typedef void* (*fn_GetInsertReturnPoint)(void* channel, int insertPoint);
-                    typedef void* (*fn_GetInsertSendPoint)(void* channel, int insertPoint);
-                    auto getRetPt = (fn_GetInsertReturnPoint)RESOLVE(0x1006d9850);
-                    auto getSndPt = (fn_GetInsertSendPoint)RESOLVE(0x1006d9780);
-
-                    void* dyn8Send = getDyn8SendPoint(tgtCh);
-                    void* dyn8Recv = getDyn8RecvPoint(tgtCh);
-                    void* chReturnPt = getRetPt(tgtChannel, ip);  // channel's own recv (non-dynamics parent)
-                    void* chSendPt = getSndPt(tgtChannel, ip);    // channel's own send (non-dynamics parent)
-                    sInsertPts pts = { dyn8Recv, chReturnPt, dyn8Send, chSendPt };
-                    setInserts(tgtChannel, pts, ip);
-                    fprintf(stderr, "[MC]   Insert%c: ch %d — SetInserts Dyn8[%d] recv=%p chRet=%p send=%p chSnd=%p\n",
-                            'A'+ip, tgtCh+1, tgtCh, dyn8Recv, chReturnPt, dyn8Send, chSendPt);
-                    continue;
-                } else if (ins.parentType == 0) {
-                    // Unassigned: call SetInserts with default unassigned points
-                    sInsertPts pts = { routeRecvPt, routeRecvPt, routeSendPt, routeSendPt };
-                    setInserts(tgtChannel, pts, ip);
-                    fprintf(stderr, "[MC]   Insert%c: ch %d — SetInserts DISCONNECT (default pts)\n",
-                            'A'+ip, tgtCh+1);
-                    continue;
-                } else {
-                    // Rack FX / External: use audio routing tasks (proven to work)
-                    fprintf(stderr, "[MC]   Insert%c: ch %d ← fxSend=%p fxRecv=%p (type=%d)\n",
-                            'A'+ip, tgtCh+1, routeSendPt, routeRecvPt, ins.parentType);
-                }
-
-                if (routeRecvPt) {
-                    uint8_t buf[64]; memset(buf, 0, sizeof(buf));
-                    createSendTargetTask(buf, tgtChannel, routeRecvPt, ip, enable);
-                    performTasks(g_audioSRPManager, buf);
-                }
-                if (routeSendPt) {
-                    uint8_t buf[64]; memset(buf, 0, sizeof(buf));
-                    createReturnSourceTask(buf, tgtChannel, routeSendPt, ip);
-                    performTasks(g_audioSRPManager, buf);
-                }
-            }
-        }
+        replayInsertRouting(plan, snaps, "initial");
+        refreshStereoDyn8Assignments("post-initial-dyn8-refresh");
         fprintf(stderr, "[MC]   Insert reassignment done.\n");
+        replayDyn8Settings("initial");
+    }
 
-        // Dyn8 settings transfer via cDynamicsSystem::SetDynamicsData + FullDriverUpdate
-        // SetDynamicsData writes to system's internal data array + sets dirty flags
-        // FullDriverUpdate pushes dirty data to drivers/curve widgets
-        // Net object also updated via SetAllDataAndUpdateUI for control widgets
-        if (!dyn8Transfers.empty()) {
-            fprintf(stderr, "[MC] Dyn8 system-level transfer phase (%zu entries)...\n", dyn8Transfers.size());
-            typedef void (*fn_setAllDataUI)(void* obj, void* sDynData);
-            auto setAllDataUI = (fn_setAllDataUI)RESOLVE(0x100239970);
-            typedef void (*fn_setDynData)(void* system, void* key, void* data);
-            auto setDynData = (fn_setDynData)RESOLVE(0x100239240); // cDynamicsSystem::SetDynamicsData
-            typedef void (*fn_fullDriverUpdate)(void* system);
-            auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(0x10023c6c0); // cDynamicsSystem::FullDriverUpdate()
+    if (hadStereoConfigChange) {
+        phase("Phase: post-stereo routing settle");
+        waitForStereoConfigReset();
+        replayInsertRouting(plan, snaps, "post-settle");
+        refreshStereoDyn8Assignments("post-settle-dyn8-refresh");
+        waitForStereoConfigReset();
+        replayInsertRouting(plan, snaps, "final");
+        refreshStereoDyn8Assignments("post-final-dyn8-refresh");
+    }
 
-            for (auto& xfer : dyn8Transfers) {
-                void* tgtDynObj = getDynNetObj(xfer.tgtUnitIdx);
-                if (!tgtDynObj) {
-                    fprintf(stderr, "[MC]   Dyn8 unit %d: getDynNetObj returned null!\n", xfer.tgtUnitIdx);
-                    continue;
+    if (hadStereoConfigChange)
+        waitForStereoConfigReset();
+
+    if (hadStereoConfigChange) {
+        phase("Phase: full settle recall");
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            fprintf(stderr, "[MC] Full settle recall '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+            recallChannel(tgtCh, snaps[si], skipPreamp);
+        }
+        waitForStereoConfigReset();
+    }
+
+    phase("Phase: restore delay and proc order");
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        if (snaps[si].validB[1]) {
+            uint16_t wantDelay = ((uint16_t)snaps[si].dataB[1].buf[1] << 8) | snaps[si].dataB[1].buf[2];
+            bool wantBypass = snaps[si].dataB[1].buf[3] != 0;
+            setDelayForChannel(tgtCh, wantDelay, wantBypass);
+        }
+        writeProcOrderForChannel(tgtCh, snaps[si]);
+    }
+
+    if (hadStereoConfigChange) {
+        phase("Phase: stereo split stabilization");
+        waitForStereoConfigReset();
+        waitForStereoConfigReset();
+        replayInsertRouting(plan, snaps, "post-final-state");
+        refreshStereoDyn8Assignments("post-final-state-dyn8-refresh");
+        waitForStereoConfigReset();
+        for (auto it = plan.targetMap.rbegin(); it != plan.targetMap.rend(); ++it) {
+            int tgtCh = it->first;
+            int si = it->second;
+            fprintf(stderr, "[MC] Late Type A settle '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+            recallTypeAForChannel(tgtCh, snaps[si]);
+            waitForStereoConfigReset();
+        }
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2 + 1; ch >= pair * 2; ch--) {
+                for (auto& [tgtCh, si] : plan.targetMap) {
+                    if (tgtCh != ch) continue;
+                    fprintf(stderr, "[MC] Mono split settle '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+                    recallTypeAForChannel(tgtCh, snaps[si]);
+                    waitForStereoConfigReset();
+                    break;
                 }
-                if (!snaps[xfer.snapIdx].validDyn8) {
-                    fprintf(stderr, "[MC]   Dyn8 snap[%d]: no valid data!\n", xfer.snapIdx);
-                    continue;
-                }
-
-                // Read cDynamicsSystem* and sDynamicsKey from target net object
-                void* dynSystem = nullptr;
-                safeRead((uint8_t*)tgtDynObj + 0x90, &dynSystem, sizeof(dynSystem));
-                uint8_t dynKey[8] = {};
-                safeRead((uint8_t*)tgtDynObj + 0x88, dynKey, 8);
-
-                fprintf(stderr, "[MC]   Dyn8 unit %d: obj=%p system=%p key={%u,%u} type=%u\n",
-                        xfer.tgtUnitIdx, tgtDynObj, dynSystem,
-                        *(uint32_t*)dynKey, (uint32_t)dynKey[4],
-                        *(uint32_t*)snaps[xfer.snapIdx].dyn8Data);
-
-                // 1. Write to net object (for control widgets)
-                setAllDataUI(tgtDynObj, snaps[xfer.snapIdx].dyn8Data);
-
-                // 2. Write to cDynamicsSystem data array + set dirty flags (for curve/driver)
-                if (dynSystem) {
-                    setDynData(dynSystem, dynKey, snaps[xfer.snapIdx].dyn8Data);
-                    // SetDynamicsData sets +0xca8 (selective dirty), but FullDriverUpdate
-                    // checks +0xca9 (full update flag). Set it manually.
-                    uint8_t one = 1;
-                    safeWrite((uint8_t*)dynSystem + 0xca9, &one, 1);
-                    // 3. Push dirty data to drivers/curve widgets immediately
-                    fullDriverUpdate(dynSystem);
-                    fprintf(stderr, "[MC]   SetDynamicsData + FullDriverUpdate done\n");
-                } else {
-                    fprintf(stderr, "[MC]   WARNING: cDynamicsSystem is null!\n");
-                }
-
-                // 3. Send messages through DUC's EntrypointMessage to refresh curve
-                // The cDynamicsNetObject and DUC are separate objects. InformOtherObjects
-                // on the net object does NOT reach the DUC's CC intermediates. The CC
-                // intermediates (which drive the crossover curve) are dependents of the
-                // DUC's embedded cNetObject at DUC+0x10. EntrypointMessage processes
-                // the message type, emits Qt signals, AND calls InformOtherObjects on
-                // DUC+0x10 — the exact path used when data arrives from the network.
-                void* duc = getDynUnitClient(xfer.tgtUnitIdx);
-                if (duc) {
-                    typedef void (*fn_cAHNetMessage_ctor)(void* msg);
-                    typedef void (*fn_cAHNetMessage_dtor)(void* msg);
-                    typedef void (*fn_SetLength)(void* msg, uint32_t len);
-                    typedef void (*fn_SetDataBufferUBYTE)(void* msg, uint8_t val, uint32_t offset);
-                    typedef void (*fn_PackBandsWide)(void* msg, void* data, int param);
-                    typedef void (*fn_PackSideChain)(void* msg, void* data, int param);
-                    typedef void (*fn_EntrypointMessage)(void* duc, void* msg);
-
-                    auto msgCtor     = (fn_cAHNetMessage_ctor)RESOLVE(0x1000e9790);
-                    auto msgDtor     = (fn_cAHNetMessage_dtor)RESOLVE(0x1000e9810);
-                    auto setLen      = (fn_SetLength)RESOLVE(0x1000e9ee0);
-                    auto setUBYTE    = (fn_SetDataBufferUBYTE)RESOLVE(0x1000ebde0);
-                    auto packBands   = (fn_PackBandsWide)RESOLVE(0x1000cded0);
-                    auto packSC      = (fn_PackSideChain)RESOLVE(0x1000cdfd0); // PackSideChainMessage
-                    auto entrypoint  = (fn_EntrypointMessage)RESOLVE(0x1005e9140);
-
-                    uint32_t ducKey = 0;
-                    safeRead((uint8_t*)duc + 0x68, &ducKey, 4);
-
-                    // Helper: stack-allocated cAHNetMessage (0x28 bytes from disassembly)
-                    uint8_t msgBuf[64];
-
-                    // --- Send 0x1001 (type) message ---
-                    memset(msgBuf, 0, sizeof(msgBuf));
-                    msgCtor(msgBuf);
-                    *(uint16_t*)(msgBuf + 0x10) = 0;      // flags
-                    *(uint32_t*)(msgBuf + 0x14) = ducKey;  // src key
-                    *(uint32_t*)(msgBuf + 0x18) = ducKey;  // dst key
-                    *(uint32_t*)(msgBuf + 0x1c) = 0x1001;  // msg type
-                    setLen(msgBuf, 1);
-                    setUBYTE(msgBuf, snaps[xfer.snapIdx].dyn8Data[0], 0); // type byte
-                    entrypoint(duc, msgBuf);
-                    msgDtor(msgBuf);
-
-                    // --- Send 0x1002 (bands wide) message ---
-                    memset(msgBuf, 0, sizeof(msgBuf));
-                    msgCtor(msgBuf);
-                    *(uint16_t*)(msgBuf + 0x10) = 0;
-                    *(uint32_t*)(msgBuf + 0x14) = ducKey;
-                    *(uint32_t*)(msgBuf + 0x18) = ducKey;
-                    *(uint32_t*)(msgBuf + 0x1c) = 0x1002;
-                    setLen(msgBuf, 8);
-                    packBands(msgBuf, snaps[xfer.snapIdx].dyn8Data, 0);
-                    entrypoint(duc, msgBuf);
-                    msgDtor(msgBuf);
-
-                    // --- Send 0x1003 (sidechain) message ---
-                    memset(msgBuf, 0, sizeof(msgBuf));
-                    msgCtor(msgBuf);
-                    *(uint16_t*)(msgBuf + 0x10) = 0;
-                    *(uint32_t*)(msgBuf + 0x14) = ducKey;
-                    *(uint32_t*)(msgBuf + 0x18) = ducKey;
-                    *(uint32_t*)(msgBuf + 0x1c) = 0x1003;
-                    setLen(msgBuf, 0xa);
-                    packSC(msgBuf, snaps[xfer.snapIdx].dyn8Data, 0);
-                    entrypoint(duc, msgBuf);
-                    msgDtor(msgBuf);
-
-                    fprintf(stderr, "[MC]   DUC %p: sent 0x1001+0x1002+0x1003 via EntrypointMessage\n", duc);
-                } else {
-                    fprintf(stderr, "[MC]   WARNING: getDynUnitClient(%d) returned null!\n", xfer.tgtUnitIdx);
-                }
-
-                // Verify net object
-                uint8_t afterRecall[0x94] = {0};
-                safeRead((uint8_t*)tgtDynObj + 0x98, afterRecall, 0x94);
-                int match = 0;
-                for (int b = 0; b < 0x94; b++) {
-                    if (afterRecall[b] == snaps[xfer.snapIdx].dyn8Data[b]) match++;
-                }
-                fprintf(stderr, "[MC]   Unit %d: %d/148 bytes match source\n",
-                        xfer.tgtUnitIdx, match);
             }
+        }
+        replayInsertRouting(plan, snaps, "post-typea-settle");
+        refreshStereoDyn8Assignments("post-typea-dyn8-refresh");
+        waitForStereoConfigReset();
+        for (auto& [tgtCh, si] : plan.targetMap)
+            writeProcOrderForChannel(tgtCh, snaps[si]);
+        waitForStereoConfigReset();
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                for (auto& [tgtCh, si] : plan.targetMap) {
+                    if (tgtCh != ch || !snaps[si].validB[1]) continue;
+                    uint16_t wantDelay = ((uint16_t)snaps[si].dataB[1].buf[1] << 8) | snaps[si].dataB[1].buf[2];
+                    bool wantBypass = snaps[si].dataB[1].buf[3] != 0;
+                    fprintf(stderr, "[MC] Mono split delay settle '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+                    setDelayForChannel(tgtCh, wantDelay, wantBypass);
+                    waitForStereoConfigReset();
+                    break;
+                }
+            }
+        }
+        replayInsertRouting(plan, snaps, "post-delay-settle");
+        refreshStereoDyn8Assignments("post-delay-dyn8-refresh");
+        waitForStereoConfigReset();
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                resetInputProcessingGangMaster(ch, "mono-split-ungang");
+                waitForStereoConfigReset();
+            }
+        }
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                for (auto& [tgtCh, si] : plan.targetMap) {
+                    if (tgtCh != ch) continue;
+                    fprintf(stderr, "[MC] Mono split final full settle '%s' → pos %d\n", snaps[si].name, tgtCh+1);
+                    recallChannel(tgtCh, snaps[si], skipPreamp);
+                    waitForStereoConfigReset();
+                    break;
+                }
+            }
+        }
+        replayInsertRouting(plan, snaps, "post-mono-full-settle");
+        refreshStereoDyn8Assignments("post-mono-full-dyn8-refresh");
+        waitForStereoConfigReset();
+    }
+
+    if (useInputLibraryExperiment && !inputLibraryRecalls.empty()) {
+        phase("Phase: input library experiment recall");
+        fprintf(stderr, "[MC] Input channel library experiment recall phase (%zu entries)...\n",
+                inputLibraryRecalls.size());
+        for (auto& recall : inputLibraryRecalls) {
+            libraryRecallInputChannel(recall.tgtCh, recall.presetName);
+            waitForStereoConfigReset();
+        }
+        replayInsertRouting(plan, snaps, "post-input-lib");
+        refreshStereoDyn8Assignments("post-input-lib-dyn8-refresh");
+        waitForStereoConfigReset();
+    }
+
+    if (useDyn8LibraryExperiment && !dyn8LibraryRecalls.empty()) {
+        phase("Phase: Dyn8 library experiment recall");
+        fprintf(stderr, "[MC] Dyn8 library experiment recall phase (%zu entries)...\n",
+                dyn8LibraryRecalls.size());
+        replayInsertRouting(plan, snaps, "pre-lib-recall");
+        refreshStereoDyn8Assignments("pre-lib-recall-dyn8-refresh");
+        waitForStereoConfigReset();
+        bool tryDyn8SetInserts = false;
+        if (const char* setInsertsEnv = getenv("MC_AUTOTEST_DYN8_SETINSERTS")) {
+            tryDyn8SetInserts = (atoi(setInsertsEnv) != 0);
+        }
+        for (auto& recall : dyn8LibraryRecalls) {
+            ChannelSnapshot beforeCh;
+            bool beforeOk = snapshotChannel(recall.tgtCh, beforeCh);
+
+            if (tryDyn8SetInserts && beforeOk && !beforeCh.validDyn8) {
+                for (int variant = 0; variant < 2 && !beforeCh.validDyn8; variant++) {
+                    if (!assignDyn8InsertWithSetInserts(recall.tgtCh, recall.tgtUnitIdx, 0, variant, "pre-lib-recall"))
+                        continue;
+                    waitForStereoConfigReset();
+                    destroySnapshot(beforeCh);
+                    beforeOk = snapshotChannel(recall.tgtCh, beforeCh);
+                    fprintf(stderr,
+                            "[MC] Dyn8 library experiment: after SetInserts variant=%d ch %d validDyn8=%d InsertA type=%d\n",
+                            variant, recall.tgtCh + 1, beforeCh.validDyn8, beforeCh.insertInfo[0].parentType);
+                }
+            }
+
+            uint8_t before[0x94] = {};
+            void* tgtDynObj = getDynNetObj(recall.tgtUnitIdx);
+            if (tgtDynObj)
+                safeRead((uint8_t*)tgtDynObj + 0x98, before, sizeof(before));
+
+            fprintf(stderr,
+                    "[MC] Dyn8 library experiment: recalling '%s' (obj '%s') onto ch %d / unit %d\n",
+                    recall.presetName, recall.storedObjName, recall.tgtCh + 1, recall.tgtUnitIdx);
+            libraryRecallDyn8(recall.tgtCh, recall.presetName, recall.storedObjName);
+            waitForStereoConfigReset();
+
+            uint8_t after[0x94] = {};
+            int changed = 0;
+            if (tgtDynObj)
+                safeRead((uint8_t*)tgtDynObj + 0x98, after, sizeof(after));
+            for (size_t i = 0; i < sizeof(after); i++) {
+                if (before[i] != after[i]) changed++;
+            }
+
+            ChannelSnapshot afterCh;
+            bool afterOk = snapshotChannel(recall.tgtCh, afterCh);
+            fprintf(stderr,
+                    "[MC] Dyn8 library experiment: recall changed %d/148 bytes on unit %d\n",
+                    changed, recall.tgtUnitIdx);
+            if (beforeOk && afterOk) {
+                fprintf(stderr,
+                        "[MC] Dyn8 library experiment: ch %d validDyn8 %d -> %d, InsertA type %d -> %d\n",
+                        recall.tgtCh + 1,
+                        beforeCh.validDyn8, afterCh.validDyn8,
+                        beforeCh.insertInfo[0].parentType, afterCh.insertInfo[0].parentType);
+            }
+            if (beforeOk) destroySnapshot(beforeCh);
+            if (afterOk) destroySnapshot(afterCh);
+        }
+    }
+
+    if (hadStereoConfigChange) {
+        phase("Phase: final stabilize and refresh");
+        waitForStereoConfigReset();
+        for (auto& [tgtCh, si] : plan.targetMap) {
+            writeProcOrderForChannel(tgtCh, snaps[si]);
+        }
+        waitForStereoConfigReset();
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                for (auto& [tgtCh, si] : plan.targetMap) {
+                    if (tgtCh != ch) continue;
+                    replayMixerAssignmentsForChannel(tgtCh, snaps[si], "post-final-mixer-assigns");
+                    waitForStereoConfigReset();
+                    break;
+                }
+            }
+        }
+        for (int pair : stereoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                for (auto& [tgtCh, si] : plan.targetMap) {
+                    if (tgtCh != ch) continue;
+                    replayMixerAssignmentsForChannel(tgtCh, snaps[si], "post-final-stereo-mixer-assigns");
+                    waitForStereoConfigReset();
+                    break;
+                }
+            }
+        }
+        waitForStereoConfigReset();
+        waitForStereoConfigReset();
+        replayInsertRouting(plan, snaps, "post-final-stabilize");
+        refreshStereoDyn8Assignments("post-final-stabilize-dyn8-refresh");
+        replayDyn8Settings("post-final-stabilize");
+        for (int pair : monoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                refreshSideChainStateForChannel(ch, "post-final-sidechain-refresh");
+                waitForStereoConfigReset();
+            }
+        }
+        for (int pair : stereoizedPairs) {
+            for (int ch = pair * 2; ch <= pair * 2 + 1; ch++) {
+                refreshSideChainStateForChannel(ch, "post-final-stereo-sidechain-refresh");
+                waitForStereoConfigReset();
+            }
+        }
+        QApplication::processEvents();
+        for (auto& [tgtCh, _] : plan.targetMap) {
+            ChannelSnapshot live = {};
+            if (!snapshotChannel(tgtCh, live)) continue;
+            fprintf(stderr,
+                    "[MC]   [post-final-stabilize] live ch %d: validDyn8=%d InsertA type=%d send=%p recv=%p InsertB type=%d send=%p recv=%p\n",
+                    tgtCh + 1,
+                    live.validDyn8 ? 1 : 0,
+                    live.insertInfo[0].parentType,
+                    live.insertInfo[0].fxSendPt,
+                    live.insertInfo[0].fxReceivePt,
+                    live.insertInfo[1].parentType,
+                    live.insertInfo[1].fxSendPt,
+                    live.insertInfo[1].fxReceivePt);
+            destroySnapshot(live);
         }
     }
 
     for (int i = 0; i < rangeSize; i++) destroySnapshot(snaps[i]);
 
+    if (!dyn8LibraryRecalls.empty()) {
+        fprintf(stderr, "[MC] Dyn8 library experiment cleanup (%zu entries)...\n",
+                dyn8LibraryRecalls.size());
+        for (auto& recall : dyn8LibraryRecalls) {
+            if (!libraryDeleteDyn8(recall.presetName)) {
+                fprintf(stderr, "[MC] Dyn8 library experiment: failed to delete '%s'\n",
+                        recall.presetName);
+            }
+        }
+    }
+    if (!inputLibraryRecalls.empty()) {
+        fprintf(stderr, "[MC] Input channel library experiment cleanup (%zu entries)...\n",
+                inputLibraryRecalls.size());
+        for (auto& recall : inputLibraryRecalls) {
+            if (!libraryDeleteInputChannel(recall.presetName)) {
+                fprintf(stderr, "[MC] input library experiment: failed to delete '%s'\n",
+                        recall.presetName);
+            }
+        }
+    }
+
     // Verify
+    phase("Phase: verify final state");
     fprintf(stderr, "[MC] === Verify after move ===\n");
     for (int i = lo; i <= hi; i++) {
         const char* name = g_getChannelName(g_audioDM, 1, (uint8_t)i);
@@ -2272,6 +3892,7 @@ static bool moveChannel(int src, int dst, bool keepPatching = true) {
         fprintf(stderr, "[MC] Pos %d: '%s' trim=%.1f dB (%d)\n", i+1, name ? name : "", trimDb, trimVal);
     }
 
+    phase("Phase: move complete");
     return true;
 }
 
@@ -2319,16 +3940,23 @@ static void showMoveDialog() {
         int dstCh = dstSpin->value() - 1;
         bool srcSt = isChannelStereo(srcCh);
         bool dstSt = isChannelStereo(dstCh);
-        srcStereoLabel->setText(srcSt ? QString("[Stereo %1+%2]").arg(srcCh+1).arg(srcCh+2) : "[Mono]");
-        dstStereoLabel->setText(dstSt ? QString("[Stereo %1+%2]").arg(dstCh+1).arg(dstCh+2) : "[Mono]");
+        int srcPairStart = srcSt ? (srcCh & ~1) : srcCh;
+        int dstPairStart = dstSt ? (dstCh & ~1) : dstCh;
+        srcStereoLabel->setText(srcSt ? QString("[Stereo %1+%2]").arg(srcPairStart+1).arg(srcPairStart+2) : "[Mono]");
+        dstStereoLabel->setText(dstSt ? QString("[Stereo %1+%2]").arg(dstPairStart+1).arg(dstPairStart+2) : "[Mono]");
     };
-    QObject::connect(srcSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateStereoLabels(); });
-    QObject::connect(dstSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateStereoLabels(); });
-    updateStereoLabels();  // initial state
 
-    auto* patchCheck = new QCheckBox("Move source patching with channel (Scenario B)");
-    patchCheck->setChecked(false);  // Default: Scenario A (patching stays at position)
+    auto* patchCheck = new QCheckBox("Move preamp socket with channel (Scenario B)");
+    patchCheck->setChecked(false);
     layout->addWidget(patchCheck);
+
+    auto* monoPairCheck = new QCheckBox("Move two adjacent mono channels as one block");
+    monoPairCheck->setChecked(false);
+    layout->addWidget(monoPairCheck);
+
+    auto* moveHintLabel = new QLabel();
+    moveHintLabel->setWordWrap(true);
+    layout->addWidget(moveHintLabel);
 
     auto* statusLabel = new QLabel("Ready.");
     statusLabel->setWordWrap(true);
@@ -2343,20 +3971,81 @@ static void showMoveDialog() {
     btnLayout->addWidget(closeBtn);
     layout->addLayout(btnLayout);
 
+    auto updateMoveUi = [=]() {
+        updateStereoLabels();
+
+        int srcCh = srcSpin->value() - 1;
+        int dstCh = dstSpin->value() - 1;
+        bool srcSt = isChannelStereo(srcCh);
+        bool canUseMonoPair = false;
+        if (!srcSt && srcCh < 127) {
+            canUseMonoPair = !isChannelStereo(srcCh + 1);
+        }
+        monoPairCheck->setEnabled(canUseMonoPair);
+        if (!canUseMonoPair) monoPairCheck->setChecked(false);
+
+        MovePlan plan;
+        char err[256];
+        if (!buildMovePlan(srcCh, dstCh, monoPairCheck->isChecked(), plan, err, sizeof(err))) {
+            moveHintLabel->setText(QString("Unsupported right now: %1.").arg(err));
+            moveBtn->setEnabled(false);
+            return;
+        }
+
+        if (plan.srcStereo) {
+            QString text = QString("Stereo move: ch %1+%2 will move together to %3+%4.")
+                .arg(plan.srcStart + 1).arg(plan.srcStart + 2)
+                .arg(plan.dstStart + 1).arg(plan.dstStart + 2);
+            if (plan.rawSrc != plan.srcStart || plan.rawDst != plan.dstStart)
+                text += " Selection normalized to the stereo pair boundary.";
+            text += patchCheck->isChecked()
+                ? " Patching/preamp socket will move with the channel."
+                : " Patching/preamp socket will shift by the move amount.";
+            moveHintLabel->setText(text);
+        } else if (plan.srcMonoBlock) {
+            QString text = QString("Two-mono block move: ch %1+%2 will move together to %3+%4.")
+                .arg(plan.srcStart + 1).arg(plan.srcStart + 2)
+                .arg(plan.dstStart + 1).arg(plan.dstStart + 2);
+            text += patchCheck->isChecked()
+                ? " Patching/preamp socket will move with the channel."
+                : " Patching/preamp socket will shift by the move amount.";
+            moveHintLabel->setText(text);
+        } else {
+            moveHintLabel->setText(patchCheck->isChecked()
+                ? "Mono move: affected range is all mono. Patching/preamp socket will move with the channel."
+                : "Mono move: affected range is all mono. Patching/preamp socket will shift by the move amount.");
+        }
+
+        moveBtn->setEnabled(true);
+    };
+
+    QObject::connect(srcSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
+    QObject::connect(dstSpin, QOverload<int>::of(&QSpinBox::valueChanged), [=](int) { updateMoveUi(); });
+    QObject::connect(monoPairCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
+    QObject::connect(patchCheck, &QCheckBox::toggled, [=](bool) { updateMoveUi(); });
+    updateMoveUi();
+
     QObject::connect(closeBtn, &QPushButton::clicked, g_dialog, &QDialog::hide);
 
     QObject::connect(moveBtn, &QPushButton::clicked, [=]() {
         int src = srcSpin->value() - 1;
         int dst = dstSpin->value() - 1;
-        bool keepPatching = !patchCheck->isChecked();  // checkbox = move patching = !keep
+        bool movePatchWithChannel = patchCheck->isChecked();
+        bool moveMonoBlock = monoPairCheck->isChecked();
+        MovePlan plan;
+        char err[256];
+        if (!buildMovePlan(src, dst, moveMonoBlock, plan, err, sizeof(err))) {
+            statusLabel->setText(QString("Unsupported: %1.").arg(err));
+            moveBtn->setEnabled(false);
+            return;
+        }
         statusLabel->setText("Moving...");
         moveBtn->setEnabled(false);
         QApplication::processEvents();
 
-        bool ok = moveChannel(src, dst, keepPatching);
+        bool ok = moveChannel(src, dst, movePatchWithChannel, moveMonoBlock);
         statusLabel->setText(ok ? "Done!" : "Failed — check log.");
-        moveBtn->setEnabled(true);
-        updateStereoLabels();
+        updateMoveUi();
     });
 
     // Test Stereo button: toggle stereo on source channel, with Type A settings preservation
@@ -2415,7 +4104,7 @@ static void showMoveDialog() {
             .arg(newSt ? "STEREO" : "MONO")
             .arg(toggleOk ? "restored — check log" : "FAILED");
         statusLabel->setText(afterMsg);
-        updateStereoLabels();
+        updateMoveUi();
     });
 
     g_dialog->show();
@@ -2539,16 +4228,16 @@ static void dumpChannelData(int ch, const char* label) {
         fprintf(stderr, "\n");
     }
 
-    // Preamp
-    PreampData pd;
-    if (readPreampData(ch, pd))
-        fprintf(stderr, "[MC]      preamp: gain=%d pad=%d phantom=%d\n", pd.gain, pd.pad, pd.phantom);
-
     // Patching
     PatchData patch;
-    if (readPatchData(ch, patch))
+    if (readPatchData(ch, patch)) {
         fprintf(stderr, "[MC]      patch: srcType=%d src={type=%d, num=%d}\n",
                 patch.sourceType, patch.source.type, patch.source.number);
+        PreampData pd;
+        if (readPreampDataForPatch(patch, pd))
+            fprintf(stderr, "[MC]      preamp: socket=%u gain=%d pad=%d phantom=%d\n",
+                    patch.source.number, pd.gain, pd.pad, pd.phantom);
+    }
 }
 
 // =============================================================================
@@ -2561,6 +4250,7 @@ static void dumpChannelData(int ch, const char* label) {
 // =============================================================================
 __attribute__((constructor))
 static void onLoad() {
+    setupLogging();
     fprintf(stderr, "[MC] ===== MoveChannel dylib loaded =====\n");
     resolveSlide();
     resolveSymbols();
@@ -2597,6 +4287,20 @@ static void onLoad() {
         fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M).\n");
 
         showMoveDialog();
+
+        if (getenv("MC_AUTOTEST_SRC") && getenv("MC_AUTOTEST_DST")) {
+            fprintf(stderr, "[MC] Autotest requested via environment.\n");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                bool ok = runAutomatedMoveTest();
+                if (const char* exitEnv = getenv("MC_AUTOTEST_EXIT")) {
+                    if (atoi(exitEnv) != 0) {
+                        fprintf(stderr, "[MC] Autotest finished, quitting app (%s).\n", ok ? "PASS" : "FAIL");
+                        qApp->quit();
+                    }
+                }
+            });
+        }
 
         // Auto-test disabled
 #if 0
