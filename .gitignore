@@ -11,6 +11,16 @@
 # Packaged releases
 dist/
 
+# Development-only notes and scratch files
+memory/
+plans/
+BREAKTROUGH.md
+failedToMoveDyn8.md
+failedToMoveTrim.md
+lldb_commands.txt
+lldb_explore.py
+testCSV.csv
+
 # Local editor / OS noise
 *.swp
 *.swo

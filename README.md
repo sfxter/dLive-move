@@ -54,8 +54,7 @@ That script produces:
 - [`src/plugin_main.mm`](/Users/sfx/Programavimas/dLive-patch/src/plugin_main.mm): main patch implementation
 - [`package_release.sh`](/Users/sfx/Programavimas/dLive-patch/package_release.sh): creates a shareable package
 - [`Makefile`](/Users/sfx/Programavimas/dLive-patch/Makefile): builds the injected dylib
-- [`dist/`](./dist): packaged builds
-- [`memory/`](./memory): reverse-engineering notes and project memory
+- [`docs/`](./docs): install and sharing documentation
 
 ## Requirements
 

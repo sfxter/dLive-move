@@ -1,4 +1,0 @@
-INFO:__main__:dlive-midi-tool version: 2.8.3
-INFO:__main__:No config file found, using default console: dLive from dliveConstants instead.
-INFO:__main__:No config file found, using default midi-port: 12 to 16 from dliveConstants instead.
-INFO:__main__:No config file found, using default ip: 192.168.1.70 from dliveConstants instead
