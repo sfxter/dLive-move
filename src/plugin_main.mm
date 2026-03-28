@@ -605,8 +605,24 @@ static bool findAudioCoreDM() {
             }
             if (!g_gangingManager) fprintf(stderr, "[MC] GangingManager not found in UIManagerHolder\n");
 
+            uintptr_t uiCprMgrVt = (uintptr_t)RESOLVE(0x106c9eba8) + 0x10;
+            for (int off = 0; off < 0x400; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                if ((uintptr_t)vt == uiCprMgrVt) {
+                    g_uiCopyPasteResetManager = ptr;
+                    fprintf(stderr, "[MC] UICopyPasteResetManager at UIManagerHolder+0x%x = %p\n", off, ptr);
+                    break;
+                }
+            }
+            if (!g_uiCopyPasteResetManager)
+                fprintf(stderr, "[MC] UICopyPasteResetManager not found in UIManagerHolder\n");
+
             uintptr_t cprSwitchInterpVt = (uintptr_t)RESOLVE(0x106ce1fe8) + 0x10;
-            for (int off = 0; off < 0x300; off += 8) {
+            for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
                 if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
@@ -622,7 +638,7 @@ static bool findAudioCoreDM() {
                 fprintf(stderr, "[MC] CopyPasteResetSwitchInterpreter not found in UIManagerHolder\n");
 
             uintptr_t selectorMgrVt = (uintptr_t)RESOLVE(0x106c77ca0) + 0x10;
-            for (int off = 0; off < 0x300; off += 8) {
+            for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
                 if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
@@ -638,7 +654,7 @@ static bool findAudioCoreDM() {
                 fprintf(stderr, "[MC] ChannelSelectorManager not found in UIManagerHolder\n");
 
             uintptr_t multiFuncGetSelected = (uintptr_t)RESOLVE(0x1001098470);
-            for (int off = 0; off < 0x300; off += 8) {
+            for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
                 if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
@@ -5157,20 +5173,44 @@ static bool isAuxStripType(uint32_t stripType) {
     return (stripType & ~1u) == 4u;
 }
 
+struct UICopyPasteResetCommand {
+    uint32_t task;
+    uint32_t target;
+    uint64_t stripKey;
+};
+
 static bool sendBuiltInCopyPasteResetCommand(uint32_t task, uint32_t target, const SelectedStripInfo& strip) {
     if (!strip.valid || strip.channel < 0 || strip.channel > 255) return false;
+    uint64_t stripKey = MAKE_KEY(strip.stripType, (uint8_t)strip.channel);
+    if (g_uiCopyPasteResetManager) {
+        typedef void (*fn_PerformCommand)(void* obj, const UICopyPasteResetCommand& cmd);
+        auto performCommand = (fn_PerformCommand)RESOLVE(0x10076de90);
+        if (performCommand) {
+            UICopyPasteResetCommand cmd = {};
+            cmd.task = task;
+            cmd.target = target;
+            cmd.stripKey = stripKey;
+            fprintf(stderr,
+                    "[MC] Built-in CPR command via UI manager: task=%u target=%u stripType=%u channel=%d\n",
+                    task, target, strip.stripType, strip.channel + 1);
+            performCommand(g_uiCopyPasteResetManager, cmd);
+            return true;
+        }
+        fprintf(stderr, "[MC] Built-in CPR command unavailable: PerformCommand symbol missing.\n");
+    }
+
     if (!g_copyPasteResetSwitchInterpreter) {
-        fprintf(stderr, "[MC] Built-in CPR command unavailable: switch interpreter not found.\n");
+        fprintf(stderr,
+                "[MC] Built-in CPR command unavailable: UI manager and switch interpreter not found.\n");
         return false;
     }
     typedef void (*fn_SendCopyPasteResetCommand)(void* obj, uint32_t task, uint32_t target, uint64_t stripKey);
     auto sendCommand = (fn_SendCopyPasteResetCommand)RESOLVE(0x10040a720);
     if (!sendCommand) {
-        fprintf(stderr, "[MC] Built-in CPR command unavailable: symbol missing.\n");
+        fprintf(stderr, "[MC] Built-in CPR command unavailable: switch interpreter symbol missing.\n");
         return false;
     }
-    uint64_t stripKey = MAKE_KEY(strip.stripType, (uint8_t)strip.channel);
-    fprintf(stderr, "[MC] Built-in CPR command: task=%u target=%u stripType=%u channel=%d\n",
+    fprintf(stderr, "[MC] Built-in CPR command via switch interpreter: task=%u target=%u stripType=%u channel=%d\n",
             task, target, strip.stripType, strip.channel + 1);
     sendCommand(g_copyPasteResetSwitchInterpreter, task, target, stripKey);
     return true;

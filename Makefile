@@ -1,4 +1,4 @@
-APP_PATH = /Applications/dLive Director V2.11 copy.app
+APP_PATH = /Applications/dLive Director V2.11.app
 QTPATH = $(APP_PATH)/Contents/Frameworks
 BINARY = $(APP_PATH)/Contents/MacOS/dLive Director V2.11
 QTHDR = /opt/homebrew/Cellar/qt@5/5.15.17/lib

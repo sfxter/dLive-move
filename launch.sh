@@ -2,7 +2,8 @@
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="/Applications/dLive Director V2.11 copy.app/Contents/MacOS/dLive Director V2.11"
+DEFAULT_APP="/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
+APP="${DLIVE_APP:-$DEFAULT_APP}"
 LOG="$DIR/movechannel.log"
 SHOW_LOG="${MC_SHOW_LOG:-1}"
 TAIL_PID=""
@@ -15,6 +16,13 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM
+
+if [[ ! -x "$APP" ]]; then
+  echo "[launch] dLive Director binary not found:"
+  echo "[launch]   $APP"
+  echo "[launch] Set DLIVE_APP to the correct binary path and try again."
+  exit 1
+fi
 
 if [[ "$SHOW_LOG" != "0" ]]; then
   touch "$LOG"

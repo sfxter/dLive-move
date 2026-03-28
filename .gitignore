@@ -1,0 +1,16 @@
+.DS_Store
+.claude/
+
+# Build artifacts
+*.o
+*.dylib
+
+# Logs
+*.log
+
+# Packaged releases
+dist/
+
+# Local editor / OS noise
+*.swp
+*.swo
