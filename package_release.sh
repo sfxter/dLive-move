@@ -44,15 +44,6 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 /usr/bin/osascript -e 'display dialog "Quarantine attributes removed from this patch folder." buttons {"OK"} default button "OK"'
 EOF
 
-APPLESCRIPT="$OUT_DIR/Start Patched dLive.applescript"
-cat >"$APPLESCRIPT" <<'EOF'
-on run
-	set resourcesDir to POSIX path of (path to resource "")
-	set cmd to "cd " & quoted form of resourcesDir & " && /usr/bin/env MC_SHOW_LOG=0 ./_launch_internal.sh >/dev/null 2>&1 &"
-	do shell script cmd
-end run
-EOF
-
 cat >"$OUT_DIR/README.txt" <<'EOF'
 dLive Move Patch
 ================
@@ -116,12 +107,49 @@ chmod +x "$OUT_DIR/Start Patched dLive.command"
 chmod +x "$OUT_DIR/Open Patch Log.command"
 chmod +x "$OUT_DIR/Remove Quarantine.command"
 
-echo "[package] Building macOS app launcher"
-osacompile -o "$OUT_DIR/Start Patched dLive.app" "$APPLESCRIPT"
-rm -f "$APPLESCRIPT"
+echo "[package] Building native macOS app launcher"
+APP_DIR="$OUT_DIR/Start Patched dLive.app"
+APP_CONTENTS="$APP_DIR/Contents"
+APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RES_DIR="$APP_CONTENTS/Resources"
+mkdir -p "$APP_MACOS" "$APP_RES_DIR"
 
-APP_RES_DIR="$OUT_DIR/Start Patched dLive.app/Contents/Resources"
-mkdir -p "$APP_RES_DIR"
+cat >"$APP_CONTENTS/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>Start Patched dLive</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.sfxter.dlive-move.launcher</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Start Patched dLive</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+clang -arch arm64 -arch x86_64 \
+  -framework Foundation \
+  -framework CoreFoundation \
+  "$ROOT/tools/launcher_main.m" \
+  -o "$APP_MACOS/Start Patched dLive"
+chmod +x "$APP_MACOS/Start Patched dLive"
+
 cp "$OUT_DIR/libmovechannel.dylib" "$APP_RES_DIR/libmovechannel.dylib"
 cp "$OUT_DIR/_launch_internal.sh" "$APP_RES_DIR/_launch_internal.sh"
 chmod +x "$APP_RES_DIR/_launch_internal.sh"
