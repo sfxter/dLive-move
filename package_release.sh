@@ -9,6 +9,8 @@ OUT_DIR="$DIST_DIR/$PKG_NAME-$STAMP"
 ZIP_PATH="$DIST_DIR/$PKG_NAME-$STAMP.zip"
 LATEST_DIR="$DIST_DIR/$PKG_NAME-latest"
 LATEST_ZIP="$DIST_DIR/$PKG_NAME-latest.zip"
+DEFAULT_SIGN_ID="Developer ID Application: KAZYS RISKUS (X8345YNH39)"
+SIGN_ID="${SIGN_ID:-$DEFAULT_SIGN_ID}"
 
 mkdir -p "$OUT_DIR"
 
@@ -45,9 +47,8 @@ EOF
 APPLESCRIPT="$OUT_DIR/Start Patched dLive.applescript"
 cat >"$APPLESCRIPT" <<'EOF'
 on run
-	set appPath to POSIX path of (path to me)
-	set pkgDir to do shell script "/usr/bin/dirname " & quoted form of appPath
-	set cmd to "cd " & quoted form of pkgDir & " && /usr/bin/env MC_SHOW_LOG=0 ./_launch_internal.sh >/dev/null 2>&1 &"
+	set resourcesDir to POSIX path of (path to resource "")
+	set cmd to "cd " & quoted form of resourcesDir & " && /usr/bin/env MC_SHOW_LOG=0 ./_launch_internal.sh >/dev/null 2>&1 &"
 	do shell script cmd
 end run
 EOF
@@ -101,7 +102,8 @@ If macOS blocks the files
   xattr -dr com.apple.quarantine .
 
 Notes
-- The plugin is ad-hoc signed during packaging.
+- The launcher app and plugin are Developer ID signed during packaging.
+- This package is not notarized.
 - If the target Mac has a different Director app name/path, update DLIVE_APP.
 - `Start Patched dLive.app` launches with log tailing disabled, so it behaves like a normal app.
 EOF
@@ -118,9 +120,16 @@ echo "[package] Building macOS app launcher"
 osacompile -o "$OUT_DIR/Start Patched dLive.app" "$APPLESCRIPT"
 rm -f "$APPLESCRIPT"
 
-echo "[package] Ad-hoc signing dylib"
-codesign --force --sign - "$OUT_DIR/libmovechannel.dylib"
-codesign --force --sign - "$OUT_DIR/Start Patched dLive.app"
+APP_RES_DIR="$OUT_DIR/Start Patched dLive.app/Contents/Resources"
+mkdir -p "$APP_RES_DIR"
+cp "$OUT_DIR/libmovechannel.dylib" "$APP_RES_DIR/libmovechannel.dylib"
+cp "$OUT_DIR/_launch_internal.sh" "$APP_RES_DIR/_launch_internal.sh"
+chmod +x "$APP_RES_DIR/_launch_internal.sh"
+
+echo "[package] Signing with Developer ID: $SIGN_ID"
+codesign --force --sign "$SIGN_ID" --timestamp "$APP_RES_DIR/libmovechannel.dylib"
+codesign --force --sign "$SIGN_ID" --timestamp "$OUT_DIR/libmovechannel.dylib"
+codesign --force --sign "$SIGN_ID" --timestamp "$OUT_DIR/Start Patched dLive.app"
 
 echo "[package] Creating zip: $ZIP_PATH"
 rm -f "$ZIP_PATH"
