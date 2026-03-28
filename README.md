@@ -33,9 +33,12 @@ Read [DISCLAIMER.md](/Users/sfx/Programavimas/dLive-patch/DISCLAIMER.md) before 
 
 For most users, use the packaged build in [`dist/`](./dist):
 
-- unzip the latest package
-- if macOS blocks it, run `Remove Quarantine.command`
-- launch `Start Patched dLive.app`
+1. Unzip the latest package.
+2. First launch only:
+   right-click `Remove Quarantine.command` and choose `Open`.
+3. After that:
+   right-click `Start Patched dLive.app` and choose `Open`.
+4. Later launches should be simpler, but if macOS still blocks the app, use the same right-click `Open` flow again.
 
 The package is built by:
 

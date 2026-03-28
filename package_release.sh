@@ -17,6 +17,10 @@ mkdir -p "$OUT_DIR"
 echo "[package] Building plugin"
 make -C "$ROOT"
 
+echo "[package] Generating app icon"
+"$ROOT/tools/generate_app_icon.py" >/dev/null
+/usr/bin/iconutil -c icns "$ROOT/assets/StartPatcheddLive.iconset" -o "$ROOT/assets/StartPatcheddLive.icns"
+
 echo "[package] Preparing release folder: $OUT_DIR"
 cp "$ROOT/libmovechannel.dylib" "$OUT_DIR/"
 cp "$ROOT/launch.sh" "$OUT_DIR/_launch_internal.sh"
@@ -71,15 +75,18 @@ Important runtime requirements
 
 How to run
 1. Put this folder anywhere on the target Mac.
-2. Double-click `Start Patched dLive.app`
-3. If Finder warns, remove quarantine from the folder and try again.
+2. First launch only:
+   right-click `Remove Quarantine.command` and choose `Open`
+3. Then:
+   right-click `Start Patched dLive.app` and choose `Open`
+4. If Finder still warns later, use the same right-click `Open` flow again.
 
 Alternative launchers
 - Double-click `Start Patched dLive.command`
 
 If macOS blocks the app
-- Double-click `Remove Quarantine.command`
-- Then launch `Start Patched dLive.app` again
+- Use `Remove Quarantine.command`
+- Then launch `Start Patched dLive.app` with right-click `Open`
 
 Changing the app path
 - If needed, edit `_launch_internal.sh` so `DLIVE_APP` points to the correct dLive Director app.
@@ -123,6 +130,8 @@ cat >"$APP_CONTENTS/Info.plist" <<'EOF'
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>Start Patched dLive</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>com.sfxter.dlive-move.launcher</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -152,6 +161,7 @@ chmod +x "$APP_MACOS/Start Patched dLive"
 
 cp "$OUT_DIR/libmovechannel.dylib" "$APP_RES_DIR/libmovechannel.dylib"
 cp "$OUT_DIR/_launch_internal.sh" "$APP_RES_DIR/_launch_internal.sh"
+cp "$ROOT/assets/StartPatcheddLive.icns" "$APP_RES_DIR/AppIcon.icns"
 chmod +x "$APP_RES_DIR/_launch_internal.sh"
 
 echo "[package] Signing with Developer ID: $SIGN_ID"

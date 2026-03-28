@@ -4,8 +4,11 @@
 
 1. Download the latest packaged release from `dist/`.
 2. Unzip it.
-3. If macOS blocks it, double-click `Remove Quarantine.command`.
-4. Double-click `Start Patched dLive.app`.
+3. First launch only:
+   right-click `Remove Quarantine.command` and choose `Open`.
+4. Then:
+   right-click `Start Patched dLive.app` and choose `Open`.
+5. If macOS still blocks the launcher later, use the same right-click `Open` action again.
 
 ## If The App Path Is Different
 
