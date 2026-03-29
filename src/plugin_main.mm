@@ -4817,7 +4817,8 @@ static void showMoveDialog() {
 
     g_dialog = new QDialog(nullptr, Qt::WindowStaysOnTopHint);
     g_dialog->setWindowTitle("Move Channel");
-    g_dialog->setMinimumWidth(300);
+    g_dialog->setMinimumWidth(420);
+    g_dialog->setMinimumHeight(340);
     // Dialog persists — never destroyed, just hidden/shown
 
     auto* layout = new QVBoxLayout(g_dialog);
@@ -4863,7 +4864,7 @@ static void showMoveDialog() {
     layout->addWidget(ioPortShiftCheck);
 
     auto* blockRow = new QHBoxLayout();
-    auto* blockLabel = new QLabel("Block Size:");
+    auto* blockLabel = new QLabel("Channels to Move:");
     auto* blockSizeSpin = new QSpinBox();
     blockSizeSpin->setRange(1, 128);
     blockSizeSpin->setValue(1);
@@ -4882,10 +4883,8 @@ static void showMoveDialog() {
 
     auto* btnLayout = new QHBoxLayout();
     auto* moveBtn = new QPushButton("Move");
-    auto* testStereoBtn = new QPushButton("Test Stereo");
     auto* closeBtn = new QPushButton("Close");
     btnLayout->addWidget(moveBtn);
-    btnLayout->addWidget(testStereoBtn);
     btnLayout->addWidget(closeBtn);
     layout->addLayout(btnLayout);
 
@@ -4899,8 +4898,15 @@ static void showMoveDialog() {
 
         MovePlan plan;
         char err[256];
+        auto explainMoveError = [&](const char* rawErr) {
+            QString text = QString(rawErr);
+            if (text.contains("split stereo pair")) {
+                text += " Use an even channel count (2, 4, 6...) so stereo pairs stay intact.";
+            }
+            return text;
+        };
         if (!buildMovePlan(srcCh, dstCh, blockSizeSpin->value(), plan, err, sizeof(err))) {
-            moveHintLabel->setText(QString("Unsupported right now: %1.").arg(err));
+            moveHintLabel->setText(QString("Unsupported right now: %1").arg(explainMoveError(err)));
             moveBtn->setEnabled(false);
             return;
         }
@@ -4979,7 +4985,11 @@ static void showMoveDialog() {
         MovePlan plan;
         char err[256];
         if (!buildMovePlan(src, dst, requestedBlockSize, plan, err, sizeof(err))) {
-            statusLabel->setText(QString("Unsupported: %1.").arg(err));
+            QString text = QString(err);
+            if (text.contains("split stereo pair")) {
+                text += " Use an even channel count (2, 4, 6...) so stereo pairs stay intact.";
+            }
+            statusLabel->setText(QString("Unsupported: %1").arg(text));
             moveBtn->setEnabled(false);
             return;
         }
@@ -4991,65 +5001,6 @@ static void showMoveDialog() {
                               shiftMixRackIOPortWithMoveInScenarioA,
                               requestedBlockSize);
         statusLabel->setText(ok ? "Done!" : "Failed — check log.");
-        updateMoveUi();
-    });
-
-    // Test Stereo button: toggle stereo on source channel, with Type A settings preservation
-    QObject::connect(testStereoBtn, &QPushButton::clicked, [=]() {
-        int ch = srcSpin->value() - 1;
-        int pair = ch / 2;
-        int ch1 = pair * 2;      // first channel of pair (even)
-        int ch2 = pair * 2 + 1;  // second channel of pair (odd)
-        bool st = isChannelStereo(ch);
-        QString beforeMsg = QString("Ch %1 pair (%2+%3): %4")
-            .arg(ch+1).arg(ch1+1).arg(ch2+1).arg(st ? "STEREO" : "MONO");
-
-        fprintf(stderr, "[MC] === Stereo toggle test: ch %d pair (%d+%d) currently %s ===\n",
-                ch+1, ch1+1, ch2+1, st ? "STEREO" : "MONO");
-
-        // 1. Dump current state before toggle
-        dumpChannelData(ch1, "StereoTest-Before");
-        dumpChannelData(ch2, "StereoTest-Before");
-
-        // 2. Snapshot both channels in the pair (Type A settings)
-        ChannelSnapshot snap1, snap2;
-        bool snapOk1 = snapshotChannel(ch1, snap1);
-        bool snapOk2 = snapshotChannel(ch2, snap2);
-        fprintf(stderr, "[MC] Snapshot: ch %d=%s ch %d=%s\n",
-                ch1+1, snapOk1 ? "OK" : "FAIL",
-                ch2+1, snapOk2 ? "OK" : "FAIL");
-
-        // 3. Toggle stereo config
-        statusLabel->setText("Toggling stereo...");
-        QApplication::processEvents();
-        bool toggleOk = changeStereoConfig(ch, !st);
-        fprintf(stderr, "[MC] changeStereoConfig returned %s\n", toggleOk ? "OK" : "FAIL");
-
-        // 4. Verify channels were reset
-        bool newSt = isChannelStereo(ch);
-        fprintf(stderr, "[MC] After toggle: ch %d is now %s\n", ch+1, newSt ? "STEREO" : "MONO");
-        dumpChannelData(ch1, "StereoTest-AfterToggle");
-        dumpChannelData(ch2, "StereoTest-AfterToggle");
-
-        // 5. Recall snapshots to restore Type A settings
-        fprintf(stderr, "[MC] Recalling snapshots to restore settings...\n");
-        if (snapOk1) recallChannel(ch1, snap1);
-        if (snapOk2) recallChannel(ch2, snap2);
-
-        // 6. Dump final state
-        dumpChannelData(ch1, "StereoTest-AfterRecall");
-        dumpChannelData(ch2, "StereoTest-AfterRecall");
-
-        // Cleanup
-        if (snapOk1) destroySnapshot(snap1);
-        if (snapOk2) destroySnapshot(snap2);
-
-        QString afterMsg = QString("Ch %1 pair: %2 → %3. Settings %4.")
-            .arg(ch+1)
-            .arg(st ? "STEREO" : "MONO")
-            .arg(newSt ? "STEREO" : "MONO")
-            .arg(toggleOk ? "restored — check log" : "FAILED");
-        statusLabel->setText(afterMsg);
         updateMoveUi();
     });
 
