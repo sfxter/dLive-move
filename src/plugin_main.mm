@@ -10,9 +10,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
+#include <array>
+#include <algorithm>
+#include <functional>
 #include <map>
 #include <vector>
 #include <set>
+#include <memory>
 
 #include <QApplication>
 #include <QDialog>
@@ -22,16 +26,25 @@
 #include <QSpinBox>
 #include <QPushButton>
 #include <QCheckBox>
+#include <QProgressDialog>
 #include <QShortcut>
 #include <QKeySequence>
 #include <QKeyEvent>
+#include <QDropEvent>
 #include <QWidget>
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QAbstractItemView>
+#include <QScrollBar>
+#include <QColor>
+#include <QBrush>
 #include <QList>
 #include <QWidget>
 #include <QWindow>
+#include <QPoint>
 
 // =============================================================================
 // Safe memory read
@@ -2549,18 +2562,27 @@ struct MovePlan {
     int hi;
     bool srcStereo;
     bool srcMonoBlock;
+    bool customOrder;
     std::vector<std::pair<int, int>> targetMap;  // (target channel, snapshot index)
+    std::array<int, 128> sourceToTarget;
 
     MovePlan()
         : rawSrc(-1), rawDst(-1), srcStart(-1), dstStart(-1),
-          blockSize(1), lo(-1), hi(-1), srcStereo(false), srcMonoBlock(false) {}
+          blockSize(1), lo(-1), hi(-1), srcStereo(false), srcMonoBlock(false),
+          customOrder(false) {
+        for (int i = 0; i < 128; i++)
+            sourceToTarget[i] = i;
+    }
 };
 
 static void* getMsgDataPtr(uint8_t* msg);
 static uint32_t getMsgLength(uint8_t* msg);
 static void dumpChannelData(int ch, const char* label);
+static std::function<void(const char*)> g_moveProgressCallback;
 static bool buildMovePlan(int src, int dst, int requestedBlockSize,
                           MovePlan& plan, char* errBuf, size_t errBufLen);
+static bool buildReorderPlan(const std::vector<int>& targetOrder,
+                             MovePlan& plan, char* errBuf, size_t errBufLen);
 static int remapChannelIndex(const MovePlan& plan, int ch);
 static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan);
 static bool readGangSnapshot(uint8_t gangNum, GangSnapshot& snap);
@@ -3450,6 +3472,12 @@ static bool buildMovePlan(int src, int dst, int requestedBlockSize,
         }
     }
 
+    for (auto& [tgtCh, snapIdx] : plan.targetMap) {
+        int srcCh = plan.lo + snapIdx;
+        if (srcCh >= 0 && srcCh < 128)
+            plan.sourceToTarget[srcCh] = tgtCh;
+    }
+
     for (int pairStart = 0; pairStart < 128; pairStart += 2) {
         if (!isChannelStereo(pairStart)) continue;
         int leftDst = remapChannelIndex(plan, pairStart);
@@ -3463,25 +3491,74 @@ static bool buildMovePlan(int src, int dst, int requestedBlockSize,
     return true;
 }
 
-static int remapChannelIndex(const MovePlan& plan, int ch) {
-    int srcLo = plan.srcStart;
-    int srcHi = plan.srcStart + plan.blockSize - 1;
-    int dstLo = plan.dstStart;
-    int dstHi = plan.dstStart + plan.blockSize - 1;
+static bool buildReorderPlan(const std::vector<int>& targetOrder,
+                             MovePlan& plan, char* errBuf = nullptr, size_t errBufLen = 0) {
+    plan = MovePlan();
+    plan.customOrder = true;
+    if (errBuf && errBufLen) errBuf[0] = '\0';
+    auto setErr = [&](const char* fmt, int a = 0, int b = 0) {
+        if (errBuf && errBufLen) snprintf(errBuf, errBufLen, fmt, a, b);
+    };
 
-    if (ch < 0 || ch > 127) return -1;
-    if (ch >= srcLo && ch <= srcHi)
-        return dstLo + (ch - srcLo);
-
-    if (srcLo < dstLo) {
-        if (ch > srcHi && ch <= dstHi)
-            return ch - plan.blockSize;
-    } else if (srcLo > dstLo) {
-        if (ch >= dstLo && ch < srcLo)
-            return ch + plan.blockSize;
+    if ((int)targetOrder.size() != 128) {
+        setErr("invalid channel list size");
+        return false;
     }
 
-    return ch;
+    std::array<bool, 128> seen{};
+    std::vector<int> changed;
+    for (int tgt = 0; tgt < 128; tgt++) {
+        int srcCh = targetOrder[tgt];
+        if (srcCh < 0 || srcCh > 127) {
+            setErr("invalid source channel %d", srcCh + 1);
+            return false;
+        }
+        if (seen[srcCh]) {
+            setErr("duplicate channel %d in target list", srcCh + 1);
+            return false;
+        }
+        seen[srcCh] = true;
+        plan.sourceToTarget[srcCh] = tgt;
+        if (srcCh != tgt) {
+            changed.push_back(tgt);
+            changed.push_back(srcCh);
+        }
+    }
+
+    if (changed.empty()) {
+        plan.lo = 0;
+        plan.hi = -1;
+        return true;
+    }
+
+    plan.lo = *std::min_element(changed.begin(), changed.end());
+    plan.hi = *std::max_element(changed.begin(), changed.end());
+
+    for (int tgt = plan.lo; tgt <= plan.hi; tgt++) {
+        int srcCh = targetOrder[tgt];
+        if (srcCh < plan.lo || srcCh > plan.hi) {
+            setErr("reorder range closure failed");
+            return false;
+        }
+        plan.targetMap.push_back({tgt, srcCh - plan.lo});
+    }
+
+    for (int pairStart = 0; pairStart < 128; pairStart += 2) {
+        if (!isChannelStereo(pairStart)) continue;
+        int leftDst = remapChannelIndex(plan, pairStart);
+        int rightDst = remapChannelIndex(plan, pairStart + 1);
+        if (leftDst < 0 || rightDst < 0 || rightDst != leftDst + 1 || (leftDst & 1) != 0) {
+            setErr("reorder would split stereo pair %d+%d", pairStart + 1, pairStart + 2);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int remapChannelIndex(const MovePlan& plan, int ch) {
+    if (ch < 0 || ch > 127) return -1;
+    return plan.sourceToTarget[ch];
 }
 
 static uint8_t remapMovedChannelRef(uint8_t oldRef, const MovePlan& plan) {
@@ -3626,18 +3703,14 @@ static PatchData getTargetPatchDataForMove(const PatchData& pd, int srcCh, int t
 // =============================================================================
 // Move Channel
 // =============================================================================
-static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
-                        bool shiftMixRackIOPortWithMoveInScenarioA = false,
-                        int requestedBlockSize = 1) {
-    MovePlan plan;
-    char planErr[256];
-    if (!buildMovePlan(src, dst, requestedBlockSize, plan, planErr, sizeof(planErr))) {
-        fprintf(stderr, "[MC] Unsupported move: %s\n", planErr[0] ? planErr : "unknown error");
-        return false;
-    }
+static bool applyMovePlan(const MovePlan& inputPlan,
+                          bool movePatchWithChannel = false,
+                          bool shiftMixRackIOPortWithMoveInScenarioA = false,
+                          const char* logLabel = nullptr) {
+    MovePlan plan = inputPlan;
 
-    if (plan.srcStart == plan.dstStart) {
-        fprintf(stderr, "[MC] Same position after normalization, nothing to do.\n");
+    if (plan.targetMap.empty()) {
+        fprintf(stderr, "[MC] %s: nothing to do.\n", logLabel ? logLabel : "Move");
         return true;
     }
 
@@ -3660,9 +3733,14 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
         ? "move with channel"
         : (shiftMixRackIOPortWithMoveInScenarioA ? "shift by move amount" : "stay with channel");
 
-    if (plan.srcStereo) {
+    if (plan.customOrder) {
+        fprintf(stderr, "[MC] === APPLY %s (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
+                logLabel ? logLabel : "custom reorder",
+                lo + 1, hi + 1,
+                patchPolicy, ioPortPolicy);
+    } else if (plan.srcStereo) {
         fprintf(stderr, "[MC] === MOVE ch %d → pos %d (normalized %d+%d → %d+%d, range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
-                src+1, dst+1,
+                plan.rawSrc+1, plan.rawDst+1,
                 plan.srcStart+1, plan.srcStart+2,
                 plan.dstStart+1, plan.dstStart+2,
                 lo+1, hi+1,
@@ -3681,7 +3759,7 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
                 patchPolicy, ioPortPolicy);
     } else {
         fprintf(stderr, "[MC] === MOVE ch %d → pos %d (range %d-%d) [patching: %s, MixRack I/O Port: %s] ===\n",
-                src+1, dst+1, lo+1, hi+1,
+                plan.rawSrc+1, plan.rawDst+1, lo+1, hi+1,
                 patchPolicy, ioPortPolicy);
     }
     if (plan.srcStereo) {
@@ -3693,6 +3771,8 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
     auto phase = [&](const char* label) {
         fprintf(stderr, "[MC][%6llums] %s\n",
                 (unsigned long long)(monotonicMs() - moveStartMs), label);
+        if (g_moveProgressCallback)
+            g_moveProgressCallback(label);
     };
 
     std::vector<GangSnapshot> affectedGangSnaps;
@@ -4794,6 +4874,26 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
     return true;
 }
 
+static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
+                        bool shiftMixRackIOPortWithMoveInScenarioA = false,
+                        int requestedBlockSize = 1) {
+    MovePlan plan;
+    char planErr[256];
+    if (!buildMovePlan(src, dst, requestedBlockSize, plan, planErr, sizeof(planErr))) {
+        fprintf(stderr, "[MC] Unsupported move: %s\n", planErr[0] ? planErr : "unknown error");
+        return false;
+    }
+
+    if (plan.srcStart == plan.dstStart) {
+        fprintf(stderr, "[MC] Same position after normalization, nothing to do.\n");
+        return true;
+    }
+
+    return applyMovePlan(plan, movePatchWithChannel,
+                         shiftMixRackIOPortWithMoveInScenarioA,
+                         "block move");
+}
+
 // Forward declarations for UI
 static void dumpChannelData(int ch, const char* label);
 
@@ -4801,6 +4901,7 @@ static void dumpChannelData(int ch, const char* label);
 // UI Dialog
 // =============================================================================
 static QDialog* g_dialog = nullptr;
+static QDialog* g_reorderDialog = nullptr;
 static id g_moveShortcutMonitor = nil;
 struct CopyPasteBuffer {
     bool valid = false;
@@ -4811,6 +4912,448 @@ struct CopyPasteBuffer {
 };
 static CopyPasteBuffer g_copyBuffer;
 static bool shouldCaptureCopyPasteShortcut();
+static void showReorderDialog();
+
+static QString formatMoveProgressLabel(const char* phase) {
+    QString text = phase ? QString::fromUtf8(phase) : QString("Working...");
+    if (text.startsWith("Phase: "))
+        text = text.mid(7);
+    return QString("Moving channels...\n%1").arg(text);
+}
+
+template <typename Fn>
+static bool runMoveWithProgressDialog(QWidget* parent, const QString& initialLabel, Fn&& fn) {
+    QProgressDialog progress(parent);
+    progress.setWindowTitle("Moving Channels");
+    progress.setLabelText(initialLabel);
+    progress.setCancelButton(nullptr);
+    progress.setMinimumDuration(0);
+    progress.setRange(0, 0);
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.show();
+    QApplication::processEvents();
+
+    auto previousCallback = g_moveProgressCallback;
+    g_moveProgressCallback = [&](const char* phase) {
+        progress.setLabelText(formatMoveProgressLabel(phase));
+        QApplication::processEvents();
+    };
+
+    bool ok = fn();
+
+    g_moveProgressCallback = previousCallback;
+    progress.close();
+    QApplication::processEvents();
+    return ok;
+}
+
+struct ReorderBlockEntry {
+    int blockId = -1;
+    int srcStart = -1;
+    int width = 1;
+    QString name;
+    uint8_t colour = 0;
+    bool stereo = false;
+    bool validPatchA = false;
+    PatchData patchDataA = {};
+    bool validPatchB = false;
+    PatchData patchDataB = {};
+};
+
+struct IllegalStereoPlacement {
+    int row = -1;
+    int targetStart = -1;
+    int blockId = -1;
+};
+
+static QColor colorForChannelColourIndex(uint8_t colour) {
+    QColor base;
+    switch (colour & 0x7) {
+        case 0: base = QColor(48, 48, 48);    break; // Black
+        case 1: base = QColor(220, 35, 60);   break; // Red
+        case 2: base = QColor(8, 170, 72);    break; // Green
+        case 3: base = QColor(255, 236, 56);  break; // Yellow
+        case 4: base = QColor(20, 86, 185);   break; // Blue
+        case 5: base = QColor(186, 34, 176);  break; // Magenta
+        case 6: base = QColor(25, 196, 207);  break; // Cyan
+        case 7: base = QColor(242, 242, 242); break; // White
+        default: base = QColor(242, 242, 242); break;
+    }
+    const int mix = 230; // about 90% original color, 10% white
+    int r = (base.red()   * mix + 255 * (255 - mix)) / 255;
+    int g = (base.green() * mix + 255 * (255 - mix)) / 255;
+    int b = (base.blue()  * mix + 255 * (255 - mix)) / 255;
+    return QColor(r, g, b);
+}
+
+static QColor textColorForChannelColourIndex(uint8_t colour) {
+    switch (colour & 0x7) {
+        case 0: // Black
+        case 1: // Red
+        case 4: // Blue
+        case 5: // Magenta
+            return QColor(255, 255, 255);
+        default:
+            return QColor(44, 44, 48);
+    }
+}
+
+struct ChannelColorOption {
+    uint8_t index;
+    const char* name;
+};
+
+static const ChannelColorOption kChannelColorOptions[] = {
+    {7, "White"},
+    {1, "Red"},
+    {2, "Green"},
+    {3, "Yellow"},
+    {4, "Blue"},
+    {5, "Magenta"},
+    {6, "Cyan"},
+    {0, "Black"},
+};
+
+static QString formatAudioSourceLabel(const sAudioSource& source) {
+    switch (source.type) {
+        case 0: return "MixRack";
+        case 1: return "MixRack DX1/2";
+        case 2: return "MixRack I/O Port";
+        case 3: return "MixRack DX3/4";
+        case 5: return "MixRack I/O Port";
+        default: return QString("Type %1").arg(source.type);
+    }
+}
+
+static bool audioSourceIsUnassigned(const sAudioSource& source) {
+    return source.type == 20 && source.number == 0;
+}
+
+static QString formatAudioSourceDisplay(const sAudioSource& source) {
+    if (audioSourceIsUnassigned(source))
+        return "Unassigned";
+    return QString("%1 %2")
+        .arg(formatAudioSourceLabel(source))
+        .arg(source.number + 1);
+}
+
+static QString formatPatchPreviewForMove(const PatchData& patch,
+                                         int srcCh,
+                                         int tgtCh,
+                                         bool movePatchWithChannel,
+                                         bool shiftMixRackIOPortWithMoveInScenarioA) {
+    PatchData previewPatch = getTargetPatchDataForMove(patch, srcCh, tgtCh,
+                                                       movePatchWithChannel,
+                                                       shiftMixRackIOPortWithMoveInScenarioA);
+    return formatAudioSourceDisplay(previewPatch.source);
+}
+
+static QString formatPreampPreviewForTarget(const ReorderBlockEntry& entry,
+                                            int tgtStart,
+                                            bool movePatchWithChannel,
+                                            bool shiftMixRackIOPortWithMoveInScenarioA) {
+    if (!entry.stereo) {
+        if (!entry.validPatchA)
+            return "n/a";
+        return formatPatchPreviewForMove(entry.patchDataA, entry.srcStart, tgtStart,
+                                         movePatchWithChannel,
+                                         shiftMixRackIOPortWithMoveInScenarioA);
+    }
+
+    QString left = entry.validPatchA
+        ? formatPatchPreviewForMove(entry.patchDataA, entry.srcStart, tgtStart,
+                                    movePatchWithChannel,
+                                    shiftMixRackIOPortWithMoveInScenarioA)
+        : QString("n/a");
+    QString right = entry.validPatchB
+        ? formatPatchPreviewForMove(entry.patchDataB, entry.srcStart + 1, tgtStart + 1,
+                                    movePatchWithChannel,
+                                    shiftMixRackIOPortWithMoveInScenarioA)
+        : QString("n/a");
+
+    int leftSocket = -1;
+    int rightSocket = -1;
+    if (entry.validPatchA && entry.validPatchB) {
+        PatchData leftPatch = getTargetPatchDataForMove(entry.patchDataA, entry.srcStart, tgtStart,
+                                                        movePatchWithChannel,
+                                                        shiftMixRackIOPortWithMoveInScenarioA);
+        PatchData rightPatch = getTargetPatchDataForMove(entry.patchDataB, entry.srcStart + 1, tgtStart + 1,
+                                                         movePatchWithChannel,
+                                                         shiftMixRackIOPortWithMoveInScenarioA);
+        if (leftPatch.source.type == rightPatch.source.type &&
+            rightPatch.source.number == leftPatch.source.number + 1) {
+            return QString("%1 %2/%3")
+                .arg(formatAudioSourceLabel(leftPatch.source))
+                .arg(leftPatch.source.number + 1)
+                .arg(rightPatch.source.number + 1);
+        }
+        if (getAnalogueSocketIndexForAudioSource(leftPatch.source, leftSocket) &&
+            getAnalogueSocketIndexForAudioSource(rightPatch.source, rightSocket)) {
+            return QString("%1 %2/%3")
+                .arg(formatAudioSourceLabel(leftPatch.source))
+                .arg(leftPatch.source.number + 1)
+                .arg(rightPatch.source.number + 1);
+        }
+    }
+    if (left == right)
+        return left;
+    return left + " | " + right;
+}
+
+static QString formatReorderChannelNumberText(const ReorderBlockEntry& entry) {
+    if (entry.stereo) {
+        return QString("Ch %1+%2")
+            .arg(entry.srcStart + 1, 3, 10, QChar('0'))
+            .arg(entry.srcStart + 2, 3, 10, QChar('0'));
+    }
+    return QString("Ch %1").arg(entry.srcStart + 1, 3, 10, QChar('0'));
+}
+
+static QString formatReorderChannelNameText(const ReorderBlockEntry& entry) {
+    return entry.name.isEmpty() ? QString("(empty)") : entry.name;
+}
+
+static QString formatReorderStereoText(const ReorderBlockEntry& entry) {
+    return entry.stereo ? "Stereo" : "Mono";
+}
+
+static std::vector<IllegalStereoPlacement> findIllegalStereoPlacements(
+    const std::vector<int>& blockOrder,
+    const std::vector<ReorderBlockEntry>& blocks) {
+    std::vector<IllegalStereoPlacement> out;
+    int tgtStart = 0;
+    for (int row = 0; row < (int)blockOrder.size(); row++) {
+        int blockId = blockOrder[row];
+        if (blockId < 0 || blockId >= (int)blocks.size())
+            continue;
+        const auto& block = blocks[blockId];
+        if (block.stereo && (tgtStart & 1) != 0)
+            out.push_back({row, tgtStart, blockId});
+        tgtStart += block.width;
+    }
+    return out;
+}
+
+class ReorderTableWidget : public QTableWidget {
+public:
+    std::function<void(const std::vector<int>&, const std::vector<int>&)> onItemsReordered;
+
+    explicit ReorderTableWidget(QWidget* parent = nullptr)
+        : QTableWidget(parent) {
+        QFont tableFont = font();
+        tableFont.setPointSize(std::max(8, tableFont.pointSize() - 2));
+        setFont(tableFont);
+        setSelectionMode(QAbstractItemView::ExtendedSelection);
+        setSelectionBehavior(QAbstractItemView::SelectRows);
+        setDragEnabled(true);
+        setAcceptDrops(true);
+        setDropIndicatorShown(true);
+        setDefaultDropAction(Qt::CopyAction);
+        setDragDropMode(QAbstractItemView::DragDrop);
+        setDragDropOverwriteMode(false);
+        setAutoScroll(true);
+        setAutoScrollMargin(48);
+        setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+        setEditTriggers(QAbstractItemView::NoEditTriggers);
+        setShowGrid(false);
+        setAlternatingRowColors(false);
+        setContextMenuPolicy(Qt::CustomContextMenu);
+        verticalHeader()->setVisible(false);
+        verticalHeader()->setDefaultSectionSize(22);
+        horizontalHeader()->setStretchLastSection(true);
+    }
+
+protected:
+    std::vector<int> currentOrder() const {
+        std::vector<int> order;
+        order.reserve(rowCount());
+        for (int row = 0; row < rowCount(); row++) {
+            QTableWidgetItem* it = item(row, 0);
+            order.push_back(it ? it->data(Qt::UserRole).toInt() : row);
+        }
+        return order;
+    }
+
+    void dragMoveEvent(QDragMoveEvent* event) override {
+        const int margin = 48;
+        const int step = std::max(4, verticalHeader()->defaultSectionSize() / 2);
+        QScrollBar* bar = verticalScrollBar();
+        if (bar) {
+            if (event->pos().y() < margin) {
+                bar->setValue(bar->value() - step);
+            } else if (event->pos().y() > viewport()->height() - margin) {
+                bar->setValue(bar->value() + step);
+            }
+        }
+        QTableWidget::dragMoveEvent(event);
+    }
+
+    void dropEvent(QDropEvent* event) override {
+        std::vector<int> beforeOrder = currentOrder();
+        QModelIndexList selection = selectedIndexes();
+        QList<int> selectedRows;
+        for (const QModelIndex& index : selection)
+            selectedRows.push_back(index.row());
+        std::sort(selectedRows.begin(), selectedRows.end());
+        selectedRows.erase(std::unique(selectedRows.begin(), selectedRows.end()), selectedRows.end());
+        if (selectedRows.empty()) {
+            event->ignore();
+            return;
+        }
+
+        QModelIndex dropIndex = indexAt(event->pos());
+        int dropRow = rowCount();
+        if (dropIndex.isValid()) {
+            dropRow = dropIndex.row();
+            QRect rect = visualRect(dropIndex);
+            if (event->pos().y() > rect.center().y())
+                dropRow++;
+        }
+        int firstSelected = selectedRows.front();
+        int lastSelected = selectedRows.back();
+        if (dropRow >= firstSelected && dropRow <= lastSelected + 1) {
+            event->setDropAction(Qt::CopyAction);
+            event->accept();
+            return;
+        }
+        int removedBeforeDrop = 0;
+        for (int rowIdx : selectedRows) {
+            if (rowIdx < dropRow)
+                removedBeforeDrop++;
+        }
+        dropRow -= removedBeforeDrop;
+        if (dropRow < 0)
+            dropRow = 0;
+        std::vector<int> movedChannels;
+        movedChannels.reserve(selectedRows.size());
+        for (int rowIdx : selectedRows)
+            movedChannels.push_back(beforeOrder[rowIdx]);
+
+        std::vector<int> afterOrder = beforeOrder;
+        for (int i = (int)selectedRows.size() - 1; i >= 0; i--)
+            afterOrder.erase(afterOrder.begin() + selectedRows[i]);
+        afterOrder.insert(afterOrder.begin() + dropRow, movedChannels.begin(), movedChannels.end());
+        event->setDropAction(Qt::CopyAction);
+        event->accept();
+        if (onItemsReordered && beforeOrder != afterOrder)
+            onItemsReordered(beforeOrder, afterOrder);
+    }
+};
+
+static std::vector<ReorderBlockEntry> snapshotReorderBlocks() {
+    std::vector<ReorderBlockEntry> blocks;
+    blocks.reserve(128);
+    for (int ch = 0, blockId = 0; ch < 128; ) {
+        ReorderBlockEntry entry;
+        entry.blockId = blockId++;
+        entry.srcStart = ch;
+        entry.stereo = ((ch & 1) == 0) && isChannelStereo(ch);
+        entry.width = entry.stereo ? 2 : 1;
+        const char* rawName = g_getChannelName ? g_getChannelName(g_audioDM, 1, (uint8_t)ch) : "";
+        entry.name = rawName ? QString::fromUtf8(rawName) : QString();
+        entry.colour = g_getChannelColour ? g_getChannelColour(g_audioDM, 1, (uint8_t)ch) : 0;
+        entry.validPatchA = readPatchData(ch, entry.patchDataA);
+        if (entry.stereo && ch + 1 < 128)
+            entry.validPatchB = readPatchData(ch + 1, entry.patchDataB);
+        blocks.push_back(entry);
+        ch += entry.width;
+    }
+    return blocks;
+}
+
+static std::vector<int> readCurrentReorderBlockOrder(const ReorderTableWidget* table) {
+    std::vector<int> order;
+    order.reserve(table->rowCount());
+    for (int row = 0; row < table->rowCount(); row++) {
+        QTableWidgetItem* item = table->item(row, 0);
+        order.push_back(item ? item->data(Qt::UserRole).toInt() : row);
+    }
+    return order;
+}
+
+static std::vector<int> expandReorderBlockOrder(const std::vector<int>& blockOrder,
+                                                const std::vector<ReorderBlockEntry>& blocks) {
+    std::vector<int> channels;
+    channels.reserve(128);
+    for (int blockId : blockOrder) {
+        if (blockId < 0 || blockId >= (int)blocks.size())
+            continue;
+        const auto& block = blocks[blockId];
+        for (int i = 0; i < block.width; i++)
+            channels.push_back(block.srcStart + i);
+    }
+    return channels;
+}
+
+static void populateReorderTable(ReorderTableWidget* table, const std::vector<int>& blockOrder) {
+    table->setUpdatesEnabled(false);
+    if (table->rowCount() != (int)blockOrder.size())
+        table->setRowCount((int)blockOrder.size());
+    for (int row = 0; row < (int)blockOrder.size(); row++) {
+        int blockId = blockOrder[row];
+        for (int col = 0; col < table->columnCount(); col++) {
+            QTableWidgetItem* item = table->item(row, col);
+            if (!item) {
+                item = new QTableWidgetItem();
+                item->setFlags((item->flags() | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled |
+                                Qt::ItemIsSelectable | Qt::ItemIsEnabled) & ~Qt::ItemIsEditable);
+                table->setItem(row, col, item);
+            }
+            if (col == 0)
+                item->setData(Qt::UserRole, blockId);
+        }
+    }
+    table->setUpdatesEnabled(true);
+}
+
+static void selectReorderRowsForBlocks(ReorderTableWidget* table, const std::vector<int>& blockIds) {
+    table->clearSelection();
+    if (blockIds.empty())
+        return;
+    std::set<int> wanted(blockIds.begin(), blockIds.end());
+    for (int row = 0; row < table->rowCount(); row++) {
+        QTableWidgetItem* item = table->item(row, 0);
+        if (item && wanted.count(item->data(Qt::UserRole).toInt()))
+            table->selectRow(row);
+    }
+}
+
+static void resizeReorderDialogToTable(QDialog* dialog, ReorderTableWidget* table) {
+    if (!dialog || !table)
+        return;
+    auto* header = table->horizontalHeader();
+    bool stretchLast = header->stretchLastSection();
+    header->setStretchLastSection(false);
+    table->resizeColumnsToContents();
+    const int kColumnPadding = 18;
+    for (int col = 0; col < table->columnCount(); col++) {
+        int contentWidth = header->sectionSizeHint(col);
+        table->setColumnWidth(col, std::max(table->columnWidth(col), contentWidth) + kColumnPadding);
+    }
+    int width = table->verticalHeader()->isVisible() ? table->verticalHeader()->width() : 0;
+    for (int col = 0; col < table->columnCount(); col++)
+        width += table->columnWidth(col);
+    width += table->frameWidth() * 2;
+    width += 24; // breathing room for scrollbars/margins
+    int desired = std::max(500, width + 28);
+    dialog->setMinimumWidth(desired);
+    dialog->resize(desired, dialog->height());
+    header->setStretchLastSection(stretchLast);
+}
+
+static bool applyChannelReorder(const std::vector<int>& targetOrder,
+                                bool movePatchWithChannel,
+                                bool shiftMixRackIOPortWithMoveInScenarioA,
+                                char* errBuf = nullptr,
+                                size_t errBufLen = 0) {
+    MovePlan plan;
+    if (!buildReorderPlan(targetOrder, plan, errBuf, errBufLen))
+        return false;
+    return applyMovePlan(plan,
+                         movePatchWithChannel,
+                         shiftMixRackIOPortWithMoveInScenarioA,
+                         "custom reorder");
+}
 
 static void showMoveDialog() {
     if (g_dialog) { g_dialog->show(); g_dialog->raise(); g_dialog->activateWindow(); return; }
@@ -4883,8 +5426,10 @@ static void showMoveDialog() {
 
     auto* btnLayout = new QHBoxLayout();
     auto* moveBtn = new QPushButton("Move");
+    auto* reorderBtn = new QPushButton("Reorder...");
     auto* closeBtn = new QPushButton("Close");
     btnLayout->addWidget(moveBtn);
+    btnLayout->addWidget(reorderBtn);
     btnLayout->addWidget(closeBtn);
     layout->addLayout(btnLayout);
 
@@ -4975,6 +5520,9 @@ static void showMoveDialog() {
     updateMoveUi();
 
     QObject::connect(closeBtn, &QPushButton::clicked, g_dialog, &QDialog::hide);
+    QObject::connect(reorderBtn, &QPushButton::clicked, [=]() {
+        showReorderDialog();
+    });
 
     QObject::connect(moveBtn, &QPushButton::clicked, [=]() {
         int src = srcSpin->value() - 1;
@@ -4997,14 +5545,302 @@ static void showMoveDialog() {
         moveBtn->setEnabled(false);
         QApplication::processEvents();
 
-        bool ok = moveChannel(src, dst, movePatchWithChannel,
-                              shiftMixRackIOPortWithMoveInScenarioA,
-                              requestedBlockSize);
+        bool ok = runMoveWithProgressDialog(
+            g_dialog,
+            formatMoveProgressLabel("Phase: preparing move"),
+            [&]() {
+                return moveChannel(src, dst, movePatchWithChannel,
+                                   shiftMixRackIOPortWithMoveInScenarioA,
+                                   requestedBlockSize);
+            });
         statusLabel->setText(ok ? "Done!" : "Failed — check log.");
         updateMoveUi();
     });
 
     g_dialog->show();
+}
+
+static void showReorderDialog() {
+    if (g_reorderDialog) {
+        g_reorderDialog->show();
+        g_reorderDialog->raise();
+        g_reorderDialog->activateWindow();
+        return;
+    }
+
+    auto blocks = std::make_shared<std::vector<ReorderBlockEntry>>(snapshotReorderBlocks());
+
+    g_reorderDialog = new QDialog(nullptr, Qt::WindowStaysOnTopHint);
+    g_reorderDialog->setAttribute(Qt::WA_DeleteOnClose, true);
+    QObject::connect(g_reorderDialog, &QObject::destroyed, []() {
+        g_reorderDialog = nullptr;
+    });
+    g_reorderDialog->setWindowTitle("Channel Reorder Panel");
+    g_reorderDialog->setMinimumWidth(500);
+    g_reorderDialog->setMinimumHeight(760);
+
+    auto* layout = new QVBoxLayout(g_reorderDialog);
+
+    auto* intro = new QLabel(
+        "Drag channels to their final positions. Shift-select to move multiple channels together. "
+        "Apply stays disabled until the final order is legal.");
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto* patchCheck = new QCheckBox("Move preamp socket with channel (Scenario B)");
+    patchCheck->setChecked(false);
+    layout->addWidget(patchCheck);
+
+    auto* ioPortShiftCheck = new QCheckBox("In Scenario A, also shift MixRack I/O Port sockets");
+    ioPortShiftCheck->setChecked(false);
+    layout->addWidget(ioPortShiftCheck);
+
+    auto* table = new ReorderTableWidget(g_reorderDialog);
+    table->setColumnCount(5);
+    table->setHorizontalHeaderLabels({"Pos", "Channels", "Name", "Type", "Final Preamp"});
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    layout->addWidget(table, 1);
+    std::vector<int> initialOrder;
+    initialOrder.reserve(blocks->size());
+    for (const auto& block : *blocks)
+        initialOrder.push_back(block.blockId);
+    populateReorderTable(table, initialOrder);
+
+    struct ReorderHistoryState {
+        std::vector<std::vector<int>> undoStack;
+        std::vector<std::vector<int>> redoStack;
+    };
+    auto history = std::make_shared<ReorderHistoryState>();
+
+    auto* statusLabel = new QLabel("Ready.");
+    statusLabel->setWordWrap(true);
+    layout->addWidget(statusLabel);
+
+    auto* btnLayout = new QHBoxLayout();
+    auto* undoBtn = new QPushButton("Undo");
+    auto* redoBtn = new QPushButton("Redo");
+    auto* applyBtn = new QPushButton("Apply");
+    auto* closeBtn = new QPushButton("Close");
+    btnLayout->addWidget(undoBtn);
+    btnLayout->addWidget(redoBtn);
+    btnLayout->addStretch(1);
+    btnLayout->addWidget(applyBtn);
+    btnLayout->addWidget(closeBtn);
+    layout->addLayout(btnLayout);
+
+    auto refreshPanel = [=]() {
+        ioPortShiftCheck->setEnabled(!patchCheck->isChecked());
+        std::vector<int> blockOrder = readCurrentReorderBlockOrder(table);
+        std::vector<int> order = expandReorderBlockOrder(blockOrder, *blocks);
+        std::vector<IllegalStereoPlacement> illegalPlacements =
+            findIllegalStereoPlacements(blockOrder, *blocks);
+        std::set<int> illegalRows;
+        for (const auto& placement : illegalPlacements)
+            illegalRows.insert(placement.row);
+        int tgtStart = 0;
+
+        for (int row = 0; row < table->rowCount(); row++) {
+            auto* posItem = table->item(row, 0);
+            auto* channelNumItem = table->item(row, 1);
+            auto* channelNameItem = table->item(row, 2);
+            auto* stereoItem = table->item(row, 3);
+            auto* preampItem = table->item(row, 4);
+            int blockId = posItem ? posItem->data(Qt::UserRole).toInt() : row;
+            if (blockId < 0 || blockId >= (int)blocks->size())
+                continue;
+            const auto& entry = (*blocks)[blockId];
+            QColor bg = colorForChannelColourIndex(entry.colour);
+            QColor fg = textColorForChannelColourIndex(entry.colour);
+            if (illegalRows.count(row)) {
+                bg = QColor(255, 226, 226);
+                fg = QColor(155, 32, 32);
+            }
+            QBrush bgBrush(bg);
+            QBrush fgBrush(fg);
+            if (posItem)
+                posItem->setText(QString::number(tgtStart + 1));
+            if (channelNumItem)
+                channelNumItem->setText(formatReorderChannelNumberText(entry));
+            if (channelNameItem)
+                channelNameItem->setText(formatReorderChannelNameText(entry));
+            if (stereoItem)
+                stereoItem->setText(formatReorderStereoText(entry));
+            if (preampItem) {
+                preampItem->setText(formatPreampPreviewForTarget(entry, tgtStart,
+                                                                 patchCheck->isChecked(),
+                                                                 ioPortShiftCheck->isChecked()));
+            }
+            if (posItem)
+                posItem->setTextAlignment(Qt::AlignCenter);
+            if (channelNumItem)
+                channelNumItem->setTextAlignment(Qt::AlignCenter);
+            if (stereoItem)
+                stereoItem->setTextAlignment(Qt::AlignCenter);
+            for (int col = 0; col < table->columnCount(); col++) {
+                QTableWidgetItem* item = table->item(row, col);
+                if (!item)
+                    continue;
+                item->setBackground(bgBrush);
+                item->setForeground(fgBrush);
+            }
+            tgtStart += entry.width;
+        }
+
+        if (!illegalPlacements.empty()) {
+            const auto& placement = illegalPlacements.front();
+            const auto& block = (*blocks)[placement.blockId];
+            QString text = QString("Illegal layout: stereo block Ch %1+%2 would start at position %3. Add or move one mono channel before it so stereo blocks start on 1, 3, 5, ...")
+                .arg(block.srcStart + 1, 3, 10, QChar('0'))
+                .arg(block.srcStart + 2, 3, 10, QChar('0'))
+                .arg(placement.targetStart + 1);
+            statusLabel->setText(text);
+            applyBtn->setEnabled(false);
+            undoBtn->setEnabled(!history->undoStack.empty());
+            redoBtn->setEnabled(!history->redoStack.empty());
+            resizeReorderDialogToTable(g_reorderDialog, table);
+            return;
+        }
+
+        MovePlan plan;
+        char err[256];
+        if (!buildReorderPlan(order, plan, err, sizeof(err))) {
+            QString text = QString("Illegal layout: %1").arg(err);
+            if (QString(err).contains("split stereo pair")) {
+                text += " Keep stereo channels together on positions 1+2, 3+4, 5+6, ...";
+            }
+            statusLabel->setText(text);
+            applyBtn->setEnabled(false);
+            undoBtn->setEnabled(!history->undoStack.empty());
+            redoBtn->setEnabled(!history->redoStack.empty());
+            resizeReorderDialogToTable(g_reorderDialog, table);
+            return;
+        }
+
+        int changed = 0;
+        for (int i = 0; i < 128; i++) {
+            if (order[i] != i) changed++;
+        }
+        if (changed == 0) {
+            statusLabel->setText("No changes yet.");
+            applyBtn->setEnabled(false);
+        } else {
+            statusLabel->setText(QString("Ready to apply. %1 channel positions changed.")
+                                 .arg(changed));
+            applyBtn->setEnabled(true);
+        }
+        undoBtn->setEnabled(!history->undoStack.empty());
+        redoBtn->setEnabled(!history->redoStack.empty());
+        resizeReorderDialogToTable(g_reorderDialog, table);
+    };
+
+    auto restoreOrder = [=](const std::vector<int>& order, const std::vector<int>& selectedBlocks = std::vector<int>()) {
+        populateReorderTable(table, order);
+        refreshPanel();
+        selectReorderRowsForBlocks(table, selectedBlocks);
+    };
+
+    table->onItemsReordered = [=](const std::vector<int>& before, const std::vector<int>& after) {
+        if (before == after)
+            return;
+        history->undoStack.push_back(before);
+        history->redoStack.clear();
+        restoreOrder(after);
+    };
+    QObject::connect(patchCheck, &QCheckBox::toggled, [=](bool) { refreshPanel(); });
+    QObject::connect(ioPortShiftCheck, &QCheckBox::toggled, [=](bool) { refreshPanel(); });
+    QObject::connect(closeBtn, &QPushButton::clicked, g_reorderDialog, &QDialog::close);
+    QObject::connect(undoBtn, &QPushButton::clicked, [=]() {
+        if (history->undoStack.empty())
+            return;
+        std::vector<int> current = readCurrentReorderBlockOrder(table);
+        history->redoStack.push_back(current);
+        std::vector<int> prior = history->undoStack.back();
+        history->undoStack.pop_back();
+        restoreOrder(prior);
+    });
+    QObject::connect(redoBtn, &QPushButton::clicked, [=]() {
+        if (history->redoStack.empty())
+            return;
+        std::vector<int> current = readCurrentReorderBlockOrder(table);
+        history->undoStack.push_back(current);
+        std::vector<int> next = history->redoStack.back();
+        history->redoStack.pop_back();
+        restoreOrder(next);
+    });
+
+    auto* undoShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Z")), g_reorderDialog);
+    QObject::connect(undoShortcut, &QShortcut::activated, undoBtn, &QPushButton::click);
+    auto* redoShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+Z")), g_reorderDialog);
+    QObject::connect(redoShortcut, &QShortcut::activated, redoBtn, &QPushButton::click);
+    auto* undoShortcutMac = new QShortcut(QKeySequence(QStringLiteral("Meta+Z")), g_reorderDialog);
+    QObject::connect(undoShortcutMac, &QShortcut::activated, undoBtn, &QPushButton::click);
+    auto* redoShortcutMac = new QShortcut(QKeySequence(QStringLiteral("Meta+Shift+Z")), g_reorderDialog);
+    QObject::connect(redoShortcutMac, &QShortcut::activated, redoBtn, &QPushButton::click);
+
+    QObject::connect(table, &QWidget::customContextMenuRequested, g_reorderDialog, [=](const QPoint& pos) {
+        QModelIndex idx = table->indexAt(pos);
+        if (idx.isValid() && !table->selectionModel()->isRowSelected(idx.row(), QModelIndex()))
+            table->selectRow(idx.row());
+
+        std::vector<int> selectedBlockIds;
+        QModelIndexList selected = table->selectionModel()->selectedRows();
+        selectedBlockIds.reserve(selected.size());
+        for (const QModelIndex& rowIndex : selected) {
+            QTableWidgetItem* item = table->item(rowIndex.row(), 0);
+            if (!item) continue;
+            selectedBlockIds.push_back(item->data(Qt::UserRole).toInt());
+        }
+        if (selectedBlockIds.empty())
+            return;
+
+        QMenu menu(g_reorderDialog);
+        QMenu* colorMenu = menu.addMenu("Set Color");
+        for (const auto& option : kChannelColorOptions) {
+            QAction* action = colorMenu->addAction(option.name);
+            QObject::connect(action, &QAction::triggered, g_reorderDialog, [=]() {
+                for (int blockId : selectedBlockIds) {
+                    if (blockId < 0 || blockId >= (int)blocks->size())
+                        continue;
+                    auto& block = (*blocks)[blockId];
+                    block.colour = option.index;
+                    for (int i = 0; i < block.width; i++) {
+                        int ch = block.srcStart + i;
+                        if (g_setChannelColour)
+                            g_setChannelColour(g_audioDM, 1, (uint8_t)ch, option.index);
+                    }
+                }
+                refreshPanel();
+            });
+        }
+        menu.exec(table->viewport()->mapToGlobal(pos));
+    });
+
+    QObject::connect(applyBtn, &QPushButton::clicked, [=]() {
+        std::vector<int> blockOrder = readCurrentReorderBlockOrder(table);
+        std::vector<int> order = expandReorderBlockOrder(blockOrder, *blocks);
+        char err[256];
+        bool ok = runMoveWithProgressDialog(
+            g_reorderDialog,
+            formatMoveProgressLabel("Phase: preparing reorder"),
+            [&]() {
+                return applyChannelReorder(order,
+                                           patchCheck->isChecked(),
+                                           ioPortShiftCheck->isChecked(),
+                                           err, sizeof(err));
+            });
+        if (!ok) {
+            statusLabel->setText(QString("Failed: %1").arg(err[0] ? err : "check log"));
+            return;
+        }
+        g_reorderDialog->close();
+    });
+
+    refreshPanel();
+    g_reorderDialog->show();
 }
 
 struct SelectedStripInfo {
@@ -5290,6 +6126,16 @@ static void installMoveShortcuts() {
                     showMoveDialog();
                 });
             };
+            auto installUiShortcut = [widget](const QKeySequence& seq,
+                                              const char* label,
+                                              void (*action)()) {
+                auto* shortcut = new QShortcut(seq, widget);
+                shortcut->setContext(Qt::ApplicationShortcut);
+                QObject::connect(shortcut, &QShortcut::activated, widget, [label, action]() {
+                    fprintf(stderr, "[MC] %s shortcut activated.\n", label);
+                    action();
+                });
+            };
             auto installAction = [widget](const QKeySequence& seq,
                                           const char* label,
                                           bool (*action)()) {
@@ -5303,6 +6149,8 @@ static void installMoveShortcuts() {
             };
             installOne(QKeySequence(QStringLiteral("Ctrl+Shift+M")));
             installOne(QKeySequence(QStringLiteral("Meta+Shift+M")));
+            installUiShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+R")), "Reorder panel", showReorderDialog);
+            installUiShortcut(QKeySequence(QStringLiteral("Meta+Shift+R")), "Reorder panel", showReorderDialog);
             installAction(QKeySequence(QStringLiteral("Ctrl+C")), "Copy", copySelectedChannelSettings);
             installAction(QKeySequence(QStringLiteral("Meta+C")), "Copy", copySelectedChannelSettings);
             installAction(QKeySequence(QStringLiteral("Ctrl+V")), "Paste", pasteCopiedChannelSettings);
@@ -5342,6 +6190,14 @@ static void installNativeMacMoveShortcut() {
             });
             return nil;
         }
+        if (cmdShift && chars &&
+            [chars caseInsensitiveCompare:@"r"] == NSOrderedSame) {
+            fprintf(stderr, "[MC] Reorder shortcut caught by native mac monitor.\n");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                showReorderDialog();
+            });
+            return nil;
+        }
         if (cmdOnly && chars && shouldCaptureCopyPasteShortcut()) {
             if ([chars caseInsensitiveCompare:@"c"] == NSOrderedSame) {
                 fprintf(stderr, "[MC] Copy shortcut caught by native mac monitor.\n");
@@ -5360,7 +6216,7 @@ static void installNativeMacMoveShortcut() {
         }
         return event;
     }];
-    fprintf(stderr, "[MC] Native mac move shortcut monitor installed (Cmd+Shift+M).\n");
+    fprintf(stderr, "[MC] Native mac shortcut monitor installed (Cmd+Shift+M / Cmd+Shift+R).\n");
 }
 
 // =============================================================================
@@ -5387,6 +6243,13 @@ protected:
                 fprintf(stderr, "[MC] Move shortcut caught by global filter (type=%d).\n",
                         (int)event->type());
                 showMoveDialog();
+                return true;
+            }
+            if (ke->key() == Qt::Key_R &&
+                (ctrlShift || metaShift)) {
+                fprintf(stderr, "[MC] Reorder shortcut caught by global filter (type=%d).\n",
+                        (int)event->type());
+                showReorderDialog();
                 return true;
             }
             if ((ke->key() == Qt::Key_C || ke->key() == Qt::Key_V) &&
@@ -5583,7 +6446,7 @@ static void onLoad() {
         });
         fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).\n");
 
-        showMoveDialog();
+        showReorderDialog();
 
         if (getenv("MC_AUTOTEST_SRC") && getenv("MC_AUTOTEST_DST")) {
             fprintf(stderr, "[MC] Autotest requested via environment.\n");
