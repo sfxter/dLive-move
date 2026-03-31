@@ -108,6 +108,8 @@ EOF
 
 cp "$ROOT/README.md" "$OUT_DIR/PROJECT_README.md"
 cp "$ROOT/DISCLAIMER.md" "$OUT_DIR/DISCLAIMER.md"
+cp "$ROOT/docs/LIVE_CONSOLE_AUDIT_PLAN.md" "$OUT_DIR/LIVE_CONSOLE_AUDIT_PLAN.md"
+cp "$ROOT/docs/RELEASE_NOTES_2026-03-31.md" "$OUT_DIR/RELEASE_NOTES.txt"
 
 chmod +x "$OUT_DIR/_launch_internal.sh"
 chmod +x "$OUT_DIR/Start Patched dLive.command"

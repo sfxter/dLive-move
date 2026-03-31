@@ -6,6 +6,7 @@ This project adds quality-of-life features to the dLive offline editor, with the
 
 ## What It Does
 
+- Adds a Channel Reorder Panel so you can drag channels into a new order, press `Apply`, and move their settings with them
 - Moves mono channels safely
 - Moves stereo channels as stereo blocks
 - Moves larger channel blocks while protecting stereo pairs
@@ -20,6 +21,7 @@ This project adds quality-of-life features to the dLive offline editor, with the
 It also includes extra usability features:
 
 - `Cmd+Shift+M` opens the move dialog on macOS
+- `Reorder` in the top bar opens the Channel Reorder Panel
 - `Cmd+C` / `Cmd+V` copies and pastes input channel settings
 - `Cmd+C` / `Cmd+V` uses built-in `Copy Mix` / `Paste Mix` when an Aux is selected
 
