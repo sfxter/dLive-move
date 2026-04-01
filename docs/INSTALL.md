@@ -9,6 +9,8 @@
 4. Then:
    right-click `Start Patched dLive.app` and choose `Open`.
 5. If macOS still blocks the launcher later, use the same right-click `Open` action again.
+6. If Director starts but the patch still does not load, run:
+   `Prepare Director For Patch.command`
 
 ## If The App Path Is Different
 
@@ -23,3 +25,7 @@ If your app is somewhere else, edit `_launch_internal.sh` inside the packaged fo
 - The patch launches your installed Director app with `DYLD_INSERT_LIBRARIES`
 - No LLDB is required for normal use
 - The packaged launcher disables live log tailing by default so it behaves more like a normal app
+- On some Macs, the stock signed Director app refuses third-party dylib injection even after quarantine removal
+- `Prepare Director For Patch.command` is an opt-in workaround for that case
+- It re-signs the user's local Director app with an ad-hoc signature
+- If the user wants to undo that change later, the safe path is reinstalling Director

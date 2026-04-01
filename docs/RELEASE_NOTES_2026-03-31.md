@@ -1,6 +1,6 @@
 # dLive Move Patch
 
-Date: 2026-03-31
+Date: 2026-04-01
 
 This release adds a full Channel Reorder workflow alongside the move and copy/paste improvements.
 
@@ -28,6 +28,7 @@ This release adds a full Channel Reorder workflow alongside the move and copy/pa
 - Hardened copy/paste for input channels so `Cmd+C` / `Cmd+V` now copies full strip state under plugin control instead of relying on Director's built-in input copy.
 - Added Dyn8-aware copy/paste for mono and stereo cases.
 - Fixed online copy/paste instability by removing native mac `Cmd+C` / `Cmd+V` handling and keeping those shortcuts on the Qt path.
+- Fixed a startup crash that could happen when Director showed the system-selection popup and startup initialization was delayed.
 - Hardened preamp handling:
   - true socket-backed analogue gain / pad / polarity verified live
   - MixRack I/O Port no longer treated as analogue preamp state
@@ -35,6 +36,10 @@ This release adds a full Channel Reorder workflow alongside the move and copy/pa
   - regular sidechains
   - Dyn8 sidechain source remap
   - Stereo Image mode / width
+- Added `Prepare Director For Patch.command` as an explicit opt-in helper for Macs that refuse to load the patch into the stock signed Director app:
+  - removes quarantine from the patch folder
+  - re-signs the user's local Director app with an ad-hoc signature
+  - intended only for Macs where Director opens but the patch does not load
 
 ## What Input Copy/Paste Includes
 

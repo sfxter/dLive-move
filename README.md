@@ -41,6 +41,10 @@ For most users, use the packaged build in [`dist/`](./dist):
 3. After that:
    right-click `Start Patched dLive.app` and choose `Open`.
 4. Later launches should be simpler, but if macOS still blocks the app, use the same right-click `Open` flow again.
+5. If Director opens but the patch still does not load on that Mac, run:
+   `Prepare Director For Patch.command`
+
+`Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder and re-signs the user's local `dLive Director V2.11.app` with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
 
 The package is built by:
 

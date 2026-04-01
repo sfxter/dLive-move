@@ -7663,12 +7663,10 @@ static void dumpTopNavQuickTree() {
 
 static void refreshToolbarReorderButton() {
     QmlToolbarTargets qmlTargets = findQmlToolbarTargets();
-    ToolbarReorderTargets targets = findToolbarReorderTargets();
     QWidget* host = nullptr;
     QWidget* anchor = nullptr;
     QRect anchorRect;
     QRect rightRect;
-    bool usedFallbackLayout = false;
 
     if (qmlTargets.host && qmlTargets.quickWidget && qmlTargets.tabrow) {
         host = qmlTargets.host;
@@ -7677,23 +7675,12 @@ static void refreshToolbarReorderButton() {
             rightRect = qmlObjectRectInHost(qmlTargets.homeButton, qmlTargets.quickWidget, host);
         else if (qmlTargets.tabbar)
             rightRect = qmlObjectRectInHost(qmlTargets.tabbar, qmlTargets.quickWidget, host);
-    } else if (targets.host) {
-        anchor = targets.systemWidget ? targets.systemWidget : targets.mainWidget;
-        host = targets.host;
-        if (anchor && targets.rightBoundaryWidget) {
-            anchorRect = visualTextRectInAncestor(anchor, host);
-            rightRect = widgetRectInAncestor(targets.rightBoundaryWidget, host);
-        }
     }
 
     if (!host || !anchorRect.isValid() || !rightRect.isValid() || rightRect.x() <= anchorRect.right()) {
-        host = findLargestVisibleTopLevelWidget();
-        if (!host) {
-            if (g_toolbarReorderButton)
-                g_toolbarReorderButton->hide();
-            return;
-        }
-        usedFallbackLayout = true;
+        if (g_toolbarReorderButton)
+            g_toolbarReorderButton->hide();
+        return;
     }
 
     if (!g_toolbarReorderButton || g_toolbarReorderButton->parentWidget() != host) {
@@ -7712,7 +7699,7 @@ static void refreshToolbarReorderButton() {
     g_toolbarReorderButton->setText(styleText);
     QFont navFont = anchor ? anchor->font() : host->font();
     navFont.setFamily("Liberation Sans");
-    if (!usedFallbackLayout && anchorRect.isValid()) {
+    if (anchorRect.isValid()) {
         int targetPixelSize = std::max(16, std::min(20, anchorRect.height() - 12));
         navFont.setPixelSize(targetPixelSize);
         navFont.setWeight(QFont::Normal);
@@ -7747,27 +7734,21 @@ static void refreshToolbarReorderButton() {
     int x = 0;
     int y = 4;
 
-    if (!usedFallbackLayout) {
-        int gap = rightRect.x() - anchorRect.right() - 1;
-        if (gap < 76) {
-            g_toolbarReorderButton->hide();
-            return;
-        }
-        desiredWidth = std::max(desiredWidth,
-                                g_toolbarReorderButton->fontMetrics().horizontalAdvance(styleText) + 8);
-        desiredWidth = std::min(desiredWidth, gap - 18);
-        if (desiredWidth < 48) {
-            g_toolbarReorderButton->hide();
-            return;
-        }
-        desiredHeight = std::max(26, std::min(anchorRect.height(), 30));
-        x = anchorRect.right() + 18;
-        y = anchorRect.y() + std::max(0, (anchorRect.height() - desiredHeight) / 2);
-    } else {
-        desiredWidth = std::max(desiredWidth, 80);
-        x = 210;
-        y = 10;
+    int gap = rightRect.x() - anchorRect.right() - 1;
+    if (gap < 76) {
+        g_toolbarReorderButton->hide();
+        return;
     }
+    desiredWidth = std::max(desiredWidth,
+                            g_toolbarReorderButton->fontMetrics().horizontalAdvance(styleText) + 8);
+    desiredWidth = std::min(desiredWidth, gap - 18);
+    if (desiredWidth < 48) {
+        g_toolbarReorderButton->hide();
+        return;
+    }
+    desiredHeight = std::max(26, std::min(anchorRect.height(), 30));
+    x = anchorRect.right() + 18;
+    y = anchorRect.y() + std::max(0, (anchorRect.height() - desiredHeight) / 2);
 
     g_toolbarReorderButton->setGeometry(x, y, desiredWidth, desiredHeight);
     g_toolbarReorderButton->show();
@@ -9459,7 +9440,8 @@ static void onLoad() {
 
     // Poll for app instance availability (user may need to click Offline first)
     __block int pollCount = 0;
-    __block void (^pollBlock)(void) = ^{
+    __block void (^pollBlock)(void) = nullptr;
+    pollBlock = Block_copy(^{
         pollCount++;
         void* app = g_AppInstance();
         if (!app) {
@@ -9515,8 +9497,6 @@ static void onLoad() {
             refreshToolbarReorderButton();
         });
         fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).\n");
-
-        showReorderDialog();
 
         if (getenv("MC_AUTOTEST_COPY_SRC") && getenv("MC_AUTOTEST_COPY_DST")) {
             fprintf(stderr, "[MC] Copy/paste autotest requested via environment.\n");
@@ -9587,7 +9567,7 @@ static void onLoad() {
 #endif
 
         fprintf(stderr, "[MC] ===== MoveChannel ready =====\n");
-    };
+    });
     // Start polling after initial 5s delay
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), pollBlock);

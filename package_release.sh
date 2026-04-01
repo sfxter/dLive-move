@@ -48,6 +48,34 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 /usr/bin/osascript -e 'display dialog "Quarantine attributes removed from this patch folder." buttons {"OK"} default button "OK"'
 EOF
 
+cat >"$OUT_DIR/Prepare Director For Patch.command" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DEFAULT_APP_BUNDLE="/Applications/dLive Director V2.11.app"
+APP_BUNDLE="${DLIVE_APP_BUNDLE:-$DEFAULT_APP_BUNDLE}"
+
+if [[ ! -d "$APP_BUNDLE" ]]; then
+  /usr/bin/osascript <<OSA
+display dialog "Could not find dLive Director at:\n\n$APP_BUNDLE\n\nIf your app is installed somewhere else, run this command from Terminal with:\nDLIVE_APP_BUNDLE=\"/path/to/dLive Director V2.11.app\" ./Prepare Director For Patch.command" buttons {"OK"} default button "OK" with icon caution
+OSA
+  exit 1
+fi
+
+/usr/bin/osascript <<OSA
+display dialog "This helper will do 2 things:\n\n1. Remove quarantine from this patch folder\n2. Re-sign your local dLive Director app with an ad-hoc signature so the community patch can be injected on Macs that block the stock signed app\n\nApp to modify:\n$APP_BUNDLE\n\nThis changes the code signature of your local Director install. If you want to undo it later, reinstall Director.\n\nContinue?" buttons {"Cancel", "Continue"} default button "Continue" with icon caution
+OSA
+
+/usr/bin/xattr -dr com.apple.quarantine "$DIR" || true
+/usr/bin/xattr -dr com.apple.quarantine "$APP_BUNDLE" || true
+/usr/bin/codesign --force --deep --sign - "$APP_BUNDLE"
+
+/usr/bin/osascript <<OSA
+display dialog "Director is now prepared for the patch.\n\nYou can launch the patch normally with Start Patched dLive.app or Start Patched dLive.command." buttons {"OK"} default button "OK"
+OSA
+EOF
+
 cat >"$OUT_DIR/README.txt" <<'EOF'
 dLive Move Patch
 ================
@@ -58,6 +86,7 @@ What is included
 - Start Patched dLive.app
 - Open Patch Log.command
 - Remove Quarantine.command
+- Prepare Director For Patch.command
 
 What the target Mac needs
 - dLive Director V2.11.app, or another compatible Director app build
@@ -80,6 +109,8 @@ How to run
 3. Then:
    right-click `Start Patched dLive.app` and choose `Open`
 4. If Finder still warns later, use the same right-click `Open` flow again.
+5. If Director starts but the patch does not load on this Mac, run:
+   `Prepare Director For Patch.command`
 
 Alternative launchers
 - Double-click `Start Patched dLive.command`
@@ -87,6 +118,12 @@ Alternative launchers
 If macOS blocks the app
 - Use `Remove Quarantine.command`
 - Then launch `Start Patched dLive.app` with right-click `Open`
+
+If Director opens but the patch still does not load
+- Run `Prepare Director For Patch.command`
+- This helper re-signs your local Director app with an ad-hoc signature
+- It is an opt-in workaround for Macs that refuse third-party dylib injection into the stock signed app
+- If you want to undo it later, reinstall Director
 
 Changing the app path
 - If needed, edit `_launch_internal.sh` so `DLIVE_APP` points to the correct dLive Director app.
@@ -115,6 +152,7 @@ chmod +x "$OUT_DIR/_launch_internal.sh"
 chmod +x "$OUT_DIR/Start Patched dLive.command"
 chmod +x "$OUT_DIR/Open Patch Log.command"
 chmod +x "$OUT_DIR/Remove Quarantine.command"
+chmod +x "$OUT_DIR/Prepare Director For Patch.command"
 
 echo "[package] Building native macOS app launcher"
 APP_DIR="$OUT_DIR/Start Patched dLive.app"
