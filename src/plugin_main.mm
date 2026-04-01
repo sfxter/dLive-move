@@ -20,6 +20,7 @@
 #include <cstdarg>
 #include <climits>
 #include <cmath>
+#include <mutex>
 
 #include <QApplication>
 #include <QAbstractButton>
@@ -50,6 +51,7 @@
 #include <QScrollBar>
 #include <QColor>
 #include <QBrush>
+#include <QStandardItemModel>
 #include <QList>
 #include <QPainter>
 #include <QWidget>
@@ -5288,10 +5290,20 @@ static PatchData getEffectiveTargetPatchData(const MovePlan* plan,
 // =============================================================================
 // Move Channel
 // =============================================================================
+struct MoveConflictInfo;
+static void clearLastMoveConflict();
+static void setScenarioAPreampConflict(uint32_t socketNum,
+                                       char existingSourceLabel, int existingSrcCh, int existingTgtCh,
+                                       const PreampData& existingData,
+                                       char newSourceLabel, int newSrcCh, int newTgtCh,
+                                       const PreampData& newData);
+static bool takeLastMoveConflict(MoveConflictInfo& out);
+
 static bool applyMovePlan(const MovePlan& inputPlan,
                           bool movePatchWithChannel = false,
                           bool shiftMixRackIOPortWithMoveInScenarioA = false,
                           const char* logLabel = nullptr) {
+    clearLastMoveConflict();
     MovePlan plan = inputPlan;
 
     if (plan.targetMap.empty()) {
@@ -5454,6 +5466,9 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                 if (!samePreampDataForSource(source, planned.data, data)) {
                     PreampData plannedNorm = normalizedPreampDataForSource(source, planned.data);
                     PreampData dataNorm = normalizedPreampDataForSource(source, data);
+                    setScenarioAPreampConflict(socketNum,
+                                               planned.sourceLabel, planned.srcCh, planned.tgtCh, plannedNorm,
+                                               sourceLabel, srcCh, tgtCh, dataNorm);
                     fprintf(stderr,
                             "[MC] ERROR: Scenario A preamp conflict on target socket %u:"
                             " %c ch %d -> %d wants gain=%d pad=%d phantom=%d,"
@@ -5472,6 +5487,59 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             plannedWrites.push_back({socketNum, srcCh, tgtCh, sourceLabel, data});
             return true;
         };
+
+        auto appendUntouchedSocketClaims = [&](int ch) {
+            PatchData livePatch = {};
+            PreampData livePreamp = {};
+            if (readPatchData(ch, livePatch) &&
+                readPreampDataForPatch(livePatch, livePreamp)) {
+                int socketNum = -1;
+                if (patchDataUsesSocketBackedPreamp(livePatch) &&
+                    getAnalogueSocketIndexForAudioSource(livePatch.source, socketNum)) {
+                    plannedWrites.push_back({(uint32_t)socketNum, ch, ch, 'M', livePreamp});
+                }
+            }
+
+            void* cChannel = getManagedInputChannel(ch);
+            if (!cChannel)
+                return;
+
+            typedef bool (*fn_HasActiveInputSourceAssigned)(void* channel, int activeInputSource);
+            typedef void* (*fn_GetInputChannelSource)(void* channel, int activeInputSource);
+            auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(0x1006df840);
+            auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(0x1006d81e0);
+            if (!hasActiveInputSourceAssigned || !getInputChannelSource)
+                return;
+
+            for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
+                if (!hasActiveInputSourceAssigned(cChannel, activeInputSource))
+                    continue;
+                void* sendPt = getInputChannelSource(cChannel, activeInputSource);
+                if (!sendPt)
+                    continue;
+                sAudioSource source = {0, 0};
+                if (!resolveAudioSourceFromSendPoint(sendPt, source))
+                    continue;
+                if (!shouldRestoreSocketBackedPreampForMove(source,
+                                                            movePatchWithChannel,
+                                                            shiftMixRackIOPortWithMoveInScenarioA))
+                    continue;
+                PreampData liveAidPreamp = {};
+                if (!readPreampDataForAudioSource(source, liveAidPreamp))
+                    continue;
+                int socketNum = -1;
+                if (!getAnalogueSocketIndexForAudioSource(source, socketNum))
+                    continue;
+                plannedWrites.push_back({(uint32_t)socketNum, ch, ch,
+                                         (char)('A' + activeInputSource - 1), liveAidPreamp});
+            }
+        };
+
+        for (int ch = 0; ch < 128; ch++) {
+            if (ch >= lo && ch <= hi)
+                continue;
+            appendUntouchedSocketClaims(ch);
+        }
 
         for (auto& [tgtCh, si] : plan.targetMap) {
             if (!snaps[si].validPatch || !snaps[si].validPreamp) continue;
@@ -5782,6 +5850,8 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             PatchData tgtPatch = getEffectiveTargetPatchData(&plan, snaps[si].patchData, srcCh, tgtCh,
                                                              movePatchWithChannel,
                                                              shiftMixRackIOPortWithMoveInScenarioA);
+            PatchData matePatch = {};
+            bool haveMatePatch = false;
 
             bool tgtStereo = isChannelStereo(tgtCh);
             if (tgtStereo && (tgtCh & 1)) {
@@ -5825,9 +5895,10 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                 }
                 if (mateSnapIdx >= 0 && snaps[mateSnapIdx].validPatch) {
                     int mateSrcCh = lo + mateSnapIdx;
-                    PatchData matePatch = getEffectiveTargetPatchData(
+                    matePatch = getEffectiveTargetPatchData(
                         &plan, snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh,
                         movePatchWithChannel, shiftMixRackIOPortWithMoveInScenarioA);
+                    haveMatePatch = true;
                     sAudioSource& mateSrc = matePatch.source;
                     sendPtB = audioSourceIsUnassigned(mateSrc)
                         ? getUnassignedInputSendPoint()
@@ -5848,6 +5919,21 @@ static bool applyMovePlan(const MovePlan& inputPlan,
 
             fprintf(stderr, "[MC]   Apply patch on ch %d via SetInputChannelSource\n", tgtCh + 1);
             setInputSource(ch, 1, sendPtA, sendPtB);
+            // Keep channel-mapper metadata aligned with the applied send points so
+            // Director and the reorder panel show the correct source family.
+            if (!writePatchData(tgtCh, tgtPatch)) {
+                fprintf(stderr,
+                        "[MC]   WARN: metadata patch sync failed on ch %d after SetInputChannelSource\n",
+                        tgtCh + 1);
+            }
+            if (tgtStereo && haveMatePatch) {
+                int pairMateCh = tgtCh + 1;
+                if (!writePatchData(pairMateCh, matePatch)) {
+                    fprintf(stderr,
+                            "[MC]   WARN: metadata patch sync failed on stereo mate ch %d after SetInputChannelSource\n",
+                            pairMateCh + 1);
+                }
+            }
             fprintf(stderr, "[MC]   Patch applied on ch %d\n", tgtCh + 1);
             QApplication::processEvents();
             usleep(25 * 1000);
@@ -6547,6 +6633,14 @@ static bool moveChannel(int src, int dst, bool movePatchWithChannel = false,
 
 // Forward declarations for UI
 static void dumpChannelData(int ch, const char* label);
+struct MoveConflictInfo;
+static void clearLastMoveConflict();
+static void setScenarioAPreampConflict(uint32_t socketNum,
+                                       char existingSourceLabel, int existingSrcCh, int existingTgtCh,
+                                       const PreampData& existingData,
+                                       char newSourceLabel, int newSrcCh, int newTgtCh,
+                                       const PreampData& newData);
+static bool takeLastMoveConflict(MoveConflictInfo& out);
 
 // =============================================================================
 // UI Dialog
@@ -6556,6 +6650,123 @@ static QDialog* g_reorderDialog = nullptr;
 static id g_moveShortcutMonitor = nil;
 static QPushButton* g_toolbarReorderButton = nullptr;
 static QTimer* g_toolbarButtonRefreshTimer = nullptr;
+
+struct MoveConflictInfo {
+    bool active = false;
+    QString title;
+    QString summary;
+    QString details;
+};
+
+static MoveConflictInfo g_lastMoveConflict;
+
+static void clearLastMoveConflict() {
+    g_lastMoveConflict = MoveConflictInfo();
+}
+
+static QString sourceLabelForConflict(char sourceLabel) {
+    if (sourceLabel == 'M')
+        return "Main patch";
+    if (sourceLabel >= 'A' && sourceLabel <= 'D')
+        return QString("ABCD %1").arg(QChar(sourceLabel));
+    return QString("Source %1").arg(QChar(sourceLabel));
+}
+
+static QString boolLabelForConflict(int value, const char* falseText = "Off", const char* trueText = "On") {
+    return value ? QString::fromUtf8(trueText) : QString::fromUtf8(falseText);
+}
+
+static QString channelNameForConflict(int ch) {
+    if (!g_audioDM || !g_getChannelName || ch < 0 || ch >= 128)
+        return QString();
+    const char* raw = g_getChannelName(g_audioDM, 1, (uint8_t)ch);
+    if (!raw || !*raw)
+        return QString();
+    return QString::fromUtf8(raw);
+}
+
+static void setScenarioAPreampConflict(uint32_t socketNum,
+                                       char existingSourceLabel, int existingSrcCh, int existingTgtCh,
+                                       const PreampData& existingData,
+                                       char newSourceLabel, int newSrcCh, int newTgtCh,
+                                       const PreampData& newData) {
+    QString existingName = channelNameForConflict(existingSrcCh);
+    QString newName = channelNameForConflict(newSrcCh);
+
+    auto formatChannelRef = [](int srcCh, int tgtCh, const QString& name) {
+        QString ref = (srcCh == tgtCh)
+            ? QString("ch %1").arg(srcCh + 1)
+            : QString("ch %1 -> %2").arg(srcCh + 1).arg(tgtCh + 1);
+        if (!name.isEmpty())
+            ref += QString(" (\"%1\")").arg(name);
+        return ref;
+    };
+
+    QString summary =
+        QString("Scenario A would make multiple input paths share analogue socket %1, "
+                "but they request different preamp values.")
+            .arg(socketNum);
+
+    QString details =
+        QString(
+            "<p><b>Conflicting socket:</b> %1</p>"
+            "<table cellspacing='0' cellpadding='5' border='1' style='border-collapse:collapse;'>"
+            "<tr>"
+            "<th align='left'>Path</th>"
+            "<th align='left'>Channel</th>"
+            "<th align='left'>Socket</th>"
+            "<th align='left'>Gain</th>"
+            "<th align='left'>Pad</th>"
+            "<th align='left'>Phantom</th>"
+            "</tr>"
+            "<tr>"
+            "<td>%2</td>"
+            "<td>%3</td>"
+            "<td>%4</td>"
+            "<td>%5</td>"
+            "<td>%6</td>"
+            "<td>%7</td>"
+            "</tr>"
+            "<tr>"
+            "<td>%8</td>"
+            "<td>%9</td>"
+            "<td>%10</td>"
+            "<td>%11</td>"
+            "<td>%12</td>"
+            "<td>%13</td>"
+            "</tr>"
+            "</table>"
+            "<p><b>How to fix it:</b></p>"
+            "<p>1. Try <b>Scenario B</b> (move preamp socket with channel) instead of Scenario A.<br/>"
+            "2. Or change the channel's main / ABCD input setup so these paths do not land on the same socket.<br/>"
+            "3. Or make both paths use the same preamp values, then try again.</p>")
+            .arg(socketNum)
+            .arg(sourceLabelForConflict(existingSourceLabel).toHtmlEscaped())
+            .arg(formatChannelRef(existingSrcCh, existingTgtCh, existingName).toHtmlEscaped())
+            .arg(socketNum)
+            .arg(existingData.gain)
+            .arg(boolLabelForConflict(existingData.pad, "Off", "On").toHtmlEscaped())
+            .arg(boolLabelForConflict(existingData.phantom, "Off", "On").toHtmlEscaped())
+            .arg(sourceLabelForConflict(newSourceLabel).toHtmlEscaped())
+            .arg(formatChannelRef(newSrcCh, newTgtCh, newName).toHtmlEscaped())
+            .arg(socketNum)
+            .arg(newData.gain)
+            .arg(boolLabelForConflict(newData.pad, "Off", "On").toHtmlEscaped())
+            .arg(boolLabelForConflict(newData.phantom, "Off", "On").toHtmlEscaped());
+
+    g_lastMoveConflict.active = true;
+    g_lastMoveConflict.title = "Scenario A Socket Conflict";
+    g_lastMoveConflict.summary = summary;
+    g_lastMoveConflict.details = details;
+}
+
+static bool takeLastMoveConflict(MoveConflictInfo& out) {
+    if (!g_lastMoveConflict.active)
+        return false;
+    out = g_lastMoveConflict;
+    clearLastMoveConflict();
+    return true;
+}
 
 static QString widgetTextProperty(QWidget* widget);
 static double objectNumericProperty(QObject* obj, const char* name, double fallback);
@@ -6681,7 +6892,7 @@ static const ChannelColorOption kChannelColorOptions[] = {
 
 static QString formatAudioSourceLabel(const sAudioSource& source) {
     switch (source.type) {
-        case 0: return "MixRack";
+        case 0: return "MixRack Sockets";
         case 1: return "MixRack DX1/2";
         case 2: return "MixRack I/O Port";
         case 3: return "MixRack DX3/4";
@@ -6694,12 +6905,235 @@ static bool audioSourceIsUnassigned(const sAudioSource& source) {
     return source.type == 20 && source.number == 0;
 }
 
-static QString formatAudioSourceDisplay(const sAudioSource& source) {
+static QString buildAudioSourceBankLabel(uint32_t sourceType);
+
+static std::mutex g_audioSourceDescBuildMutex;
+
+static QString buildAudioSourceDescriptionRaw(const sAudioSource& source) {
     if (audioSourceIsUnassigned(source))
         return "Unassigned";
+
+    typedef QString (*fn_BuildAudioSourceDesc)(sAudioSource);
+    auto buildDesc = (fn_BuildAudioSourceDesc)RESOLVE(0x100eb1840);
+    if (buildDesc) {
+        QString desc;
+        {
+            // Director logs "Unhandled Socket Type" on some probe calls; keep the
+            // richer binary-backed names, but silence that specific stderr noise
+            // while we are only asking it for display text.
+            std::lock_guard<std::mutex> lock(g_audioSourceDescBuildMutex);
+            int savedStderr = dup(STDERR_FILENO);
+            int nullFd = open("/dev/null", O_WRONLY);
+            if (savedStderr >= 0 && nullFd >= 0) {
+                fflush(stderr);
+                dup2(nullFd, STDERR_FILENO);
+                desc = buildDesc(source);
+                fflush(stderr);
+                dup2(savedStderr, STDERR_FILENO);
+                setvbuf(stderr, nullptr, _IOLBF, 0);
+            } else {
+                desc = buildDesc(source);
+            }
+            if (nullFd >= 0)
+                close(nullFd);
+            if (savedStderr >= 0)
+                close(savedStderr);
+        }
+        if (!desc.isEmpty())
+            return desc;
+    }
+
+    return QString();
+}
+
+static QString trimAudioSourceBankSuffix(QString desc) {
+    struct Pattern {
+        const char* marker;
+    };
+    static const Pattern patterns[] = {
+        {": "},
+        {", Input "},
+        {", Output "},
+        {" Number "},
+    };
+
+    for (const auto& pattern : patterns) {
+        int pos = desc.lastIndexOf(pattern.marker);
+        if (pos <= 0)
+            continue;
+        QString suffix = desc.mid(pos + (int)strlen(pattern.marker)).trimmed();
+        bool ok = false;
+        suffix.toInt(&ok);
+        if (ok)
+            return desc.left(pos).trimmed();
+    }
+
+    int spacePos = desc.lastIndexOf(' ');
+    if (spacePos > 0) {
+        QString suffix = desc.mid(spacePos + 1).trimmed();
+        bool ok = false;
+        suffix.toInt(&ok);
+        if (ok)
+            return desc.left(spacePos).trimmed();
+    }
+
+    return desc.trimmed();
+}
+
+static bool isMeaningfulAudioSourceDesc(const QString& desc) {
+    QString t = desc.trimmed();
+    if (t.isEmpty() || t == "-" || t == "--")
+        return false;
+    return true;
+}
+
+static bool isGenericPatchSourceLabel(const QString& label) {
+    QString t = label.trimmed();
+    return t.isEmpty() || t == "Input" || t.startsWith("Type ");
+}
+
+static bool shouldSplitPatchSourceTypeByRange(uint32_t sourceType) {
+    // These low-numbered input banks contain multiple visible sub-banks
+    // (Surface sockets, Surface I/O 4/5, MixRack sockets, DX, I/O ports).
+    return sourceType <= 5;
+}
+
+static QString buildAudioSourceDescription(const sAudioSource& source) {
+    QString desc = buildAudioSourceDescriptionRaw(source).trimmed();
+    if (!desc.isEmpty() && desc != "-" && desc != "--")
+        return desc;
+
+    if (audioSourceIsUnassigned(source))
+        return "Unassigned";
+
     return QString("%1 %2")
-        .arg(formatAudioSourceLabel(source))
+        .arg(buildAudioSourceBankLabel(source.type))
         .arg(source.number + 1);
+}
+
+static QString buildAudioSourceBankLabel(uint32_t sourceType) {
+    if (sourceType == 20)
+        return "Unassigned";
+
+    uint16_t count = 0;
+    if (readNumSendPointsForType(sourceType, count) && count > 0) {
+        uint16_t probeLimit = shouldSplitPatchSourceTypeByRange(sourceType)
+            ? std::min<uint16_t>(count, 32)
+            : std::min<uint16_t>(count, 8);
+        for (uint16_t sourceNumber = 0; sourceNumber < probeLimit; sourceNumber++) {
+            QString desc = buildAudioSourceDescriptionRaw({sourceType, sourceNumber}).trimmed();
+            if (!isMeaningfulAudioSourceDesc(desc))
+                continue;
+            desc = trimAudioSourceBankSuffix(desc);
+            if (!desc.isEmpty() && !isGenericPatchSourceLabel(desc))
+                return desc;
+        }
+    }
+
+    typedef QString (*fn_AudioSourceToSourceString)(uint32_t sourceType, uint32_t& sourceNumber);
+    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(0x100f59db0);
+    if (audioSourceToSourceString) {
+        uint32_t sourceNumber = 0;
+        QString label = audioSourceToSourceString(sourceType, sourceNumber).trimmed();
+        if (!label.isEmpty())
+            return label;
+    }
+
+    return formatAudioSourceLabel({sourceType, 0});
+}
+
+static QString buildPatchMenuBankLabel(uint32_t sourceType, uint32_t sourceNumber) {
+    if (sourceType == 20)
+        return "Unassigned";
+
+    QString desc = buildAudioSourceDescriptionRaw({sourceType, sourceNumber}).trimmed();
+    if (isMeaningfulAudioSourceDesc(desc)) {
+        QString label = trimAudioSourceBankSuffix(desc);
+        if (!label.isEmpty() && !isGenericPatchSourceLabel(label))
+            return label;
+    }
+
+    typedef QString (*fn_AudioSourceToSourceString)(uint32_t sourceType, uint32_t& sourceNumber);
+    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(0x100f59db0);
+    if (audioSourceToSourceString) {
+        uint32_t probeNumber = sourceNumber;
+        QString label = audioSourceToSourceString(sourceType, probeNumber).trimmed();
+        if (!label.isEmpty()) {
+            label = trimAudioSourceBankSuffix(label);
+            if (!label.isEmpty())
+                return label;
+        }
+    }
+
+    return buildAudioSourceBankLabel(sourceType);
+}
+
+static QString formatAudioSourceDisplay(const sAudioSource& source) {
+    return buildAudioSourceDescription(source);
+}
+
+struct PatchSourceChoiceEntry {
+    QString label;
+    uint32_t type;
+    uint32_t startNumber;
+    uint32_t count;
+    bool available;
+};
+
+static std::vector<PatchSourceChoiceEntry> buildPatchSourceChoices(const PatchData* preferredPatch = nullptr) {
+    std::vector<PatchSourceChoiceEntry> out;
+    out.push_back({QString("Unassigned"), 20, 0, 0, true});
+
+    for (uint32_t sourceType = 0; sourceType < 0x2f; sourceType++) {
+        uint16_t count = 0;
+        bool hasCount = readNumSendPointsForType(sourceType, count);
+        if (!hasCount || count == 0)
+            continue;
+
+        if (!shouldSplitPatchSourceTypeByRange(sourceType)) {
+            QString label = buildPatchMenuBankLabel(sourceType, 0).trimmed();
+            if (isGenericPatchSourceLabel(label) || label == "Unassigned")
+                continue;
+            out.push_back({label, sourceType, 0, count, true});
+            continue;
+        }
+
+        QString runLabel;
+        uint32_t runStart = 0;
+        uint32_t runCount = 0;
+
+        auto flushRun = [&]() {
+            if (runLabel.isEmpty() || runLabel == "Unassigned" || runCount == 0 ||
+                isGenericPatchSourceLabel(runLabel))
+                return;
+            out.push_back({runLabel, sourceType, runStart, runCount, true});
+        };
+
+        for (uint32_t sourceNumber = 0; sourceNumber < count; sourceNumber++) {
+            QString label = buildPatchMenuBankLabel(sourceType, sourceNumber).trimmed();
+            if (label.isEmpty() || label == "Unassigned" || isGenericPatchSourceLabel(label))
+                continue;
+
+            if (runLabel.isEmpty()) {
+                runLabel = label;
+                runStart = sourceNumber;
+                runCount = 1;
+                continue;
+            }
+            if (label == runLabel) {
+                runCount++;
+                continue;
+            }
+
+            flushRun();
+            runLabel = label;
+            runStart = sourceNumber;
+            runCount = 1;
+        }
+        flushRun();
+    }
+
+    return out;
 }
 
 static uint32_t patchDataSourceIndexForAudioSourceType(uint32_t audioSourceType,
@@ -6802,14 +7236,14 @@ static QString formatPreampPreviewForTarget(const ReorderBlockEntry& entry,
         if (leftPatch.source.type == rightPatch.source.type &&
             rightPatch.source.number == leftPatch.source.number + 1) {
             return QString("%1 %2/%3")
-                .arg(formatAudioSourceLabel(leftPatch.source))
+                .arg(buildAudioSourceBankLabel(leftPatch.source.type))
                 .arg(leftPatch.source.number + 1)
                 .arg(rightPatch.source.number + 1);
         }
         if (getAnalogueSocketIndexForAudioSource(leftPatch.source, leftSocket) &&
             getAnalogueSocketIndexForAudioSource(rightPatch.source, rightSocket)) {
             return QString("%1 %2/%3")
-                .arg(formatAudioSourceLabel(leftPatch.source))
+                .arg(buildAudioSourceBankLabel(leftPatch.source.type))
                 .arg(leftPatch.source.number + 1)
                 .arg(rightPatch.source.number + 1);
         }
@@ -7952,7 +8386,24 @@ static void showMoveDialog() {
                                    shiftMixRackIOPortWithMoveInScenarioA,
                                    requestedBlockSize);
             });
-        statusLabel->setText(ok ? "Done!" : "Failed — check log.");
+        if (!ok) {
+            MoveConflictInfo conflict;
+            if (takeLastMoveConflict(conflict)) {
+                statusLabel->setText(conflict.summary);
+                QMessageBox msgBox(g_dialog);
+                msgBox.setIcon(QMessageBox::Warning);
+                msgBox.setWindowTitle(conflict.title);
+                msgBox.setTextFormat(Qt::RichText);
+                msgBox.setText(conflict.summary);
+                msgBox.setInformativeText(conflict.details);
+                msgBox.setStandardButtons(QMessageBox::Ok);
+                msgBox.exec();
+            } else {
+                statusLabel->setText("Failed — check log.");
+            }
+        } else {
+            statusLabel->setText("Done!");
+        }
         updateMoveUi();
     });
 
@@ -8197,14 +8648,7 @@ static void showReorderDialog() {
     auto patchSourceChoiceForSource = [](const sAudioSource& source) -> QString {
         if (audioSourceIsUnassigned(source))
             return "Unassigned";
-        switch (source.type) {
-            case 0: return "MixRack";
-            case 1: return "MixRack DX1/2";
-            case 2:
-            case 5: return "MixRack I/O Port";
-            case 3: return "MixRack DX3/4";
-            default: return formatAudioSourceLabel(source);
-        }
+        return buildPatchMenuBankLabel(source.type, source.number);
     };
 
     QObject::connect(table, &QWidget::customContextMenuRequested, g_reorderDialog, [=](const QPoint& pos) {
@@ -8244,33 +8688,37 @@ static void showReorderDialog() {
                                                  ioPortShiftCheck->isChecked())
                     : currentA;
 
-                QStringList sourceChoices;
-                sourceChoices << "MixRack"
-                              << "MixRack DX1/2"
-                              << "MixRack DX3/4"
-                              << "MixRack I/O Port"
-                              << "Unassigned";
-                int currentSourceIndex = sourceChoices.indexOf(
-                    patchSourceChoiceForSource(currentA.source));
-                if (currentSourceIndex < 0)
-                    currentSourceIndex = 0;
+                std::vector<PatchSourceChoiceEntry> sourceChoices = buildPatchSourceChoices(&currentA);
+                int currentSourceIndex = 0;
+                for (int i = 0; i < (int)sourceChoices.size(); i++) {
+                    const auto& choice = sourceChoices[i];
+                    if (choice.type != currentA.source.type)
+                        continue;
+                    if (currentA.source.number < choice.startNumber ||
+                        currentA.source.number >= choice.startNumber + choice.count)
+                        continue;
+                    currentSourceIndex = i;
+                    break;
+                }
 
                 auto sourceTypeForChoice = [&](const QString& sourceChoice) -> uint32_t {
-                    if (sourceChoice == "MixRack") return 0;
-                    if (sourceChoice == "MixRack DX1/2") return 1;
-                    if (sourceChoice == "MixRack DX3/4") return 3;
-                    if (sourceChoice == "MixRack I/O Port")
-                        return preferredMixRackIOPortAudioSourceType(&currentA);
+                    for (const auto& choice : sourceChoices) {
+                        if (choice.label == sourceChoice)
+                            return choice.type;
+                    }
                     return 20;
                 };
                 auto maxStartSocketForChoice = [&](const QString& sourceChoice) -> int {
                     if (sourceChoice == "Unassigned")
                         return 0;
-                    uint16_t sourceCount = 0;
-                    uint32_t sourceType = sourceTypeForChoice(sourceChoice);
-                    if (!readNumSendPointsForType(sourceType, sourceCount) || sourceCount == 0)
-                        return 0;
-                    return block.width > 1 ? std::max(0, (int)sourceCount - 1) : (int)sourceCount;
+                    for (const auto& choice : sourceChoices) {
+                        if (choice.label != sourceChoice)
+                            continue;
+                        if (choice.count == 0)
+                            return 0;
+                        return block.width > 1 ? std::max(0, (int)choice.count - 1) : (int)choice.count;
+                    }
+                    return 0;
                 };
 
                 QDialog patchDialog(g_reorderDialog, Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
@@ -8278,11 +8726,38 @@ static void showReorderDialog() {
                 auto* patchLayout = new QVBoxLayout(&patchDialog);
                 auto* patchForm = new QFormLayout();
                 auto* sourceCombo = new QComboBox(&patchDialog);
-                sourceCombo->addItems(sourceChoices);
+                for (const auto& choice : sourceChoices)
+                    sourceCombo->addItem(choice.label, QVariant((uint)choice.type));
                 sourceCombo->setCurrentIndex(currentSourceIndex);
+                int widestLabel = 0;
+                QFontMetrics fm(sourceCombo->font());
+                for (const auto& choice : sourceChoices)
+                    widestLabel = std::max(widestLabel, fm.horizontalAdvance(choice.label));
+                int comboWidth = std::max(260, std::min(520, widestLabel + 90));
+                sourceCombo->setMinimumWidth(comboWidth);
+                if (sourceCombo->view())
+                    sourceCombo->view()->setMinimumWidth(comboWidth + 40);
+                if (auto* model = qobject_cast<QStandardItemModel*>(sourceCombo->model())) {
+                    for (int i = 0; i < (int)sourceChoices.size(); i++) {
+                        if (sourceChoices[i].available)
+                            continue;
+                        if (QStandardItem* item = model->item(i)) {
+                            item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+                            item->setData(QColor(120, 120, 120), Qt::ForegroundRole);
+                        }
+                    }
+                }
                 auto* socketSpin = new QSpinBox(&patchDialog);
                 socketSpin->setRange(1, std::max(1, maxStartSocketForChoice(sourceCombo->currentText())));
-                int currentSocket = std::max(1, (int)currentA.source.number + 1);
+                int currentSocket = 1;
+                if (currentSourceIndex >= 0 && currentSourceIndex < (int)sourceChoices.size()) {
+                    const auto& currentChoice = sourceChoices[currentSourceIndex];
+                    if (currentChoice.type == currentA.source.type &&
+                        currentA.source.number >= currentChoice.startNumber &&
+                        currentA.source.number < currentChoice.startNumber + currentChoice.count) {
+                        currentSocket = (int)(currentA.source.number - currentChoice.startNumber + 1);
+                    }
+                }
                 socketSpin->setValue(currentSocket);
                 patchForm->addRow(block.width > 1 ? "Source bank:" : "Source bank:", sourceCombo);
                 patchForm->addRow(block.width > 1 ? "Start socket:" : "Socket:", socketSpin);
@@ -8346,14 +8821,21 @@ static void showReorderDialog() {
 
                 uint32_t sourceType = sourceTypeForChoice(sourceChoice);
                 int socketNumber = socketSpin->value();
+                uint32_t sourceNumber = 0;
+                for (const auto& choice : sourceChoices) {
+                    if (choice.label != sourceChoice)
+                        continue;
+                    sourceNumber = choice.startNumber + (uint32_t)std::max(0, socketNumber - 1);
+                    break;
+                }
 
                 block.hasPatchOverrideA = true;
                 block.patchOverrideA = makePatchDataForAudioSource(
-                    {sourceType, (uint32_t)(socketNumber - 1)}, &currentA);
+                    {sourceType, sourceNumber}, &currentA);
                 if (block.width > 1) {
                     block.hasPatchOverrideB = true;
                     block.patchOverrideB = makePatchDataForAudioSource(
-                        {sourceType, (uint32_t)socketNumber}, &currentB);
+                        {sourceType, sourceNumber + 1}, &currentB);
                 } else {
                     block.hasPatchOverrideB = false;
                 }
@@ -8410,7 +8892,20 @@ static void showReorderDialog() {
                                            err, sizeof(err));
             });
         if (!ok) {
-            statusLabel->setText(QString("Failed: %1").arg(err[0] ? err : "check log"));
+            MoveConflictInfo conflict;
+            if (takeLastMoveConflict(conflict)) {
+                statusLabel->setText(conflict.summary);
+                QMessageBox msgBox(g_reorderDialog);
+                msgBox.setIcon(QMessageBox::Warning);
+                msgBox.setWindowTitle(conflict.title);
+                msgBox.setTextFormat(Qt::RichText);
+                msgBox.setText(conflict.summary);
+                msgBox.setInformativeText(conflict.details);
+                msgBox.setStandardButtons(QMessageBox::Ok);
+                msgBox.exec();
+            } else {
+                statusLabel->setText(QString("Failed: %1").arg(err[0] ? err : "check log"));
+            }
             return;
         }
         g_reorderDialog->close();
@@ -8797,6 +9292,21 @@ static void refreshDyn8RackForCopyPaste(const std::vector<CopyPasteDyn8Op>& dyn8
     QApplication::processEvents();
 }
 
+static uint8_t remapCopiedSidechainChannel(uint8_t oldChannel,
+                                           int copySrcStart,
+                                           int copyBlockSize,
+                                           int dstStart) {
+    if (copyBlockSize <= 0)
+        return oldChannel;
+    int rel = (int)oldChannel - copySrcStart;
+    if (rel < 0 || rel >= copyBlockSize)
+        return oldChannel;
+    int mapped = dstStart + rel;
+    if (mapped < 0 || mapped > 127)
+        return oldChannel;
+    return (uint8_t)mapped;
+}
+
 static bool pasteCopyBufferToInputStart(int dstStart) {
     if (!g_copyBuffer.valid) {
         fprintf(stderr, "[MC] Paste channel settings: clipboard is empty.\n");
@@ -8820,7 +9330,27 @@ static bool pasteCopyBufferToInputStart(int dstStart) {
         int tgtCh = dstStart + i;
         haveLiveBefore[i] = snapshotChannel(tgtCh, liveBefore[i]);
 
-        if (!recallChannel(tgtCh, g_copyBuffer.snaps[i], true)) {
+        ChannelSnapshot pasteSnap = g_copyBuffer.snaps[i];
+        for (int p = 5; p <= 6; p++) {
+            if (!pasteSnap.validB[p])
+                continue;
+            uint8_t stripType = pasteSnap.dataB[p].buf[1];
+            uint8_t oldChannel = pasteSnap.dataB[p].buf[2];
+            if (stripType != 1)
+                continue;
+            uint8_t newChannel = remapCopiedSidechainChannel(oldChannel,
+                                                             g_copyBuffer.srcStart,
+                                                             g_copyBuffer.blockSize,
+                                                             dstStart);
+            if (newChannel != oldChannel) {
+                pasteSnap.dataB[p].buf[2] = newChannel;
+                fprintf(stderr,
+                        "[MC]   Copy-paste remap %s for target ch %d: channel %u -> %u\n",
+                        g_procB[p].name, tgtCh + 1, oldChannel, newChannel);
+            }
+        }
+
+        if (!recallChannel(tgtCh, pasteSnap, true)) {
             fprintf(stderr, "[MC] Paste channel settings failed on ch %d.\n", tgtCh + 1);
             for (int j = 0; j <= i; j++) {
                 if (haveLiveBefore[j])
@@ -8828,26 +9358,26 @@ static bool pasteCopyBufferToInputStart(int dstStart) {
             }
             return false;
         }
-        if (g_copyBuffer.snaps[i].validB[1]) {
-            uint16_t wantDelay = ((uint16_t)g_copyBuffer.snaps[i].dataB[1].buf[1] << 8) |
-                                 g_copyBuffer.snaps[i].dataB[1].buf[2];
-            bool wantBypass = g_copyBuffer.snaps[i].dataB[1].buf[3] != 0;
+        if (pasteSnap.validB[1]) {
+            uint16_t wantDelay = ((uint16_t)pasteSnap.dataB[1].buf[1] << 8) |
+                                 pasteSnap.dataB[1].buf[2];
+            bool wantBypass = pasteSnap.dataB[1].buf[3] != 0;
             setDelayForChannel(tgtCh, wantDelay, wantBypass);
         }
-        writeProcOrderForChannel(tgtCh, g_copyBuffer.snaps[i]);
-        replayMixerStateForChannel(tgtCh, g_copyBuffer.snaps[i], "copy-paste");
+        writeProcOrderForChannel(tgtCh, pasteSnap);
+        replayMixerStateForChannel(tgtCh, pasteSnap, "copy-paste");
         refreshSideChainStateForChannel(tgtCh, "copy-paste");
-        if (g_copyBuffer.snaps[i].validPreamp) {
+        if (pasteSnap.validPreamp) {
             PatchData tgtPatch = {};
             if (readPatchData(tgtCh, tgtPatch) &&
                 patchDataUsesSocketBackedPreamp(tgtPatch) &&
-                writePreampDataForPatch(tgtPatch, g_copyBuffer.snaps[i].preampData)) {
+                writePreampDataForPatch(tgtPatch, pasteSnap.preampData)) {
                 fprintf(stderr,
                         "[MC]   Copy-paste preamp on ch %d: gain=%d pad=%d phantom=%d\n",
                         tgtCh + 1,
-                        g_copyBuffer.snaps[i].preampData.gain,
-                        g_copyBuffer.snaps[i].preampData.pad,
-                        g_copyBuffer.snaps[i].preampData.phantom);
+                        pasteSnap.preampData.gain,
+                        pasteSnap.preampData.pad,
+                        pasteSnap.preampData.phantom);
             } else {
                 fprintf(stderr,
                         "[MC]   Copy-paste preamp skipped on ch %d (no writable socket-backed preamp)\n",

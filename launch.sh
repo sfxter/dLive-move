@@ -1,5 +1,5 @@
 #!/bin/bash
-set -u
+set -u -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_APP="/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
@@ -7,6 +7,7 @@ APP="${DLIVE_APP:-$DEFAULT_APP}"
 LOG="$DIR/movechannel.log"
 SHOW_LOG="${MC_SHOW_LOG:-0}"
 LOG_LEVEL="${MC_LOG_LEVEL:-1}"
+FILTER_SOCKET_TYPE_ERRORS="${MC_FILTER_SOCKET_TYPE_ERRORS:-1}"
 TAIL_PID=""
 BASE_TMPDIR="${TMPDIR%/}"
 RUN_TMPDIR=""
@@ -84,5 +85,12 @@ else
 fi
 
 echo "[launch] Using MC_LOG_LEVEL=$LOG_LEVEL (0=quiet, 1=normal, 2=verbose)"
-TMPDIR="$RUN_TMPDIR" MC_LOG_LEVEL="$LOG_LEVEL" DYLD_INSERT_LIBRARIES="$DIR/libmovechannel.dylib" "$APP" >>"$LOG" 2>&1
-exit $?
+if [[ "$FILTER_SOCKET_TYPE_ERRORS" != "0" ]]; then
+  echo "[launch] Filtering known harmless Director log noise: Unhandled Socket Type"
+  TMPDIR="$RUN_TMPDIR" MC_LOG_LEVEL="$LOG_LEVEL" DYLD_INSERT_LIBRARIES="$DIR/libmovechannel.dylib" "$APP" 2>&1 \
+    | awk 'index($0, "ERROR: Unhandled Socket Type") == 0 { print }' >>"$LOG"
+  exit ${PIPESTATUS[0]}
+else
+  TMPDIR="$RUN_TMPDIR" MC_LOG_LEVEL="$LOG_LEVEL" DYLD_INSERT_LIBRARIES="$DIR/libmovechannel.dylib" "$APP" >>"$LOG" 2>&1
+  exit $?
+fi

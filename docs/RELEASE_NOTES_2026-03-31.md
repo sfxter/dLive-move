@@ -4,6 +4,9 @@ Date: 2026-04-01
 
 This release adds a full Channel Reorder workflow alongside the move and copy/paste improvements.
 
+Update note:
+- Follow-up fixes now improve source-bank naming inside `Set Main Patch...`, filter harmless `Unhandled Socket Type` log spam from Director, and make sidechain copy/paste keep `Itself` relative to the pasted channel.
+
 ## What Changed
 
 - Added a Channel Reorder Panel:
@@ -27,7 +30,16 @@ This release adds a full Channel Reorder workflow alongside the move and copy/pa
 - Added explicit mute-group replay support and verified it live.
 - Hardened copy/paste for input channels so `Cmd+C` / `Cmd+V` now copies full strip state under plugin control instead of relying on Director's built-in input copy.
 - Added Dyn8-aware copy/paste for mono and stereo cases.
+- Fixed channel copy/paste sidechains so:
+  - `Itself` now stays `Itself` on the pasted channel
+  - sidechains pointing to other channels still copy over normally
 - Fixed online copy/paste instability by removing native mac `Cmd+C` / `Cmd+V` handling and keeping those shortcuts on the Qt path.
+- Improved source-bank naming and mapping in the Channel Reorder Panel:
+  - `Set Main Patch...` now shows richer source-bank names again
+  - stereo preview and table source labels better match the actual selected source bank
+- Filtered harmless Director log spam:
+  - `ERROR: Unhandled Socket Type`
+  - this line is now suppressed in the launcher log by default so the real warnings are easier to read
 - Fixed a startup crash that could happen when Director showed the system-selection popup and startup initialization was delayed.
 - Hardened preamp handling:
   - true socket-backed analogue gain / pad / polarity verified live
