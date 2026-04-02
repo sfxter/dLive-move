@@ -15,6 +15,17 @@ SAVED_STATE_DIR="$HOME/Library/Saved Application State/com.allen-heath.dLive.Dir
 DIRECTOR_TMP_DIR="$HOME/Library/Application Support/AllenAndHeath/AllenHeath/TLDV2.11/TLDData/Director/Tmp/TempShow"
 BOOST_WAVES_DIR="/private/tmp/boost_waves_interprocess"
 
+running_director_pids() {
+  ps -axo pid=,command= \
+    | awk -v app="$APP" '
+        index($0, app) {
+          pid = $1
+          if (pid != "")
+            print pid
+        }
+      '
+}
+
 if [[ -z "$BASE_TMPDIR" ]]; then
   BASE_TMPDIR="/tmp"
 fi
@@ -44,7 +55,7 @@ echo "[launch] Writing fresh log to $LOG"
 RUN_TMPDIR="$(mktemp -d "${BASE_TMPDIR}/dlive-patch.XXXXXX")"
 echo "[launch] Using isolated TMPDIR $RUN_TMPDIR"
 
-if ! pgrep -f "$APP" >/dev/null 2>&1; then
+if [[ -z "$(running_director_pids)" ]]; then
   if [[ -d "$SAVED_STATE_DIR" ]]; then
     echo "[launch] Clearing stale saved state"
     rm -rf "$SAVED_STATE_DIR"
@@ -63,7 +74,7 @@ if ! pgrep -f "$APP" >/dev/null 2>&1; then
   while IFS= read -r singleton_file; do
     QT_SINGLETON_FILES+=("$singleton_file")
   done < <(
-    find "$BASE_TMPDIR" -maxdepth 1 \
+    find "$BASE_TMPDIR" -maxdepth 2 \
       \( -name 'qipc_systemsem_dLiveDirectorRunning*' \
          -o -name 'qipc_sharedmemory_dLiveDirectorRunning*' \) \
       -print 2>/dev/null
@@ -71,6 +82,16 @@ if ! pgrep -f "$APP" >/dev/null 2>&1; then
   if (( ${#QT_SINGLETON_FILES[@]} > 0 )) && ! lsof "${QT_SINGLETON_FILES[@]}" >/dev/null 2>&1; then
     echo "[launch] Clearing stale Qt singleton IPC files in $BASE_TMPDIR"
     rm -f "${QT_SINGLETON_FILES[@]}"
+  fi
+  OLD_PATCH_TMP_DIRS=()
+  while IFS= read -r patch_tmp; do
+    OLD_PATCH_TMP_DIRS+=("$patch_tmp")
+  done < <(
+    find "$BASE_TMPDIR" -maxdepth 1 -type d -name 'dlive-patch.*' -print 2>/dev/null
+  )
+  if (( ${#OLD_PATCH_TMP_DIRS[@]} > 0 )); then
+    echo "[launch] Clearing stale dLive patch temp dirs in $BASE_TMPDIR"
+    rm -rf "${OLD_PATCH_TMP_DIRS[@]}" >/dev/null 2>&1 || true
   fi
 fi
 

@@ -1,0 +1,162 @@
+settings set stop-disassembly-display never
+settings set target.process.thread.step-avoid-regexp ""
+
+target create "/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
+settings set target.env-vars DYLD_INSERT_LIBRARIES=/Users/sfx/Programavimas/dLive-patch/libmovechannel.dylib
+settings append target.env-vars MC_LOG_LEVEL=1
+
+breakpoint set -n 'cInputChannelPreampForm::GainValuePress()'
+breakpoint command add
+expr (void)printf("\n[LLDB] GainValuePress this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::GainValueRelease()'
+breakpoint command add
+expr (void)printf("\n[LLDB] GainValueRelease this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cAnalogueInput::SetStatus(short*, bool*, bool*, cAHNetMessage&, bool, int)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cAnalogueInput::SetStatus this=%p gain=%d pad=%d phantom=%d\n", $arg1, (int)*(short*)$arg2, (int)*(bool*)$arg3, (int)*(bool*)$arg4)
+bt 5
+continue
+DONE
+
+breakpoint set -n 'cChannel::ReceivePointUpdated()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cChannel::ReceivePointUpdated this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cChannel::InputChannelStartReceivePointUpdated(eActiveInputSource, cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cChannel::InputChannelStartReceivePointUpdated this=%p activeInput=%d channel=%p\n", $arg1, (int)$arg2, $arg3)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cChannel::ActiveInputChannelStartReceivePointUpdated(cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cChannel::ActiveInputChannelStartReceivePointUpdated this=%p channel=%p\n", $arg1, $arg2)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cSocket::HasPreampChanged()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cSocket::HasPreampChanged this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cSocketProxy::HasPreampChanged()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cSocketProxy::HasPreampChanged this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::ReceivePointUpdated(cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::ReceivePointUpdated this=%p channel=%p\n", $arg1, $arg2)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::InputChannelStartReceivePointUpdated(eActiveInputSource, cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::InputChannelStartReceivePointUpdated this=%p activeInput=%d channel=%p\n", $arg1, (int)$arg2, $arg3)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::ChangeChannel(cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::ChangeChannel this=%p channel=%p\n", $arg1, $arg2)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::SetChannelAndInitState()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::SetChannelAndInitState this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::ActiveInputChannelChanged()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::ActiveInputChannelChanged this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::UpdateToReceivePoint()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::UpdateToReceivePoint this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::UpdatePreampBlock()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::UpdatePreampBlock this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputChannelPreampForm::UpdatePreampPanel()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputChannelPreampForm::UpdatePreampPanel this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputSourceAssignPanel::ReceivePointUpdated(eActiveInputSource, cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputSourceAssignPanel::ReceivePointUpdated this=%p activeInput=%d channel=%p\n", $arg1, (int)$arg2, $arg3)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputSourceAssignPanel::ChangeChannel(cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputSourceAssignPanel::ChangeChannel this=%p channel=%p\n", $arg1, $arg2)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cInputSourceAssignPanel::UpdateToReceivePoint()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cInputSourceAssignPanel::UpdateToReceivePoint this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cPreampOverviewForm::ReceivePointUpdated(cChannel*)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cPreampOverviewForm::ReceivePointUpdated this=%p channel=%p\n", $arg1, $arg2)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cPreampOverviewForm::UpdatePreamp()'
+breakpoint command add
+expr (void)printf("\n[LLDB] cPreampOverviewForm::UpdatePreamp this=%p\n", $arg1)
+bt 4
+continue
+DONE
+
+breakpoint set -n 'cChannelSelector::UpdatePreampMembersByAudioSource(sAudioSource, unsigned char*, unsigned char*, unsigned char, bool)'
+breakpoint command add
+expr (void)printf("\n[LLDB] cChannelSelector::UpdatePreampMembersByAudioSource this=%p stripType=%u channel=%u activeInput=%u stereo=%d\n", $arg1, (unsigned)*(unsigned char*)$arg3, (unsigned)*(unsigned char*)$arg4, (unsigned)$arg5, (int)$arg6)
+bt 5
+continue
+DONE
+
+process launch

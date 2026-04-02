@@ -1,0 +1,80 @@
+settings set stop-disassembly-display never
+settings set target.process.thread.step-avoid-regexp ""
+
+target create "/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
+settings set target.env-vars DYLD_INSERT_LIBRARIES=/Users/sfx/Programavimas/dLive-patch/libmovechannel.dylib
+settings append target.env-vars MC_LOG_LEVEL=1
+
+command script import /Users/sfx/Programavimas/dLive-patch/tools/scene_recall_trace_helpers.py
+script scene_recall_trace_helpers.init_trace()
+
+breakpoint set -n 'cSceneManagerIntermediateClient::SceneRecalled(cAHNetMessage&)'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_recalled_msg
+
+breakpoint set -n 'cSceneManagerIntermediateClient::SceneRecalled(cSceneManagerIntermediateData::eSceneDataTarget, unsigned short)'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_recalled_target
+
+breakpoint set -n 'cSceneManagerIntermediateClient::CurrentAndGoSceneSet(cAHNetMessage&)'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_current_go
+
+breakpoint set -n 'cSceneManagerIntermediateClient::SceneCurrentSettingsRecalled()'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_current_settings
+
+breakpoint set -n 'cSceneManagerIntermediateClient::SceneRecalledSignal(QString, unsigned short)'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_signal
+
+breakpoint set -n 'cSceneManagerIntermediateClient::GoPerformedSignal()'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_signal
+
+breakpoint set -n 'cSceneManagerIntermediateClient::ScenesUpdateCompleteSignal()'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_signal
+
+breakpoint set -n 'cSceneManagerIntermediateClient::LastRecalledSceneNumberChangedSignal(unsigned short)'
+breakpoint command add -F scene_recall_trace_helpers.bp_scene_signal
+
+breakpoint set -n 'cInputChannelPreampForm::SetChannelAndInitState()'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::ChangeChannel(cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::ReceivePointUpdated(cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::InputChannelStartReceivePointUpdated(eActiveInputSource, cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::ActiveInputChannelChanged()'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::UpdateToReceivePoint()'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputChannelPreampForm::UpdatePreampPanel()'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_form
+
+breakpoint set -n 'cInputSourceAssignPanel::ChangeChannel(cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_source_assign
+
+breakpoint set -n 'cInputSourceAssignPanel::ReceivePointUpdated(eActiveInputSource, cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_source_assign
+
+breakpoint set -n 'cInputSourceAssignPanel::UpdateToReceivePoint()'
+breakpoint command add -F scene_recall_trace_helpers.bp_source_assign
+
+breakpoint set -n 'cPreampOverviewForm::ReceivePointUpdated(cChannel*)'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_overview
+
+breakpoint set -n 'cPreampOverviewForm::UpdatePreamp()'
+breakpoint command add -F scene_recall_trace_helpers.bp_preamp_overview
+
+breakpoint set -n 'cChannelSelector::UpdatePreampMembersByAudioSource(sAudioSource, unsigned char*, unsigned char*, unsigned char, bool)'
+breakpoint command add -F scene_recall_trace_helpers.bp_selector_preamp
+
+breakpoint set -n 'cChannelSelector::InformDL5000ControlSurfacePreAmpControls(unsigned char, eAudioChannelType)'
+breakpoint command add -F scene_recall_trace_helpers.bp_selector_preamp
+
+breakpoint set -n 'cChannelSelector::UpdateDL5000ControlSurfaceControls(unsigned char, eAudioChannelType)'
+breakpoint command add -F scene_recall_trace_helpers.bp_selector_preamp
+
+process launch

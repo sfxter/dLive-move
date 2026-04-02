@@ -60,6 +60,8 @@
 #include <QTimer>
 #include <QVariant>
 #include <QMetaProperty>
+#include <QPointer>
+#include <QFile>
 
 // =============================================================================
 // Safe memory read
@@ -88,6 +90,20 @@ enum MCLogLevel {
 };
 
 static int g_mcLogLevel = -1;
+static void refreshVisiblePreampUI(const char* phaseTag = nullptr);
+static void dumpPreampUiRegions(const char* phaseTag = nullptr);
+static void runWestProcessingRefreshExperiment(const char* phaseTag = nullptr);
+static int getSelectedInputChannel(bool verbose);
+static void rememberSelectedInputChannel(int ch);
+struct SelectedStripInfo {
+    bool valid = false;
+    uint32_t stripType = 0;
+    int channel = -1;
+    void* channelPtr = nullptr;
+};
+static SelectedStripInfo getSelectedStripInfo(bool verbose);
+static int getSelectedInputChannel(bool verbose);
+static void updateAutotestOverlay(const QString& title, const QString& detail = QString());
 
 static void initLogLevel() {
     if (g_mcLogLevel >= 0) return;
@@ -157,6 +173,44 @@ static uint64_t monotonicMs() {
 static bool autotestEnvEnabled(const char* name) {
     const char* value = getenv(name);
     return value && atoi(value) != 0;
+}
+
+static bool envFlagEnabled(const char* name) {
+    const char* value = getenv(name);
+    return value && atoi(value) != 0;
+}
+
+static void* findChildObjectByVtable(void* root,
+                                     uintptr_t expectedVtable,
+                                     int directScanBytes = 0x400,
+                                     int childScanBytes = 0x400) {
+    if (!root || expectedVtable < 0x100000000ULL)
+        return nullptr;
+
+    for (int off = 0; off < directScanBytes; off += 8) {
+        void* ptr = nullptr;
+        if (!safeRead((uint8_t*)root + off, &ptr, sizeof(ptr)))
+            continue;
+        if (!ptr || (uintptr_t)ptr < 0x100000000ULL)
+            continue;
+        void* vt = nullptr;
+        if (safeRead(ptr, &vt, sizeof(vt)) && (uintptr_t)vt == expectedVtable)
+            return ptr;
+
+        for (int subOff = 0; subOff < childScanBytes; subOff += 8) {
+            void* child = nullptr;
+            if (!safeRead((uint8_t*)ptr + subOff, &child, sizeof(child)))
+                continue;
+            if (!child || (uintptr_t)child < 0x100000000ULL)
+                continue;
+            void* childVt = nullptr;
+            if (safeRead(child, &childVt, sizeof(childVt)) &&
+                (uintptr_t)childVt == expectedVtable) {
+                return child;
+            }
+        }
+    }
+    return nullptr;
 }
 
 static bool vtableHasNearbySlot(void* obj,
@@ -344,12 +398,20 @@ static void* g_registryRouter = nullptr;     // gRegistryRouter
 static void* g_channelManager = nullptr;     // cChannelManager* (from cUIManagerHolder)
 static void* g_uiManagerHolder = nullptr;    // cUIManagerHolder* (for current selected channel)
 static void* g_channelSelectorManager = nullptr; // cChannelSelectorManager* (from UIManagerHolder scan)
+static void* g_channelSelector = nullptr;   // cChannelSelector* (from ChannelSelectorManager scan)
+static void* g_channelSelectorLite = nullptr; // cChannelSelectorLite* (from ChannelSelectorManager scan)
 static void* g_multifunctionChannelInterface = nullptr; // cMultifunctionChannelInterface* (from UIManagerHolder scan)
 static void* g_uiCopyPasteResetManager = nullptr; // cUICopyPasteResetManager* (from UIManagerHolder scan)
 static void* g_copyPasteResetSwitchInterpreter = nullptr; // cCopyPasteResetSwitchInterpreter*
 static void* g_audioSRPManager = nullptr;    // cAudioSendReceivePointManager* (from cUIManagerHolder)
 static void* g_dynRack = nullptr;            // cDynamicsRack* (from UIManagerHolder+0x40)
 static void* g_sceneClient = nullptr;       // cSceneManagerIntermediateClient* (from UIManagerHolder scan)
+static void* g_showManagerClientBase = nullptr; // cShowManagerClientBase* (from UIManagerHolder scan)
+static void* g_showManagerClient = nullptr; // cShowManagerClient* (from UIManagerHolder scan)
+static void* g_virtualMixRackShowManagerClient = nullptr; // cVirtualMixRackShowManagerClient*
+static void* g_sceneImportManagerClient = nullptr; // cSceneImportManagerClient*
+static void* g_uiChannelSelectListener = nullptr; // cUIChannelSelectListener* (from UIManagerHolder scan)
+static void* g_uiListenManager = nullptr; // cUIListenManager* (from UIManagerHolder scan)
 static void* g_libraryMgrClient = nullptr;  // cLibraryManagerClient* (from UIManagerHolder+0x98)
 static void* g_gangingManager = nullptr;    // cGangingManager* (from UIManagerHolder scan)
 static void* g_surfaceChannels = nullptr;   // cSurfaceChannels* (from UIManagerHolder scan)
@@ -729,6 +791,51 @@ static bool findAudioCoreDM() {
             }
             if (!g_sceneClient) fprintf(stderr, "[MC] SceneManagerIntermediateClient not found in UIManagerHolder\n");
 
+            uintptr_t showMgrBaseVt = (uintptr_t)RESOLVE(0x106c9e138) + 0x10;
+            uintptr_t showMgrVt = (uintptr_t)RESOLVE(0x106d0da90) + 0x10;
+            uintptr_t vmrShowMgrVt = (uintptr_t)RESOLVE(0x106cfb420) + 0x10;
+            uintptr_t sceneImportMgrVt = (uintptr_t)RESOLVE(0x106c9dd10) + 0x10;
+            uintptr_t uiChannelSelectListenerVt = (uintptr_t)RESOLVE(0x106d0f240) + 0x10;
+            uintptr_t uiListenManagerVt = (uintptr_t)RESOLVE(0x106c9eea0) + 0x10;
+            for (int off = 0; off < 0x400; off += 8) {
+                void* ptr = nullptr;
+                safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
+                if (!ptr || (uintptr_t)ptr < 0x100000000ULL) continue;
+                void* vt = nullptr;
+                safeRead(ptr, &vt, sizeof(vt));
+                uintptr_t vtp = (uintptr_t)vt;
+                if (!g_showManagerClientBase && vtp == showMgrBaseVt) {
+                    g_showManagerClientBase = ptr;
+                    fprintf(stderr, "[MC] ShowManagerClientBase at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+                if (!g_showManagerClient && vtp == showMgrVt) {
+                    g_showManagerClient = ptr;
+                    fprintf(stderr, "[MC] ShowManagerClient at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+                if (!g_virtualMixRackShowManagerClient && vtp == vmrShowMgrVt) {
+                    g_virtualMixRackShowManagerClient = ptr;
+                    fprintf(stderr, "[MC] VirtualMixRackShowManagerClient at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+                if (!g_sceneImportManagerClient && vtp == sceneImportMgrVt) {
+                    g_sceneImportManagerClient = ptr;
+                    fprintf(stderr, "[MC] SceneImportManagerClient at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+                if (!g_uiChannelSelectListener && vtp == uiChannelSelectListenerVt) {
+                    g_uiChannelSelectListener = ptr;
+                    fprintf(stderr, "[MC] UIChannelSelectListener at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+                if (!g_uiListenManager && vtp == uiListenManagerVt) {
+                    g_uiListenManager = ptr;
+                    fprintf(stderr, "[MC] UIListenManager at UIManagerHolder+0x%x = %p\n", off, ptr);
+                }
+            }
+            if (!g_showManagerClientBase) fprintf(stderr, "[MC] ShowManagerClientBase not found in UIManagerHolder\n");
+            if (!g_showManagerClient) fprintf(stderr, "[MC] ShowManagerClient not found in UIManagerHolder\n");
+            if (!g_virtualMixRackShowManagerClient) fprintf(stderr, "[MC] VirtualMixRackShowManagerClient not found in UIManagerHolder\n");
+            if (!g_sceneImportManagerClient) fprintf(stderr, "[MC] SceneImportManagerClient not found in UIManagerHolder\n");
+            if (!g_uiChannelSelectListener) fprintf(stderr, "[MC] UIChannelSelectListener not found in UIManagerHolder\n");
+            if (!g_uiListenManager) fprintf(stderr, "[MC] UIListenManager not found in UIManagerHolder\n");
+
             // cLibraryManagerClient at UIManagerHolder+0x98 (confirmed from PerformRecall disasm)
             safeRead((uint8_t*)uiHolder + 0x98, &g_libraryMgrClient, sizeof(g_libraryMgrClient));
             fprintf(stderr, "[MC] LibraryManagerClient=%p\n", g_libraryMgrClient);
@@ -812,6 +919,24 @@ static bool findAudioCoreDM() {
             }
             if (!g_channelSelectorManager)
                 fprintf(stderr, "[MC] ChannelSelectorManager not found in UIManagerHolder\n");
+            else {
+                uintptr_t selectorVt = (uintptr_t)RESOLVE(0x106c77c58) + 0x10;
+                uintptr_t selectorLiteVt = (uintptr_t)RESOLVE(0x106c7c098) + 0x10;
+                g_channelSelector = findChildObjectByVtable(g_channelSelectorManager, selectorVt);
+                g_channelSelectorLite = findChildObjectByVtable(g_channelSelectorManager, selectorLiteVt);
+                if (g_channelSelector) {
+                    fprintf(stderr, "[MC] ChannelSelector discovered from ChannelSelectorManager = %p\n",
+                            g_channelSelector);
+                }
+                if (g_channelSelectorLite) {
+                    fprintf(stderr, "[MC] ChannelSelectorLite discovered from ChannelSelectorManager = %p\n",
+                            g_channelSelectorLite);
+                }
+                if (!g_channelSelector)
+                    fprintf(stderr, "[MC] ChannelSelector not found in ChannelSelectorManager\n");
+                if (!g_channelSelectorLite)
+                    fprintf(stderr, "[MC] ChannelSelectorLite not found in ChannelSelectorManager\n");
+            }
 
             uintptr_t multiFuncGetSelected = (uintptr_t)RESOLVE(0x1001098470);
             for (int off = 0; off < 0x400; off += 8) {
@@ -919,6 +1044,128 @@ static void* getDefaultInsertReceivePoint() {
     return pt;
 }
 
+struct MCShowKey {
+    QString name;
+    int location = 3;
+    uint16_t slot = 0;
+    uint16_t reserved = 0;
+    QString aux;
+};
+
+static const char* showLocationName(int location) {
+    switch (location) {
+        case 0: return "Unknown0";
+        case 1: return "MixRack";
+        case 2: return "Surface";
+        case 3: return "EditorLocal";
+        case 4: return "USB";
+        case 5: return "Unknown5";
+        default: return "Unknown";
+    }
+}
+
+static QString normalizeShowName(const QString& text) {
+    return text.trimmed().toCaseFolded();
+}
+
+static void* getShowManagerClientForCalls() {
+    if (g_showManagerClient)
+        return g_showManagerClient;
+    if (g_showManagerClientBase)
+        return g_showManagerClientBase;
+    return nullptr;
+}
+
+static QList<MCShowKey> getShowsForLocation(int location) {
+    QList<MCShowKey> out;
+    void* client = getShowManagerClientForCalls();
+    if (!client)
+        return out;
+    typedef void (*fn_GetShows)(void* client, QList<MCShowKey>& out, int location);
+    auto getShows = (fn_GetShows)RESOLVE(0x100723bc0);
+    getShows(client, out, location);
+    return out;
+}
+
+static void dumpAvailableShows() {
+    void* client = getShowManagerClientForCalls();
+    if (!client) {
+        fprintf(stderr, "[MC] dumpAvailableShows: no show manager client!\n");
+        return;
+    }
+    fprintf(stderr, "[MC] ==== Available Shows ====\n");
+    for (int location = 0; location <= 5; location++) {
+        QList<MCShowKey> shows = getShowsForLocation(location);
+        fprintf(stderr,
+                "[MC] show location %d (%s): %d shows\n",
+                location,
+                showLocationName(location),
+                shows.size());
+        for (int i = 0; i < shows.size(); i++) {
+            const MCShowKey& key = shows[i];
+            QByteArray nameUtf8 = key.name.toUtf8();
+            QByteArray auxUtf8 = key.aux.toUtf8();
+            fprintf(stderr,
+                    "[MC][SHOW] show[%d]: name='%s' loc=%d(%s) slot=%u aux='%s'\n",
+                    i,
+                    nameUtf8.constData(),
+                    key.location,
+                    showLocationName(key.location),
+                    (unsigned)key.slot,
+                    auxUtf8.constData());
+        }
+    }
+}
+
+static bool findShowKeyByName(const QString& wantedName, MCShowKey& outKey) {
+    void* client = getShowManagerClientForCalls();
+    if (!client)
+        return false;
+
+    QString wantedNorm = normalizeShowName(wantedName);
+    for (int location = 0; location <= 5; location++) {
+        QList<MCShowKey> shows = getShowsForLocation(location);
+        for (const MCShowKey& key : shows) {
+            if (normalizeShowName(key.name) == wantedNorm ||
+                normalizeShowName(key.aux) == wantedNorm) {
+                outKey = key;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool recallShowByName(const QString& wantedName) {
+    void* client = getShowManagerClientForCalls();
+    if (!client) {
+        fprintf(stderr, "[MC] recallShowByName('%s'): no show manager client!\n",
+                wantedName.toUtf8().constData());
+        return false;
+    }
+
+    MCShowKey key;
+    if (!findShowKeyByName(wantedName, key)) {
+        fprintf(stderr, "[MC] recallShowByName('%s'): show not found\n",
+                wantedName.toUtf8().constData());
+        dumpAvailableShows();
+        return false;
+    }
+
+    typedef void (*fn_RecallShow)(void* client, MCShowKey key, bool arg1, bool arg2);
+    auto recallShow = (fn_RecallShow)RESOLVE(0x1007249e0);
+    fprintf(stderr,
+            "[MC] recallShowByName('%s'): recalling key name='%s' loc=%d(%s) slot=%u aux='%s'\n",
+            wantedName.toUtf8().constData(),
+            key.name.toUtf8().constData(),
+            key.location,
+            showLocationName(key.location),
+            (unsigned)key.slot,
+            key.aux.toUtf8().constData());
+    recallShow(client, key, false, false);
+    return true;
+}
+
 // Recall scene by number (1-based). Blocks briefly for the recall to take effect.
 static void recallScene(int sceneNum) {
     if (!g_sceneClient) {
@@ -938,6 +1185,32 @@ static void recallScene(int sceneNum) {
     fprintf(stderr, "[MC] recallScene(%d): SetGoSceneIndex(%d) + PerformGo called\n", sceneNum, idx);
 }
 
+// Ask Director to recall "current settings" via the scene manager client.
+// This is a high-level scene-side refresh path, so keep it gated/explicit.
+static void recallCurrentSettingsViaSceneClient() {
+    if (!g_sceneClient) {
+        fprintf(stderr, "[MC] recallCurrentSettingsViaSceneClient: no scene client!\n");
+        return;
+    }
+    typedef void (*fn_RecallCurrentSettings)(void* client);
+    auto recallCurrentSettings = (fn_RecallCurrentSettings)RESOLVE(0x10071e5b0);
+    recallCurrentSettings(g_sceneClient);
+    fprintf(stderr, "[MC] recallCurrentSettingsViaSceneClient: RecallCurrentSettings() called\n");
+}
+
+// Emit the client-side "current settings recalled" Qt signal without forcing
+// another backend recall. This is intended as a UI refresh experiment only.
+static void emitSceneCurrentSettingsRecalledSignal() {
+    if (!g_sceneClient) {
+        fprintf(stderr, "[MC] emitSceneCurrentSettingsRecalledSignal: no scene client!\n");
+        return;
+    }
+    typedef void (*fn_SceneCurrentSettingsRecalled)(void* client);
+    auto emitSignal = (fn_SceneCurrentSettingsRecalled)RESOLVE(0x100368070);
+    emitSignal(g_sceneClient);
+    fprintf(stderr, "[MC] emitSceneCurrentSettingsRecalledSignal: SceneCurrentSettingsRecalled() emitted\n");
+}
+
 static bool isChannelStereo(int ch);
 static void waitForStereoConfigReset();
 static bool readStereoConfig(uint8_t config[64]);
@@ -945,11 +1218,48 @@ static bool writeStereoConfig(const uint8_t config[64]);
 static bool isInsertStatusProc(int procIdx);
 
 static void waitForSceneRecall() {
+    int settleMs = 8000;
+    if (const char* env = getenv("MC_AUTOTEST_SHOW_SETTLE_MS")) {
+        int parsed = atoi(env);
+        if (parsed > 0)
+            settleMs = parsed;
+    }
+    fprintf(stderr, "[MC][AUTOTEST] waitForSceneRecall: settling for %d ms\n", settleMs);
+    int waited = 0;
+    while (waited < settleMs) {
+        QApplication::processEvents();
+        usleep(500 * 1000);
+        waited += 500;
+    }
     QApplication::processEvents();
-    usleep(1500 * 1000);
-    QApplication::processEvents();
-    usleep(1500 * 1000);
-    QApplication::processEvents();
+}
+
+static bool maybeRecallAutotestShow() {
+    const char* showEnv = getenv("MC_AUTOTEST_RECALL_SHOW");
+    if (!showEnv || !*showEnv)
+        return true;
+    QString showName = QString::fromUtf8(showEnv).trimmed();
+    if (showName.isEmpty())
+        return true;
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Recalling SHOW %1").arg(showName));
+    fprintf(stderr, "[MC][AUTOTEST] recalling SHOW '%s' before scenario\n",
+            showName.toUtf8().constData());
+    if (!recallShowByName(showName)) {
+        updateAutotestOverlay("dLive Self-Test",
+                              QString("Failed to recall SHOW %1").arg(showName));
+        fprintf(stderr, "[MC][AUTOTEST] failed to recall SHOW '%s'\n",
+                showName.toUtf8().constData());
+        return false;
+    }
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Waiting for SHOW %1 to settle").arg(showName));
+    waitForSceneRecall();
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("SHOW %1 recalled").arg(showName));
+    fprintf(stderr, "[MC][AUTOTEST] SHOW '%s' recall wait complete\n",
+            showName.toUtf8().constData());
+    return true;
 }
 
 static bool waitForStereoConfigMatch(const uint8_t want[64], int timeoutMs, const char* tag) {
@@ -1493,6 +1803,139 @@ static void* getInputChannel(int ch) {
     return ptr;
 }
 
+static bool isSelectedInputChannelMatch(const SelectedStripInfo& strip,
+                                        int selectedInput,
+                                        int targetCh) {
+    if (selectedInput == targetCh)
+        return true;
+    if (strip.valid && strip.stripType == 1 && strip.channel == targetCh)
+        return true;
+    return false;
+}
+
+static bool selectInputChannelForUI(int ch, const char* phaseTag = nullptr) {
+    if (ch < 0 || ch >= 128) {
+        fprintf(stderr, "[MC] %sselectInputChannelForUI: invalid channel %d\n",
+                phaseTag ? phaseTag : "", ch + 1);
+        return false;
+    }
+    if (!g_uiManagerHolder) {
+        fprintf(stderr, "[MC] %sselectInputChannelForUI: no UIManagerHolder\n",
+                phaseTag ? phaseTag : "");
+        return false;
+    }
+    void* inputCh = getInputChannel(ch);
+    if (!inputCh) {
+        fprintf(stderr, "[MC] %sselectInputChannelForUI: input channel %d not found\n",
+                phaseTag ? phaseTag : "", ch + 1);
+        return false;
+    }
+    typedef void (*fn_SetCurrentlySelectedChannel)(void* holder, void* channel);
+    auto setCurrentlySelectedChannel = (fn_SetCurrentlySelectedChannel)RESOLVE(0x10076c070);
+    typedef void (*fn_UIListenChangeChannel)(void* mgr, void* channel);
+    auto uiListenChangeChannel = (fn_UIListenChangeChannel)RESOLVE(0x100370060);
+    struct UIChannelStripKey {
+        uint32_t stripType = 0;
+        uint8_t channel = 0xFF;
+        uint8_t pad[3] = {0, 0, 0};
+    };
+    typedef void (*fn_SelectChannelByKey)(void* listener, UIChannelStripKey key);
+    auto selectChannelByKey = (fn_SelectChannelByKey)RESOLVE(0x10076bf50);
+    if (!setCurrentlySelectedChannel) {
+        fprintf(stderr, "[MC] %sselectInputChannelForUI: SetCurrentlySelectedChannel unavailable\n",
+                phaseTag ? phaseTag : "");
+        return false;
+    }
+    int keyStripType = 1;
+    if (const char* stripEnv = getenv("MC_AUTOTEST_SELECT_KEY_STRIP"))
+        keyStripType = atoi(stripEnv);
+    int keyChannel = ch;
+    if (const char* offsetEnv = getenv("MC_AUTOTEST_SELECT_KEY_CH_OFFSET"))
+        keyChannel += atoi(offsetEnv);
+    bool useSet = false;
+    bool useListen = false;
+    bool useListener = true;
+    if (const char* setEnv = getenv("MC_AUTOTEST_SELECT_USE_SET"))
+        useSet = (atoi(setEnv) != 0);
+    if (const char* listenEnv = getenv("MC_AUTOTEST_SELECT_USE_LISTEN"))
+        useListen = (atoi(listenEnv) != 0);
+    if (const char* listenerEnv = getenv("MC_AUTOTEST_SELECT_USE_LISTENER"))
+        useListener = (atoi(listenerEnv) != 0);
+    fprintf(stderr,
+            "[MC] %sselectInputChannelForUI: target=%d useSet=%d useListen=%d useListener=%d keyStripType=%d keyChannel=%d\n",
+            phaseTag ? phaseTag : "",
+            ch + 1, useSet ? 1 : 0, useListen ? 1 : 0, useListener ? 1 : 0,
+            keyStripType, keyChannel + 1);
+    UIChannelStripKey key;
+    key.stripType = (uint32_t)std::max(0, keyStripType);
+    key.channel = (uint8_t)std::max(0, std::min(255, keyChannel));
+
+    auto issueSelection = [&]() {
+        if (useSet) {
+            fprintf(stderr, "[MC] %sselectInputChannelForUI: calling SetCurrentlySelectedChannel\n",
+                    phaseTag ? phaseTag : "");
+            setCurrentlySelectedChannel(g_uiManagerHolder, inputCh);
+            fprintf(stderr, "[MC] %sselectInputChannelForUI: SetCurrentlySelectedChannel returned\n",
+                    phaseTag ? phaseTag : "");
+        }
+        if (useListen && g_uiListenManager && uiListenChangeChannel) {
+            fprintf(stderr, "[MC] %sselectInputChannelForUI: calling UIListenManager::ChangeChannel\n",
+                    phaseTag ? phaseTag : "");
+            uiListenChangeChannel(g_uiListenManager, inputCh);
+            fprintf(stderr, "[MC] %sselectInputChannelForUI: UIListenManager::ChangeChannel returned\n",
+                    phaseTag ? phaseTag : "");
+        }
+        if (useListener && g_uiChannelSelectListener && selectChannelByKey) {
+            fprintf(stderr,
+                    "[MC] %sselectInputChannelForUI: calling UIChannelSelectListener::SelectChannel(stripType=%u, channel=%u)\n",
+                    phaseTag ? phaseTag : "",
+                    key.stripType, (unsigned)key.channel);
+            selectChannelByKey(g_uiChannelSelectListener, key);
+            fprintf(stderr, "[MC] %sselectInputChannelForUI: UIChannelSelectListener::SelectChannel returned\n",
+                    phaseTag ? phaseTag : "");
+        }
+        rememberSelectedInputChannel(ch);
+    };
+
+    issueSelection();
+
+    SelectedStripInfo strip;
+    int selectedInput = -1;
+    bool matched = false;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        QApplication::processEvents();
+        usleep(350 * 1000);
+        QApplication::processEvents();
+        strip = getSelectedStripInfo(true);
+        selectedInput = getSelectedInputChannel(true);
+        matched = isSelectedInputChannelMatch(strip, selectedInput, ch);
+        fprintf(stderr,
+                "[MC] %sselectInputChannelForUI: poll attempt=%d stripValid=%d stripType=%u stripCh=%d selectedInput=%d matched=%d\n",
+                phaseTag ? phaseTag : "",
+                attempt,
+                strip.valid ? 1 : 0,
+                strip.valid ? strip.stripType : 0u,
+                strip.valid ? strip.channel + 1 : -1,
+                selectedInput >= 0 ? selectedInput + 1 : -1,
+                matched ? 1 : 0);
+        if (matched)
+            break;
+        if (attempt < 9)
+            issueSelection();
+    }
+
+    fprintf(stderr,
+            "[MC] %sselectInputChannelForUI: after select stripValid=%d stripType=%u stripCh=%d selectedInput=%d\n",
+            phaseTag ? phaseTag : "",
+            strip.valid ? 1 : 0,
+            strip.valid ? strip.stripType : 0u,
+            strip.valid ? strip.channel + 1 : -1,
+            selectedInput >= 0 ? selectedInput + 1 : -1);
+    fprintf(stderr, "[MC] %sselectInputChannelForUI: selected ch %d\n",
+            phaseTag ? phaseTag : "", ch + 1);
+    return true;
+}
+
 static bool isChannelStereo(int ch) {
     void* helpers = g_CPRHelpersInstance();
     if (!helpers) return false;
@@ -1755,6 +2198,52 @@ struct ActiveInputSourceData {
     bool         validPreamp;
 };
 
+static const char* preampSourceLabelText(char sourceLabel) {
+    switch (sourceLabel) {
+        case 'M': return "Main";
+        case 'A': return "ABCD A";
+        case 'B': return "ABCD B";
+        case 'C': return "ABCD C";
+        case 'D': return "ABCD D";
+        default:  return "?";
+    }
+}
+
+static void logPreampSocketClaim(const char* stage,
+                                 uint32_t socketNum,
+                                 char sourceLabel,
+                                 int srcCh,
+                                 int tgtCh,
+                                 const sAudioSource& source,
+                                 const PreampData& data,
+                                 const char* extra = nullptr) {
+    if (!stage)
+        stage = "claim";
+    if (srcCh == tgtCh) {
+        fprintf(stderr,
+                "[MC][PREAMP] %s socket %u: %s ch %d source={type=%u,num=%u} gain=%d pad=%d phantom=%d%s%s\n",
+                stage,
+                socketNum,
+                preampSourceLabelText(sourceLabel),
+                srcCh + 1,
+                source.type, source.number,
+                data.gain, data.pad, data.phantom,
+                extra ? " " : "",
+                extra ? extra : "");
+    } else {
+        fprintf(stderr,
+                "[MC][PREAMP] %s socket %u: %s ch %d -> %d source={type=%u,num=%u} gain=%d pad=%d phantom=%d%s%s\n",
+                stage,
+                socketNum,
+                preampSourceLabelText(sourceLabel),
+                srcCh + 1, tgtCh + 1,
+                source.type, source.number,
+                data.gain, data.pad, data.phantom,
+                extra ? " " : "",
+                extra ? extra : "");
+    }
+}
+
 static PreampData normalizedPreampDataForSource(const sAudioSource& source, PreampData pd);
 static bool samePreampData(const PreampData& a, const PreampData& b) {
     return a.gain == b.gain && a.pad == b.pad && a.phantom == b.phantom;
@@ -1951,6 +2440,18 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
         fprintf(stderr, "[MC]     Preamp write socket %d: pad applied\n", socketNum);
         midiSetPhantom(ai, pd.phantom != 0);
         fprintf(stderr, "[MC]     Preamp write socket %d: phantom applied\n", socketNum);
+    }
+
+    PreampData finalReadback = {};
+    if (readPreampDataForSocket(socketNum, finalReadback)) {
+        fprintf(stderr,
+                "[MC][PREAMP] write socket %d readback: gain=%d pad=%d phantom=%d\n",
+                socketNum,
+                finalReadback.gain, finalReadback.pad, finalReadback.phantom);
+    } else {
+        fprintf(stderr,
+                "[MC][PREAMP] write socket %d readback failed\n",
+                socketNum);
     }
 
     return true;
@@ -4480,6 +4981,46 @@ static bool compareSnapshotsForCopyPaste(const ChannelSnapshot& expected,
     return ok;
 }
 
+static void logFinalPreampStateForChannel(int ch, const char* phaseTag = "final-verify") {
+    PatchData livePatch = {};
+    if (!readPatchData(ch, livePatch))
+        return;
+
+    int socketNum = -1;
+    if (!patchDataUsesSocketBackedPreamp(livePatch) ||
+        !getAnalogueSocketIndexForAudioSource(livePatch.source, socketNum)) {
+        fprintf(stderr,
+                "[MC][PREAMP] %s ch %d: no socket-backed preamp source (srcType=%u src={type=%u,num=%u})\n",
+                phaseTag,
+                ch + 1,
+                livePatch.sourceType,
+                livePatch.source.type,
+                livePatch.source.number);
+        return;
+    }
+
+    PreampData pd = {};
+    if (!readPreampDataForPatch(livePatch, pd)) {
+        fprintf(stderr,
+                "[MC][PREAMP] %s ch %d: source={type=%u,num=%u} socket=%d readback failed\n",
+                phaseTag,
+                ch + 1,
+                livePatch.source.type,
+                livePatch.source.number,
+                socketNum);
+        return;
+    }
+
+    fprintf(stderr,
+            "[MC][PREAMP] %s ch %d: source={type=%u,num=%u} socket=%d gain=%d pad=%d phantom=%d\n",
+            phaseTag,
+            ch + 1,
+            livePatch.source.type,
+            livePatch.source.number,
+            socketNum,
+            pd.gain, pd.pad, pd.phantom);
+}
+
 static bool compareGangSnapshotsForMove(const GangSnapshot& expected,
                                         const GangSnapshot& actual,
                                         const MovePlan& plan) {
@@ -4649,6 +5190,7 @@ static bool runAutomatedCopyPasteTest() {
     const char* dstEnv = getenv("MC_AUTOTEST_COPY_DST");
     if (!srcEnv || !dstEnv)
         return false;
+    updateAutotestOverlay("dLive Self-Test", "Running copy/paste scenario...");
 
     int src = atoi(srcEnv) - 1;
     int dst = atoi(dstEnv) - 1;
@@ -4703,6 +5245,13 @@ static bool runAutomatedCopyPasteTest() {
     usleep(200 * 1000);
     QApplication::processEvents();
 
+    if (const char* selectEnv = getenv("MC_AUTOTEST_SELECT_CH")) {
+        int selectCh = atoi(selectEnv) - 1;
+        selectInputChannelForUI(selectCh, "[MC][COPYTEST] ");
+    } else {
+        selectInputChannelForUI(dstStart, "[MC][COPYTEST] ");
+    }
+
     bool ok = true;
     for (int i = 0; i < blockSize; i++) {
         ChannelSnapshot actual = {};
@@ -4718,7 +5267,47 @@ static bool runAutomatedCopyPasteTest() {
     for (int i = 0; i < blockSize; i++)
         destroySnapshot(expected[i]);
 
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Copy/paste result: %1").arg(ok ? "PASS" : "FAIL"));
     fprintf(stderr, "[MC][COPYTEST] RESULT: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool runAutomatedSelectTest() {
+    const char* selectEnv = getenv("MC_AUTOTEST_SELECT_CH");
+    if (!selectEnv) {
+        fprintf(stderr, "[MC][SELECTTEST] missing MC_AUTOTEST_SELECT_CH\n");
+        return false;
+    }
+    int selectCh = atoi(selectEnv) - 1;
+    if (selectCh < 0 || selectCh >= 128) {
+        fprintf(stderr, "[MC][SELECTTEST] invalid channel env '%s'\n", selectEnv);
+        return false;
+    }
+
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Selecting channel %1").arg(selectCh + 1));
+    fprintf(stderr, "[MC][SELECTTEST] selecting channel %d\n", selectCh + 1);
+    bool ok = selectInputChannelForUI(selectCh, "[MC][SELECTTEST] ");
+    QApplication::processEvents();
+    usleep(700 * 1000);
+    QApplication::processEvents();
+
+    SelectedStripInfo strip = getSelectedStripInfo(true);
+    int selectedInput = getSelectedInputChannel(true);
+    fprintf(stderr,
+            "[MC][SELECTTEST] final selection: stripValid=%d stripType=%u stripCh=%d selectedInput=%d\n",
+            strip.valid ? 1 : 0,
+            strip.valid ? strip.stripType : 0u,
+            strip.valid ? strip.channel + 1 : -1,
+            selectedInput >= 0 ? selectedInput + 1 : -1);
+
+    if (!isSelectedInputChannelMatch(strip, selectedInput, selectCh))
+        ok = false;
+
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Selection result: %1").arg(ok ? "PASS" : "FAIL"));
+    fprintf(stderr, "[MC][SELECTTEST] RESULT: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -4726,6 +5315,8 @@ static bool runAutomatedMoveTest() {
     const char* srcEnv = getenv("MC_AUTOTEST_SRC");
     const char* dstEnv = getenv("MC_AUTOTEST_DST");
     if (!srcEnv || !dstEnv) return false;
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Preparing move %1 -> %2").arg(srcEnv).arg(dstEnv));
 
     int src = atoi(srcEnv) - 1;  // user-facing 1-based
     int dst = atoi(dstEnv) - 1;
@@ -4866,6 +5457,30 @@ static bool runAutomatedMoveTest() {
                              requestedBlockSize);
     bool ok = moved;
     if (moved) {
+        if (const char* selectEnv = getenv("MC_AUTOTEST_SELECT_CH")) {
+            int selectCh = atoi(selectEnv) - 1;
+            selectInputChannelForUI(selectCh, "[MC][AUTOTEST] ");
+        } else {
+            selectInputChannelForUI(plan.dstStart, "[MC][AUTOTEST] ");
+        }
+        fprintf(stderr,
+                "[MC][AUTOTEST] MC_AUTOTEST_DUMP_PREAMP_UI=%s\n",
+                getenv("MC_AUTOTEST_DUMP_PREAMP_UI") ? getenv("MC_AUTOTEST_DUMP_PREAMP_UI") : "(null)");
+        if (autotestEnvEnabled("MC_AUTOTEST_DUMP_PREAMP_UI")) {
+            dumpPreampUiRegions("[MC][AUTOTEST] ");
+            QTimer::singleShot(1500, qApp, []() {
+                dumpPreampUiRegions("[MC][AUTOTEST] (delayed) ");
+            });
+        }
+        if (autotestEnvEnabled("MC_AUTOTEST_WEST_REFRESH_EXPERIMENT")) {
+            runWestProcessingRefreshExperiment("[MC][AUTOTEST] ");
+            QTimer::singleShot(250, qApp, []() {
+                runWestProcessingRefreshExperiment("[MC][AUTOTEST] (delayed 250ms) ");
+            });
+            QTimer::singleShot(1000, qApp, []() {
+                runWestProcessingRefreshExperiment("[MC][AUTOTEST] (delayed 1000ms) ");
+            });
+        }
         if (!skipChannelVerify) {
             for (auto& [tgtCh, snapIdx] : plan.targetMap) {
                 ChannelSnapshot live;
@@ -4899,6 +5514,8 @@ static bool runAutomatedMoveTest() {
 
     for (auto& snap : expected) destroySnapshot(snap);
 
+    updateAutotestOverlay("dLive Self-Test",
+                          QString("Move result: %1").arg(ok ? "PASS" : "FAIL"));
     fprintf(stderr, "[MC][AUTOTEST] RESULT: %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -5368,6 +5985,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     auto phase = [&](const char* label) {
         fprintf(stderr, "[MC][%6llums] %s\n",
                 (unsigned long long)(monotonicMs() - moveStartMs), label);
+        updateAutotestOverlay("dLive Self-Test", QString::fromUtf8(label));
         if (g_moveProgressCallback)
             g_moveProgressCallback(label);
     };
@@ -5497,6 +6115,12 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                 if (patchDataUsesSocketBackedPreamp(livePatch) &&
                     getAnalogueSocketIndexForAudioSource(livePatch.source, socketNum)) {
                     plannedWrites.push_back({(uint32_t)socketNum, ch, ch, 'M', livePreamp});
+                    logPreampSocketClaim("untouched claim",
+                                         (uint32_t)socketNum,
+                                         'M',
+                                         ch, ch,
+                                         livePatch.source,
+                                         livePreamp);
                 }
             }
 
@@ -5532,6 +6156,12 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     continue;
                 plannedWrites.push_back({(uint32_t)socketNum, ch, ch,
                                          (char)('A' + activeInputSource - 1), liveAidPreamp});
+                logPreampSocketClaim("untouched claim",
+                                     (uint32_t)socketNum,
+                                     (char)('A' + activeInputSource - 1),
+                                     ch, ch,
+                                     source,
+                                     liveAidPreamp);
             }
         };
 
@@ -5555,6 +6185,12 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             if (!patchDataUsesSocketBackedPreamp(tgtPatch) ||
                 !getAnalogueSocketIndexForAudioSource(tgtPatch.source, socketNum))
                 continue;
+            logPreampSocketClaim("planned moved",
+                                 (uint32_t)socketNum,
+                                 'M',
+                                 srcCh, tgtCh,
+                                 tgtPatch.source,
+                                 snaps[si].preampData);
             if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh,
                                    'M', tgtPatch.source, snaps[si].preampData)) {
                 restoreAffectedGangs("Phase: restore input ganging after abort", false);
@@ -5578,6 +6214,12 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     continue;
                 int socketNum = -1;
                 if (!getAnalogueSocketIndexForAudioSource(tgtSource, socketNum)) continue;
+                logPreampSocketClaim("planned moved",
+                                     (uint32_t)socketNum,
+                                     (char)('A' + activeInputSource - 1),
+                                     srcCh, tgtCh,
+                                     tgtSource,
+                                     aid.preampData);
                 if (!checkPlannedWrite((uint32_t)socketNum, srcCh, tgtCh,
                                        (char)('A' + activeInputSource - 1),
                                        tgtSource, aid.preampData)) {
@@ -5832,6 +6474,10 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     phase("Phase: rewrite patching");
     fprintf(stderr, "[MC] Writing patching (%s; MixRack I/O Port: %s)...\n",
             patchPolicy, ioPortPolicy);
+        bool disablePatchMetadataSync = envFlagEnabled("MC_DISABLE_PATCH_METADATA_SYNC");
+        fprintf(stderr,
+                "[MC]   Patch metadata sync after SetInputChannelSource: %s\n",
+                disablePatchMetadataSync ? "DISABLED by MC_DISABLE_PATCH_METADATA_SYNC" : "enabled");
         // Use CSV import path: cChannel::SetInputChannelSource via task system
         // This is what Import CSV uses — full update + UI refresh
         typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
@@ -5921,17 +6567,37 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             setInputSource(ch, 1, sendPtA, sendPtB);
             // Keep channel-mapper metadata aligned with the applied send points so
             // Director and the reorder panel show the correct source family.
-            if (!writePatchData(tgtCh, tgtPatch)) {
+            if (disablePatchMetadataSync) {
                 fprintf(stderr,
-                        "[MC]   WARN: metadata patch sync failed on ch %d after SetInputChannelSource\n",
+                        "[MC]   Metadata patch sync skipped on ch %d after SetInputChannelSource\n",
                         tgtCh + 1);
-            }
-            if (tgtStereo && haveMatePatch) {
-                int pairMateCh = tgtCh + 1;
-                if (!writePatchData(pairMateCh, matePatch)) {
+                if (tgtStereo && haveMatePatch) {
+                    int pairMateCh = tgtCh + 1;
                     fprintf(stderr,
-                            "[MC]   WARN: metadata patch sync failed on stereo mate ch %d after SetInputChannelSource\n",
+                            "[MC]   Metadata patch sync skipped on stereo mate ch %d after SetInputChannelSource\n",
                             pairMateCh + 1);
+                }
+            } else {
+                if (!writePatchData(tgtCh, tgtPatch)) {
+                    fprintf(stderr,
+                            "[MC]   WARN: metadata patch sync failed on ch %d after SetInputChannelSource\n",
+                            tgtCh + 1);
+                } else {
+                    fprintf(stderr,
+                            "[MC]   Metadata patch sync applied on ch %d after SetInputChannelSource\n",
+                            tgtCh + 1);
+                }
+                if (tgtStereo && haveMatePatch) {
+                    int pairMateCh = tgtCh + 1;
+                    if (!writePatchData(pairMateCh, matePatch)) {
+                        fprintf(stderr,
+                                "[MC]   WARN: metadata patch sync failed on stereo mate ch %d after SetInputChannelSource\n",
+                                pairMateCh + 1);
+                    } else {
+                        fprintf(stderr,
+                                "[MC]   Metadata patch sync applied on stereo mate ch %d after SetInputChannelSource\n",
+                                pairMateCh + 1);
+                    }
                 }
             }
             fprintf(stderr, "[MC]   Patch applied on ch %d\n", tgtCh + 1);
@@ -5959,17 +6625,31 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         if (!patchDataUsesSocketBackedPreamp(tgtPatch) ||
             !getAnalogueSocketIndexForAudioSource(tgtPatch.source, socketNum))
             continue;
+        logPreampSocketClaim("restore main",
+                             (uint32_t)socketNum,
+                             'M',
+                             srcCh, tgtCh,
+                             tgtPatch.source,
+                             snaps[si].preampData);
         if (writePreampDataForPatch(tgtPatch, snaps[si].preampData)) {
             fprintf(stderr,
                     "[MC]   Restore preamp for ch %d on socket %u: gain=%d pad=%d phantom=%d\n",
                     tgtCh + 1, (unsigned)socketNum,
                     snaps[si].preampData.gain, snaps[si].preampData.pad, snaps[si].preampData.phantom);
+            PreampData readback = {};
+            if (readPreampDataForPatch(tgtPatch, readback)) {
+                fprintf(stderr,
+                        "[MC][PREAMP] restore main readback ch %d socket %u: gain=%d pad=%d phantom=%d\n",
+                        tgtCh + 1, (unsigned)socketNum,
+                        readback.gain, readback.pad, readback.phantom);
+            }
         } else {
             fprintf(stderr,
                     "[MC]   WARN: preamp restore failed for ch %d on socket %u\n",
                     tgtCh + 1, (unsigned)socketNum);
         }
     }
+    refreshVisiblePreampUI("[MC] post-main-preamp: ");
 
     phase("Phase: restore ABCD source setup");
     typedef void (*fn_SetActiveInputChannel)(void* channel, uint8_t activeInputSource);
@@ -6099,6 +6779,12 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             PreampData tgtPreamp = aid.preampData;
             int socketNum = -1;
             if (!getAnalogueSocketIndexForAudioSource(tgtSource, socketNum)) continue;
+            logPreampSocketClaim("restore abcd",
+                                 (uint32_t)socketNum,
+                                 (char)('A' + activeInputSource - 1),
+                                 srcCh, tgtCh,
+                                 tgtSource,
+                                 tgtPreamp);
             fprintf(stderr,
                     "[MC]   ABCD-%c preamp begin ch %d: source={type=%u,num=%u} socket=%u\n",
                     'A' + activeInputSource - 1, tgtCh + 1,
@@ -6108,13 +6794,21 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                         "[MC]   Restore ABCD-%c preamp for ch %d on socket %u: gain=%d pad=%d phantom=%d\n",
                         'A' + activeInputSource - 1, tgtCh + 1, (unsigned)socketNum,
                         tgtPreamp.gain, tgtPreamp.pad, tgtPreamp.phantom);
+                PreampData readback = {};
+                if (readPreampDataForAudioSource(tgtSource, readback)) {
+                    fprintf(stderr,
+                            "[MC][PREAMP] restore abcd readback ch %d socket %u: gain=%d pad=%d phantom=%d\n",
+                            tgtCh + 1, (unsigned)socketNum,
+                            readback.gain, readback.pad, readback.phantom);
+                }
             } else {
                 fprintf(stderr,
-                        "[MC]   WARN: ABCD-%c preamp restore failed for ch %d on socket %u\n",
+                    "[MC]   WARN: ABCD-%c preamp restore failed for ch %d on socket %u\n",
                         'A' + activeInputSource - 1, tgtCh + 1, (unsigned)socketNum);
             }
         }
     }
+    refreshVisiblePreampUI("[MC] post-abcd-preamp: ");
 
     phase("Phase: restore ABCD selection");
     for (auto& [tgtCh, si] : plan.targetMap) {
@@ -6605,6 +7299,36 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         float trimDb = (trimVal - 3) / 256.0f;
 
         fprintf(stderr, "[MC] Pos %d: '%s' trim=%.1f dB (%d)\n", i+1, name ? name : "", trimDb, trimVal);
+        logFinalPreampStateForChannel(i);
+    }
+    refreshVisiblePreampUI("[MC] final-preamp: ");
+
+    if (autotestEnvEnabled("MC_EXPERIMENT_RECALL_CURRENT_SETTINGS")) {
+        phase("Phase: scene refresh experiment");
+        fprintf(stderr,
+                "[MC] scene refresh experiment: invoking RecallCurrentSettings via scene client\n");
+        recallCurrentSettingsViaSceneClient();
+        waitForSceneRecall();
+        fprintf(stderr, "[MC] === Verify after scene refresh experiment ===\n");
+        for (int i = lo; i <= hi; i++) {
+            logFinalPreampStateForChannel(i);
+        }
+        refreshVisiblePreampUI("[MC] post-scene-refresh: ");
+    }
+
+    if (autotestEnvEnabled("MC_EXPERIMENT_SCENE_UI_SIGNAL")) {
+        phase("Phase: scene UI signal experiment");
+        fprintf(stderr,
+                "[MC] scene UI signal experiment: emitting SceneCurrentSettingsRecalled on scene client\n");
+        emitSceneCurrentSettingsRecalledSignal();
+        QApplication::processEvents();
+        usleep(500 * 1000);
+        QApplication::processEvents();
+        fprintf(stderr, "[MC] === Verify after scene UI signal experiment ===\n");
+        for (int i = lo; i <= hi; i++) {
+            logFinalPreampStateForChannel(i);
+        }
+        refreshVisiblePreampUI("[MC] post-scene-ui-signal: ");
     }
 
     phase("Phase: move complete");
@@ -6650,6 +7374,151 @@ static QDialog* g_reorderDialog = nullptr;
 static id g_moveShortcutMonitor = nil;
 static QPushButton* g_toolbarReorderButton = nullptr;
 static QTimer* g_toolbarButtonRefreshTimer = nullptr;
+static QTimer* g_autotestOverlayStatusTimer = nullptr;
+static QPointer<QFrame> g_autotestOverlayFrame = nullptr;
+static QPointer<QLabel> g_autotestOverlayTitle = nullptr;
+static QPointer<QLabel> g_autotestOverlayDetail = nullptr;
+static QString g_autotestOverlayStatusPath;
+static QString g_lastAutotestOverlayStatusText;
+
+static bool shouldShowAutotestOverlay() {
+    return getenv("MC_AUTOTEST_SELECT_ONLY") ||
+           (getenv("MC_AUTOTEST_SRC") && getenv("MC_AUTOTEST_DST")) ||
+           (getenv("MC_AUTOTEST_COPY_SRC") && getenv("MC_AUTOTEST_COPY_DST"));
+}
+
+static QWidget* getLargestVisibleAutotestWindow() {
+    QWidget* best = nullptr;
+    int bestArea = -1;
+    const auto topLevels = QApplication::topLevelWidgets();
+    for (QWidget* widget : topLevels) {
+        if (!widget || !widget->isVisible())
+            continue;
+        if (qobject_cast<QDialog*>(widget))
+            continue;
+        if (widget->width() < 400 || widget->height() < 250)
+            continue;
+        int area = widget->width() * widget->height();
+        if (widget->findChild<QObject*>("mainQmlWidget", Qt::FindChildrenRecursively))
+            area += 100000000;
+        if (area > bestArea) {
+            best = widget;
+            bestArea = area;
+        }
+    }
+    return best;
+}
+
+static QWidget* getAutotestOverlayHost() {
+    QWidget* host = QApplication::activeWindow();
+    if (host && host->isVisible() && !qobject_cast<QDialog*>(host))
+        return host;
+    return getLargestVisibleAutotestWindow();
+}
+
+static void ensureAutotestOverlay(QWidget* host) {
+    if (!host)
+        return;
+    if (!g_autotestOverlayFrame || g_autotestOverlayFrame->parentWidget() != host) {
+        if (g_autotestOverlayFrame)
+            g_autotestOverlayFrame->deleteLater();
+        auto* frame = new QFrame(host);
+        frame->setObjectName("mcAutotestOverlay");
+        frame->setAttribute(Qt::WA_ShowWithoutActivating, true);
+        frame->setFrameShape(QFrame::StyledPanel);
+        frame->setStyleSheet(
+            "#mcAutotestOverlay {"
+            "background: rgba(12, 16, 22, 220);"
+            "border: 2px solid rgba(0, 196, 255, 180);"
+            "border-radius: 10px;"
+            "}"
+        );
+        auto* layout = new QVBoxLayout(frame);
+        layout->setContentsMargins(12, 10, 12, 10);
+        layout->setSpacing(4);
+        auto* title = new QLabel(frame);
+        title->setStyleSheet("color: white; font-size: 16px; font-weight: 700;");
+        auto* detail = new QLabel(frame);
+        detail->setStyleSheet("color: rgba(255,255,255,210); font-size: 12px;");
+        detail->setWordWrap(true);
+        layout->addWidget(title);
+        layout->addWidget(detail);
+        g_autotestOverlayFrame = frame;
+        g_autotestOverlayTitle = title;
+        g_autotestOverlayDetail = detail;
+    }
+}
+
+static void positionAutotestOverlay() {
+    if (!g_autotestOverlayFrame)
+        return;
+    QWidget* host = g_autotestOverlayFrame->parentWidget();
+    if (!host)
+        return;
+    const int overlayWidth = std::min(420, std::max(300, host->width() / 3));
+    g_autotestOverlayFrame->resize(overlayWidth, g_autotestOverlayFrame->sizeHint().height());
+    const int x = std::max(12, host->width() - g_autotestOverlayFrame->width() - 18);
+    const int y = std::max(56, host->height() - g_autotestOverlayFrame->height() - 18);
+    g_autotestOverlayFrame->move(x, y);
+}
+
+static void updateAutotestOverlay(const QString& title, const QString& detail) {
+    if (!shouldShowAutotestOverlay())
+        return;
+    QWidget* host = getAutotestOverlayHost();
+    if (!host) {
+        fprintf(stderr, "[MC][AUTOTEST] overlay host unavailable for title='%s'\n",
+                title.toUtf8().constData());
+        return;
+    }
+    ensureAutotestOverlay(host);
+    if (!g_autotestOverlayFrame)
+        return;
+    g_autotestOverlayTitle->setText(title);
+    g_autotestOverlayDetail->setText(detail);
+    g_autotestOverlayDetail->setVisible(!detail.isEmpty());
+    g_autotestOverlayFrame->adjustSize();
+    positionAutotestOverlay();
+    g_autotestOverlayFrame->show();
+    g_autotestOverlayFrame->raise();
+    fprintf(stderr,
+            "[MC][AUTOTEST] overlay shown on host='%s' size=%dx%d title='%s' detail='%s'\n",
+            host->objectName().toUtf8().constData(),
+            host->width(),
+            host->height(),
+            title.toUtf8().constData(),
+            detail.toUtf8().constData());
+    QApplication::processEvents();
+}
+
+static void hideAutotestOverlay() {
+    if (g_autotestOverlayFrame)
+        g_autotestOverlayFrame->hide();
+}
+
+static void pollAutotestOverlayStatusFile() {
+    if (g_autotestOverlayStatusPath.isEmpty())
+        return;
+    QFile file(g_autotestOverlayStatusPath);
+    if (!file.exists())
+        return;
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return;
+    QString text = QString::fromUtf8(file.readAll());
+    file.close();
+    if (text == g_lastAutotestOverlayStatusText)
+        return;
+    g_lastAutotestOverlayStatusText = text;
+    QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) {
+        hideAutotestOverlay();
+        return;
+    }
+    QStringList lines = trimmed.split('\n');
+    QString title = lines.isEmpty() ? QString("dLive Self-Test") : lines.takeFirst().trimmed();
+    QString detail = lines.join("\n").trimmed();
+    updateAutotestOverlay(title.isEmpty() ? QString("dLive Self-Test") : title, detail);
+}
 
 struct MoveConflictInfo {
     bool active = false;
@@ -6978,6 +7847,213 @@ static QString trimAudioSourceBankSuffix(QString desc) {
     }
 
     return desc.trimmed();
+}
+
+static bool classNameContains(QObject* obj, const char* needle) {
+    if (!obj || !needle || !*needle)
+        return false;
+    const QMetaObject* mo = obj->metaObject();
+    if (!mo || !mo->className())
+        return false;
+    return QString::fromLatin1(mo->className()).contains(QString::fromLatin1(needle),
+                                                         Qt::CaseInsensitive);
+}
+
+static bool objectLooksLikePreampUI(QObject* obj) {
+    if (!obj)
+        return false;
+    if (classNameContains(obj, "Preamp"))
+        return true;
+    const QString name = obj->objectName();
+    if (name.contains("Preamp", Qt::CaseInsensitive))
+        return true;
+    return false;
+}
+
+static QList<QWidget*> candidatePreampRefreshWindows() {
+    QList<QWidget*> windows;
+    auto addWindow = [&](QWidget* w) {
+        if (!w || !w->isVisible())
+            return;
+        if (!windows.contains(w))
+            windows.push_back(w);
+    };
+
+    addWindow(QApplication::activeWindow());
+    if (QWidget* focus = QApplication::focusWidget())
+        addWindow(focus->window());
+
+    const QList<QWidget*> topLevels = QApplication::topLevelWidgets();
+    for (QWidget* top : topLevels)
+        addWindow(top);
+    return windows;
+}
+
+static QList<QObject*> collectPreampRefreshTargets() {
+    QList<QObject*> targets;
+    auto addTarget = [&](QObject* obj) {
+        if (!obj || targets.contains(obj))
+            return;
+        targets.push_back(obj);
+    };
+
+    auto maybeAdd = [&](QObject* obj) {
+        if (!obj)
+            return;
+        if (classNameContains(obj, "InputChannelPreampForm") ||
+            classNameContains(obj, "PreampOverviewForm") ||
+            classNameContains(obj, "InputSourceAssignPanel")) {
+            addTarget(obj);
+        }
+    };
+
+    if (qApp) {
+        maybeAdd(qApp);
+        const QList<QObject*> appObjects = qApp->findChildren<QObject*>();
+        for (QObject* obj : appObjects)
+            maybeAdd(obj);
+    }
+
+    const QList<QWidget*> allWidgets = QApplication::allWidgets();
+    for (QWidget* widget : allWidgets) {
+        maybeAdd(widget);
+        const QList<QObject*> children = widget->findChildren<QObject*>();
+        for (QObject* obj : children)
+            maybeAdd(obj);
+    }
+
+    return targets;
+}
+
+static void refreshVisiblePreampUIOnTargets(const QList<QObject*>& targets,
+                                            const char* phaseTag) {
+    if (!qApp)
+        return;
+
+    typedef void (*fn_PreampFormChangeChannel)(void*, void*);
+    typedef void (*fn_PreampFormReceivePointUpdated)(void*, void*);
+    typedef void (*fn_PreampFormInputChannelStartReceivePointUpdated)(void*, int, void*);
+    typedef void (*fn_PreampFormUpdateToReceivePoint)(void*);
+    typedef void (*fn_PreampFormUpdatePreampPanel)(void*);
+    typedef void (*fn_SourceAssignPanelChangeChannel)(void*, void*);
+    typedef void (*fn_SourceAssignPanelUpdateToReceivePoint)(void*);
+    typedef void (*fn_PreampOverviewReceivePointUpdated)(void*, void*);
+    typedef void (*fn_PreampOverviewUpdatePreamp)(void*);
+
+    auto preampChangeChannel =
+        (fn_PreampFormChangeChannel)RESOLVE(0x100a0c080);
+    auto preampReceivePointUpdated =
+        (fn_PreampFormReceivePointUpdated)RESOLVE(0x100a0f1e0);
+    auto preampInputChannelStartReceivePointUpdated =
+        (fn_PreampFormInputChannelStartReceivePointUpdated)RESOLVE(0x100a0d460);
+    auto preampUpdateToReceivePoint =
+        (fn_PreampFormUpdateToReceivePoint)RESOLVE(0x100a0fde0);
+    auto preampUpdatePreampPanel =
+        (fn_PreampFormUpdatePreampPanel)RESOLVE(0x100a10440);
+    auto sourceAssignChangeChannel =
+        (fn_SourceAssignPanelChangeChannel)RESOLVE(0x100a167a0);
+    auto sourceAssignUpdateToReceivePoint =
+        (fn_SourceAssignPanelUpdateToReceivePoint)RESOLVE(0x100a175a0);
+    auto preampOverviewReceivePointUpdated =
+        (fn_PreampOverviewReceivePointUpdated)RESOLVE(0x100a79170);
+    auto preampOverviewUpdatePreamp =
+        (fn_PreampOverviewUpdatePreamp)RESOLVE(0x100a79300);
+
+    int selectedInputCh = getSelectedInputChannel(false);
+    void* selectedChannelObj =
+        (selectedInputCh >= 0) ? getInputChannel(selectedInputCh) : nullptr;
+    int preampForms = 0;
+    int sourceAssignPanels = 0;
+    int overviewForms = 0;
+    int actions = 0;
+    for (QObject* obj : targets) {
+        if (!obj)
+            continue;
+
+        if (classNameContains(obj, "InputChannelPreampForm")) {
+            preampForms++;
+            void* raw = obj;
+            if (selectedChannelObj && preampChangeChannel) {
+                preampChangeChannel(raw, selectedChannelObj);
+                actions++;
+            }
+            if (selectedChannelObj && preampReceivePointUpdated) {
+                preampReceivePointUpdated(raw, selectedChannelObj);
+                actions++;
+            }
+            if (selectedChannelObj && preampInputChannelStartReceivePointUpdated) {
+                for (int activeInput = 1; activeInput <= 4; ++activeInput) {
+                    preampInputChannelStartReceivePointUpdated(raw, activeInput,
+                                                               selectedChannelObj);
+                    actions++;
+                }
+            }
+            if (preampUpdateToReceivePoint) {
+                preampUpdateToReceivePoint(raw);
+                actions++;
+            }
+            if (preampUpdatePreampPanel) {
+                preampUpdatePreampPanel(raw);
+                actions++;
+            }
+            continue;
+        }
+
+        if (classNameContains(obj, "InputSourceAssignPanel")) {
+            sourceAssignPanels++;
+            void* raw = obj;
+            if (selectedChannelObj && sourceAssignChangeChannel) {
+                sourceAssignChangeChannel(raw, selectedChannelObj);
+                actions++;
+            }
+            if (sourceAssignUpdateToReceivePoint) {
+                sourceAssignUpdateToReceivePoint(raw);
+                actions++;
+            }
+            continue;
+        }
+
+        if (classNameContains(obj, "PreampOverviewForm")) {
+            overviewForms++;
+            void* raw = obj;
+            if (selectedChannelObj && preampOverviewReceivePointUpdated) {
+                preampOverviewReceivePointUpdated(raw, selectedChannelObj);
+                actions++;
+            }
+            if (preampOverviewUpdatePreamp) {
+                preampOverviewUpdatePreamp(raw);
+                actions++;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[MC] %srefresh preamp via forms: selectedCh=%d channelObj=%p candidates=%d preampForms=%d sourcePanels=%d overviewForms=%d actions=%d\n",
+            phaseTag ? phaseTag : "",
+            selectedInputCh >= 0 ? selectedInputCh + 1 : -1,
+            selectedChannelObj,
+            targets.size(), preampForms, sourceAssignPanels, overviewForms,
+            actions);
+    QApplication::processEvents();
+}
+
+static void refreshVisiblePreampUI(const char* phaseTag) {
+    QList<QObject*> targets = collectPreampRefreshTargets();
+    refreshVisiblePreampUIOnTargets(targets, phaseTag);
+
+    const QString delayedTag = QString::fromUtf8(phaseTag ? phaseTag : "");
+    const int delaysMs[] = {250, 1000, 2500};
+    for (int delayMs : delaysMs) {
+        QTimer::singleShot(delayMs, qApp, [delayedTag, delayMs]() {
+            QList<QObject*> delayedTargets = collectPreampRefreshTargets();
+            QByteArray tagUtf8 =
+                QString("%1(delayed %2ms) ")
+                    .arg(delayedTag)
+                    .arg(delayMs)
+                    .toUtf8();
+            refreshVisiblePreampUIOnTargets(delayedTargets, tagUtf8.constData());
+        });
+    }
 }
 
 static bool isMeaningfulAudioSourceDesc(const QString& desc) {
@@ -8095,6 +9171,201 @@ static void dumpTopNavQuickTree() {
     dumpQuickObjectTreeRecursive(quickObj, 0, 7);
 }
 
+static void dumpRegionWidgetsRecursive(QWidget* widget,
+                                       QWidget* host,
+                                       const QRect& region,
+                                       int depth,
+                                       int maxDepth) {
+    if (!widget || !host || depth > maxDepth || !widget->isVisible())
+        return;
+    QRect rect = widgetRectInAncestor(widget, host);
+    if (!rect.isValid() || !rect.intersects(region))
+        return;
+
+    QString indent(depth * 2, ' ');
+    QString text = normalizedToolbarText(widgetTextProperty(widget));
+    QString valueText;
+    if (widget->metaObject() &&
+        QString::fromLatin1(widget->metaObject()->className()).contains("ValueWidget",
+                                                                        Qt::CaseInsensitive)) {
+        typedef QString (*fn_ValueWidgetBaseGetText)(const void*);
+        static auto valueWidgetGetText =
+            (fn_ValueWidgetBaseGetText)RESOLVE(0x1001875e0);
+        if (valueWidgetGetText) {
+            valueText = normalizedToolbarText(valueWidgetGetText(widget));
+        }
+    }
+    fprintf(stderr,
+            "[MC][UIDUMP] %sWIDGET %s name='%s' rect=(%d,%d %dx%d) text='%s' valueText='%s' enabled=%d visible=%d\n",
+            indent.toUtf8().constData(),
+            widget->metaObject() ? widget->metaObject()->className() : "(no-meta)",
+            widget->objectName().toUtf8().constData(),
+            rect.x(), rect.y(), rect.width(), rect.height(),
+            text.toUtf8().constData(),
+            valueText.toUtf8().constData(),
+            widget->isEnabled() ? 1 : 0,
+            widget->isVisible() ? 1 : 0);
+
+    const QObjectList children = widget->children();
+    for (QObject* child : children) {
+        QWidget* childWidget = qobject_cast<QWidget*>(child);
+        if (!childWidget)
+            continue;
+        dumpRegionWidgetsRecursive(childWidget, host, region, depth + 1, maxDepth);
+    }
+}
+
+static void dumpQuickObjectsInRegionRecursive(QObject* obj,
+                                              QWidget* quickWidget,
+                                              QWidget* host,
+                                              const QRect& region,
+                                              int depth,
+                                              int maxDepth) {
+    if (!obj || !quickWidget || !host || depth > maxDepth)
+        return;
+    QRect rect = qmlObjectRectInHost(obj, quickWidget, host);
+    bool hasSize = rect.width() > 0 && rect.height() > 0;
+    if (hasSize && !rect.intersects(region))
+        return;
+    if (!objectBoolProperty(obj, "visible", true))
+        return;
+
+    QString indent(depth * 2, ' ');
+    QString text;
+    const QMetaObject* mo = obj->metaObject();
+    if (mo) {
+        int textIdx = mo->indexOfProperty("text");
+        if (textIdx >= 0) {
+            QVariant value = mo->property(textIdx).read(obj);
+            if (value.isValid() && value.canConvert<QString>())
+                text = normalizedToolbarText(value.toString());
+        }
+    }
+
+    fprintf(stderr,
+            "[MC][UIDUMP] %sQML %s name='%s' rect=(%d,%d %dx%d) text='%s' enabled=%d visible=%d\n",
+            indent.toUtf8().constData(),
+            obj->metaObject() ? obj->metaObject()->className() : "(no-meta)",
+            obj->objectName().toUtf8().constData(),
+            rect.x(), rect.y(), rect.width(), rect.height(),
+            text.toUtf8().constData(),
+            objectBoolProperty(obj, "enabled", true) ? 1 : 0,
+            objectBoolProperty(obj, "visible", true) ? 1 : 0);
+
+    for (QObject* child : obj->children())
+        dumpQuickObjectsInRegionRecursive(child, quickWidget, host, region, depth + 1, maxDepth);
+}
+
+static void dumpPreampUiRegions(const char* phaseTag) {
+    QWidget* host = findLargestVisibleTopLevelWidget();
+    if (!host) {
+        fprintf(stderr, "[MC][UIDUMP] %sno visible host window\n", phaseTag ? phaseTag : "");
+        return;
+    }
+    QRect leftRegion(120, 240, 140, 430);
+    QRect rightRegion(610, 240, 150, 430);
+    fprintf(stderr,
+            "[MC][UIDUMP] %shost=%s size=%dx%d leftRegion=(%d,%d %dx%d) rightRegion=(%d,%d %dx%d)\n",
+            phaseTag ? phaseTag : "",
+            host->metaObject() ? host->metaObject()->className() : "(no-meta)",
+            host->width(),
+            host->height(),
+            leftRegion.x(), leftRegion.y(), leftRegion.width(), leftRegion.height(),
+            rightRegion.x(), rightRegion.y(), rightRegion.width(), rightRegion.height());
+
+    fprintf(stderr, "[MC][UIDUMP] %sLEFT REGION\n", phaseTag ? phaseTag : "");
+    dumpRegionWidgetsRecursive(host, host, leftRegion, 0, 7);
+    fprintf(stderr, "[MC][UIDUMP] %sRIGHT REGION\n", phaseTag ? phaseTag : "");
+    dumpRegionWidgetsRecursive(host, host, rightRegion, 0, 7);
+
+    QObject* quickObj = host->findChild<QObject*>("mainQmlWidget");
+    QWidget* quickWidget = host->findChild<QWidget*>("mainQmlWidget");
+    if (quickObj && quickWidget) {
+        fprintf(stderr, "[MC][UIDUMP] %sLEFT REGION QML\n", phaseTag ? phaseTag : "");
+        dumpQuickObjectsInRegionRecursive(quickObj, quickWidget, host, leftRegion, 0, 8);
+        fprintf(stderr, "[MC][UIDUMP] %sRIGHT REGION QML\n", phaseTag ? phaseTag : "");
+        dumpQuickObjectsInRegionRecursive(quickObj, quickWidget, host, rightRegion, 0, 8);
+    }
+}
+
+static QList<QObject*> collectWestProcessingForms() {
+    QList<QObject*> targets;
+    auto addTarget = [&](QObject* obj) {
+        if (!obj || targets.contains(obj))
+            return;
+        if (classNameContains(obj, "WestProcessingForm"))
+            targets.push_back(obj);
+    };
+
+    if (qApp) {
+        addTarget(qApp);
+        for (QObject* obj : qApp->findChildren<QObject*>())
+            addTarget(obj);
+    }
+    for (QWidget* widget : QApplication::allWidgets()) {
+        addTarget(widget);
+        for (QObject* obj : widget->findChildren<QObject*>())
+            addTarget(obj);
+    }
+    return targets;
+}
+
+static void runWestProcessingRefreshExperiment(const char* phaseTag) {
+    typedef void (*fn_WestProcessingFormChangeChannel)(void*, void*);
+    typedef void (*fn_WestProcessingFormReceivePointUpdated)(void*, void*);
+    typedef void (*fn_WestProcessingFormSocketStatusUpdated)(void*);
+    typedef void (*fn_WestProcessingFormPreampOnSurfaceChanged)(void*, unsigned char);
+    typedef void (*fn_WestProcessingFormSetActiveInputText)(void*, unsigned char);
+
+    auto changeChannel =
+        (fn_WestProcessingFormChangeChannel)RESOLVE(0x100d69350);
+    auto receivePointUpdated =
+        (fn_WestProcessingFormReceivePointUpdated)RESOLVE(0x100d6a920);
+    auto socketStatusUpdated =
+        (fn_WestProcessingFormSocketStatusUpdated)RESOLVE(0x100d6a810);
+    auto preampOnSurfaceChanged =
+        (fn_WestProcessingFormPreampOnSurfaceChanged)RESOLVE(0x100d6a940);
+    auto setActiveInputText =
+        (fn_WestProcessingFormSetActiveInputText)RESOLVE(0x100d69f80);
+
+    int selectedInputCh = getSelectedInputChannel(false);
+    void* selectedChannelObj =
+        (selectedInputCh >= 0) ? getInputChannel(selectedInputCh) : nullptr;
+    QList<QObject*> forms = collectWestProcessingForms();
+    int actions = 0;
+    for (QObject* obj : forms) {
+        void* raw = obj;
+        if (selectedChannelObj && changeChannel) {
+            changeChannel(raw, selectedChannelObj);
+            actions++;
+        }
+        if (selectedChannelObj && receivePointUpdated) {
+            receivePointUpdated(raw, selectedChannelObj);
+            actions++;
+        }
+        if (socketStatusUpdated) {
+            socketStatusUpdated(raw);
+            actions++;
+        }
+        if (preampOnSurfaceChanged) {
+            preampOnSurfaceChanged(raw, 0);
+            actions++;
+        }
+        if (setActiveInputText) {
+            setActiveInputText(raw, 0);
+            actions++;
+        }
+    }
+    fprintf(stderr,
+            "[MC] %swest refresh experiment: selectedCh=%d channelObj=%p forms=%d actions=%d\n",
+            phaseTag ? phaseTag : "",
+            selectedInputCh >= 0 ? selectedInputCh + 1 : -1,
+            selectedChannelObj,
+            forms.size(),
+            actions);
+    QApplication::processEvents();
+}
+
 static void refreshToolbarReorderButton() {
     QmlToolbarTargets qmlTargets = findQmlToolbarTargets();
     QWidget* host = nullptr;
@@ -8914,13 +10185,6 @@ static void showReorderDialog() {
     refreshPanel();
     g_reorderDialog->show();
 }
-
-struct SelectedStripInfo {
-    bool valid = false;
-    uint32_t stripType = 0;
-    int channel = -1;
-    void* channelPtr = nullptr;
-};
 
 static SelectedStripInfo g_lastSelectedStrip;
 static uint64_t g_lastSelectedStripMs = 0;
@@ -9965,6 +11229,12 @@ __attribute__((constructor))
 static void onLoad() {
     setupLogging();
     fprintf(stderr, "[MC] ===== MoveChannel dylib loaded =====\n");
+    if (const char* dumpShowsEnv = getenv("MC_DUMP_SHOWS")) {
+        fprintf(stderr, "[MC] MC_DUMP_SHOWS='%s'\n", dumpShowsEnv);
+    }
+    if (const char* recallShowEnv = getenv("MC_AUTOTEST_RECALL_SHOW")) {
+        fprintf(stderr, "[MC] MC_AUTOTEST_RECALL_SHOW='%s'\n", recallShowEnv);
+    }
     resolveSlide();
     resolveSymbols();
 
@@ -10017,6 +11287,21 @@ static void onLoad() {
             });
             g_toolbarButtonRefreshTimer->start();
         }
+        if (g_autotestOverlayStatusPath.isEmpty()) {
+            if (const char* statusPathEnv = getenv("MC_AUTOTEST_STATUS_FILE")) {
+                if (statusPathEnv[0] != '\0')
+                    g_autotestOverlayStatusPath = QString::fromUtf8(statusPathEnv);
+            }
+        }
+        if (!g_autotestOverlayStatusPath.isEmpty() && !g_autotestOverlayStatusTimer) {
+            g_autotestOverlayStatusTimer = new QTimer(qApp);
+            g_autotestOverlayStatusTimer->setInterval(300);
+            QObject::connect(g_autotestOverlayStatusTimer, &QTimer::timeout, qApp, []() {
+                pollAutotestOverlayStatusFile();
+            });
+            g_autotestOverlayStatusTimer->start();
+            pollAutotestOverlayStatusFile();
+        }
         QObject::connect(qApp, &QGuiApplication::focusWindowChanged, qApp, [](QWindow*) {
             SelectedStripInfo strip = getSelectedStripInfo(false);
             if (strip.valid)
@@ -10028,10 +11313,43 @@ static void onLoad() {
         });
         fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).\n");
 
-        if (getenv("MC_AUTOTEST_COPY_SRC") && getenv("MC_AUTOTEST_COPY_DST")) {
+        if (envFlagEnabled("MC_DUMP_SHOWS")) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                dumpAvailableShows();
+            });
+        }
+
+        if (getenv("MC_AUTOTEST_SELECT_ONLY") && getenv("MC_AUTOTEST_SELECT_CH")) {
+            fprintf(stderr, "[MC] Select autotest requested via environment.\n");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if (const char* recallShowEnv = getenv("MC_AUTOTEST_RECALL_SHOW")) {
+                    if (recallShowEnv[0] != '\0') {
+                        if (!maybeRecallAutotestShow()) {
+                            if (autotestEnvEnabled("MC_AUTOTEST_EXIT"))
+                                qApp->quit();
+                            return;
+                        }
+                    }
+                }
+                bool ok = runAutomatedSelectTest();
+                if (const char* exitEnv = getenv("MC_AUTOTEST_EXIT")) {
+                    if (atoi(exitEnv) != 0) {
+                        fprintf(stderr, "[MC] Select autotest finished, quitting app (%s).\n", ok ? "PASS" : "FAIL");
+                        qApp->quit();
+                    }
+                }
+            });
+        } else if (getenv("MC_AUTOTEST_COPY_SRC") && getenv("MC_AUTOTEST_COPY_DST")) {
             fprintf(stderr, "[MC] Copy/paste autotest requested via environment.\n");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
+                if (!maybeRecallAutotestShow()) {
+                    if (autotestEnvEnabled("MC_AUTOTEST_EXIT"))
+                        qApp->quit();
+                    return;
+                }
                 bool ok = runAutomatedCopyPasteTest();
                 if (const char* exitEnv = getenv("MC_AUTOTEST_EXIT")) {
                     if (atoi(exitEnv) != 0) {
@@ -10044,6 +11362,11 @@ static void onLoad() {
             fprintf(stderr, "[MC] Autotest requested via environment.\n");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
+                if (!maybeRecallAutotestShow()) {
+                    if (autotestEnvEnabled("MC_AUTOTEST_EXIT"))
+                        qApp->quit();
+                    return;
+                }
                 bool ok = runAutomatedMoveTest();
                 if (const char* exitEnv = getenv("MC_AUTOTEST_EXIT")) {
                     if (atoi(exitEnv) != 0) {
