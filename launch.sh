@@ -16,10 +16,13 @@ DIRECTOR_TMP_DIR="$HOME/Library/Application Support/AllenAndHeath/AllenHeath/TLD
 BOOST_WAVES_DIR="/private/tmp/boost_waves_interprocess"
 
 running_director_pids() {
-  ps -axo pid=,command= \
+  ps -axo pid=,stat=,command= \
     | awk -v app="$APP" '
         index($0, app) {
           pid = $1
+          stat = $2
+          if (stat ~ /^UE/ || stat ~ /^Z/)
+            next
           if (pid != "")
             print pid
         }

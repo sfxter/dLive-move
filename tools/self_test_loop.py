@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import pty
 import re
 import shutil
 import signal
@@ -16,9 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = ROOT / "launch.sh"
 LOG_PATH = ROOT / "movechannel.log"
 ARTIFACTS_ROOT = ROOT / "tmp" / "self-test-runs"
-WINDOW_TITLE_PATTERNS = ("dLive Director V2.11", "dLive Director V2.02", "dLive Editor")
 DIRECTOR_COMM_NAMES = ("dLive Director V2.11", "dLive Director V2.02")
 SCREENSHOT_SETTLE_SECONDS = 2.5
+SHOW_NAME_LIMIT = 16
 
 
 @dataclass
@@ -41,6 +42,7 @@ DEFAULT_SCENARIOS = [
             "MC_AUTOTEST_SKIP_CHANNEL_VERIFY": "1",
             "MC_AUTOTEST_MOVE_PATCH": "0",
             "MC_AUTOTEST_SHIFT_MIXRACK_IO": "0",
+            "MC_AUTOTEST_DUMP_PREAMP_UI": "1",
             "MC_AUTOTEST_EXIT": "0",
         },
         expected_channels=[1, 2],
@@ -57,6 +59,7 @@ DEFAULT_SCENARIOS = [
             "MC_AUTOTEST_SKIP_CHANNEL_VERIFY": "1",
             "MC_AUTOTEST_MOVE_PATCH": "0",
             "MC_AUTOTEST_SHIFT_MIXRACK_IO": "0",
+            "MC_AUTOTEST_DUMP_PREAMP_UI": "1",
             "MC_AUTOTEST_EXIT": "0",
         },
         expected_channels=[11, 12],
@@ -150,7 +153,7 @@ def sh(cmd: str, env: Optional[Dict[str, str]] = None, check: bool = True) -> su
 
 def running_processes() -> List[str]:
     result = subprocess.run(
-        ["bash", "-lc", "ps -axo pid=,command="],
+        ["bash", "-lc", "ps -axo pid=,stat=,command="],
         cwd=str(ROOT),
         text=True,
         capture_output=True,
@@ -174,7 +177,7 @@ def running_processes() -> List[str]:
 
 def running_director_processes_strict() -> List[str]:
     result = subprocess.run(
-        ["bash", "-lc", "ps -axo pid=,command="],
+        ["bash", "-lc", "ps -axo pid=,stat=,command="],
         cwd=str(ROOT),
         text=True,
         capture_output=True,
@@ -184,6 +187,13 @@ def running_director_processes_strict() -> List[str]:
     for raw in result.stdout.splitlines():
         line = raw.strip()
         if not line:
+            continue
+        parts = line.split(None, 2)
+        stat = parts[1] if len(parts) >= 2 else ""
+        # macOS can occasionally leave behind orphaned UE entries for Director
+        # that are no longer launchable or killable. Treat those as dead ghosts
+        # so they do not block the whole self-test loop.
+        if stat.startswith("UE"):
             continue
         if "dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11" in line:
             lines.append(line)
@@ -206,6 +216,41 @@ def running_director_app_names() -> List[str]:
             if "dLive Director V2.02" not in names:
                 names.append("dLive Director V2.02")
     return names
+
+
+def running_director_process_lines() -> List[str]:
+    result = subprocess.run(
+        ["bash", "-lc", "ps -axo pid=,stat=,command="],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    lines: List[str] = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        stat = parts[1] if len(parts) >= 2 else ""
+        if stat.startswith("UE"):
+            continue
+        if "dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11" in line:
+            lines.append(line)
+            continue
+        if "dLive Director V2.02.app/Contents/MacOS/dLive Director V2.02" in line:
+            lines.append(line)
+            continue
+    return lines
+
+
+def ensure_single_director_instance(context: str) -> None:
+    lines = running_director_process_lines()
+    if len(lines) > 1:
+        raise RuntimeError(
+            f"More than one Director instance detected {context}. Refusing to continue.\n"
+            + "\n".join(lines)
+        )
 
 
 def ensure_clean_state() -> None:
@@ -259,6 +304,8 @@ def wait_for_log(pattern: str, timeout: float) -> str:
     while time.time() < deadline:
         if LOG_PATH.exists():
             last_text = LOG_PATH.read_text(errors="replace")
+            if "An instance of dLive Director is already running." in last_text:
+                raise RuntimeError("Director reported a false single-instance collision during launch.")
             if compiled.search(last_text):
                 return last_text
         time.sleep(0.25)
@@ -272,6 +319,8 @@ def wait_for_any_log(patterns: List[str], timeout: float) -> tuple[str, str]:
     while time.time() < deadline:
         if LOG_PATH.exists():
             last_text = LOG_PATH.read_text(errors="replace")
+            if "An instance of dLive Director is already running." in last_text:
+                raise RuntimeError("Director reported a false single-instance collision during scenario run.")
             for pattern, regex in compiled:
                 if regex.search(last_text):
                     return pattern, last_text
@@ -283,14 +332,20 @@ def launch_editor(extra_env: Dict[str, str]) -> subprocess.Popen:
     ensure_clean_state()
     env = os.environ.copy()
     env.update(extra_env)
+    env.setdefault("MC_PATCH_DIRECTOR_SINGLETON_KEY", "1")
+    master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(
         ["bash", "-lc", str(LAUNCH)],
         cwd=str(ROOT),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
         start_new_session=True,
+        close_fds=True,
     )
+    os.close(slave_fd)
+    proc._pty_master_fd = master_fd
     return proc
 
 
@@ -308,6 +363,12 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
+            pass
+    master_fd = getattr(proc, "_pty_master_fd", None)
+    if master_fd is not None:
+        try:
+            os.close(master_fd)
+        except OSError:
             pass
 
 
@@ -335,67 +396,10 @@ def activate_director() -> None:
     time.sleep(1.5)
 
 
-def swift_window_id_script() -> str:
-    return r'''
-import Cocoa
-import CoreGraphics
-
-let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-let wanted = ["dLive Director V2.11", "dLive Director V2.02", "dLive Editor"]
-var bestId: Int?
-var bestArea = -1
-for window in info {
-    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
-    let name = window[kCGWindowName as String] as? String ?? ""
-    let layer = window[kCGWindowLayer as String] as? Int ?? -1
-    let alpha = window[kCGWindowAlpha as String] as? Double ?? 0.0
-    guard layer == 0, alpha > 0 else { continue }
-    let matches = wanted.contains(owner) || wanted.contains(name) || owner.contains("dLive")
-    guard matches else { continue }
-    let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
-    let width = bounds["Width"] as? Int ?? 0
-    let height = bounds["Height"] as? Int ?? 0
-    let area = width * height
-    if area > bestArea, let wid = window[kCGWindowNumber as String] as? Int {
-        bestArea = area
-        bestId = wid
-    }
-}
-if let wid = bestId {
-    print(wid)
-    exit(0)
-}
-exit(1)
-'''
-
-
-def get_window_id() -> Optional[str]:
-    result = subprocess.run(
-        ["bash", "-lc", "swift - <<'SWIFT'\n" + swift_window_id_script() + "\nSWIFT"],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-    )
-    out = result.stdout.strip()
-    if result.returncode == 0 and out:
-        return out.splitlines()[-1].strip()
-    return None
-
-
 def capture_screenshot(dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     activate_director()
     time.sleep(SCREENSHOT_SETTLE_SECONDS)
-    window_id = get_window_id()
-    if window_id:
-        result = subprocess.run(
-            ["bash", "-lc", f'screencapture -x -o -l {window_id} "{dest}"'],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
-            return
     sh(f'screencapture -x "{dest}"')
 
 
@@ -466,6 +470,36 @@ def parse_selection_state(log_text: str) -> Dict[str, object]:
     return out
 
 
+def parse_timing_breakdown(log_text: str) -> Dict[str, object]:
+    out: Dict[str, object] = {"steps": {}, "move_phases": []}
+
+    timing_pattern = re.compile(r"\[MC\]\[TIMING\] step=([A-Za-z0-9_]+) ms=(\d+)(?: detail=(.*))?")
+    for match in timing_pattern.finditer(log_text):
+        step = match.group(1)
+        entry: Dict[str, object] = {"ms": int(match.group(2))}
+        detail = match.group(3)
+        if detail:
+            entry["detail"] = detail.strip()
+        out["steps"][step] = entry
+
+    phase_pattern = re.compile(r"\[MC\]\[\s*(\d+)ms\] (Phase: .+)")
+    phase_matches = list(phase_pattern.finditer(log_text))
+    for idx, match in enumerate(phase_matches):
+        absolute_ms = int(match.group(1))
+        label = match.group(2).strip()
+        duration_ms = None
+        if idx + 1 < len(phase_matches):
+            duration_ms = int(phase_matches[idx + 1].group(1)) - absolute_ms
+        out["move_phases"].append(
+            {
+                "label": label,
+                "absolute_ms": absolute_ms,
+                "duration_to_next_ms": duration_ms,
+            }
+        )
+    return out
+
+
 def copy_log(dest: Path) -> str:
     text = LOG_PATH.read_text(errors="replace") if LOG_PATH.exists() else ""
     dest.write_text(text)
@@ -502,6 +536,15 @@ def clear_status(status_path: Path) -> None:
         pass
 
 
+def make_saved_show_name(scenario_name: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9_]+", "", scenario_name).upper()
+    if not base:
+        base = "AUTO"
+    stamp = time.strftime("%H%M%S")
+    room_for_base = max(1, SHOW_NAME_LIMIT - len(stamp) - 1)
+    return f"{base[:room_for_base]}_{stamp}"[:SHOW_NAME_LIMIT]
+
+
 def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], show_name: str, status_window=None) -> Dict[str, object]:
     print(f"[self-test] scenario: {scenario.name}")
     kill_existing_instances()
@@ -514,24 +557,31 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
     status_path = run_dir / f"{scenario.name}.status.txt"
     write_status(status_path, "dLive Self-Test", f"Launching editor for {scenario.name}")
 
-    env = dict(launch_env)
-    env.update(scenario.env)
+    env = dict(scenario.env)
+    env.update(launch_env)
     env["MC_AUTOTEST_STATUS_FILE"] = str(status_path)
+    saved_show_name = None
     if show_name:
         env["MC_AUTOTEST_RECALL_SHOW"] = show_name
     if scenario.expected_channels:
         env["MC_AUTOTEST_SELECT_CH"] = str(scenario.expected_channels[0])
+    enable_save_recall = env.get("MC_AUTOTEST_ENABLE_SAVE_RECALL", "0") == "1"
+    if "MC_AUTOTEST_SRC" in scenario.env and "MC_AUTOTEST_DST" in scenario.env and enable_save_recall:
+        saved_show_name = make_saved_show_name(scenario.name)
+        env["MC_AUTOTEST_SAVE_RECALL_SHOW"] = saved_show_name
     proc = launch_editor(env)
     live_log_text = ""
 
     try:
         live_log_text = wait_for_log(r"\[MC\] ===== MoveChannel ready =====", timeout=40.0)
+        ensure_single_director_instance("after launch")
         if show_name:
             append_status(status_path, "dLive Self-Test", f"Recalling SHOW {show_name}")
             live_log_text = wait_for_log(
                 r"\[MC\] recallShowByName\('" + re.escape(show_name) + r"'\): recalling key",
                 timeout=60.0,
             )
+            ensure_single_director_instance(f"after recalling SHOW {show_name}")
             if f"[MC][AUTOTEST] failed to recall SHOW '{show_name}'" in live_log_text:
                 raise RuntimeError(f"Failed to recall SHOW {show_name!r}")
         run_optional_hook(scenario.pre_hook, f"{scenario.name} pre-hook")
@@ -556,13 +606,25 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
             else:
                 detail = f"Moving channel {src} to {dst}"
             append_status(status_path, "dLive Self-Test", detail)
-            completion_pattern, live_log_text = wait_for_any_log(
-                [
+            if saved_show_name:
+                append_status(status_path, "dLive Self-Test", f"Saving and recalling SHOW {saved_show_name}")
+                completion_patterns = [
                     r"\[MC\]\[AUTOTEST\] RESULT: PASS",
                     r"\[MC\]\[AUTOTEST\] RESULT: FAIL",
                     r"\[MC\] ERROR:",
-                ],
-                timeout=180.0,
+                ]
+                timeout = 240.0
+            else:
+                completion_patterns = [
+                    r"\[MC\]\[AUTOTEST\] RESULT: PASS",
+                    r"\[MC\]\[AUTOTEST\] RESULT: FAIL",
+                    r"\[MC\]\[\s*\d+ms\] Phase: move complete",
+                    r"\[MC\] ERROR:",
+                ]
+                timeout = 180.0
+            completion_pattern, live_log_text = wait_for_any_log(
+                completion_patterns,
+                timeout=timeout,
             )
         elif "MC_AUTOTEST_COPY_SRC" in scenario.env and "MC_AUTOTEST_COPY_DST" in scenario.env:
             append_status(
@@ -597,6 +659,7 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
                 )
         time.sleep(1.5)
         wait_for_scenario_visual_settle(scenario, status_path)
+        ensure_single_director_instance("before screenshot capture")
         append_status(status_path, "dLive Self-Test", "Capturing screenshot")
         run_optional_hook(scenario.screenshot_hook, f"{scenario.name} screenshot-hook")
         screenshot_path = run_dir / f"{scenario.name}.png"
@@ -610,6 +673,7 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
             scenario_log_path.write_text(effective_log_text)
         final_preamp = parse_final_preamp(effective_log_text, scenario.expected_channels)
         selection_state = parse_selection_state(effective_log_text)
+        timing = parse_timing_breakdown(effective_log_text)
         errors = parse_recent_errors(effective_log_text)
         status = "complete"
         if "RESULT: FAIL" in completion_pattern or "RESULT: FAIL" in effective_log_text or "[MC] ERROR:" in effective_log_text:
@@ -621,10 +685,12 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
             "show_name": show_name,
             "status": status,
             "completion_pattern": completion_pattern,
+            "saved_show_name": saved_show_name,
             "log_path": str(scenario_log_path),
             "screenshot_path": str(screenshot_path),
             "final_preamp": final_preamp,
             "selection_state": selection_state,
+            "timing": timing,
             "errors": errors,
         }
     except Exception as exc:
@@ -648,10 +714,12 @@ def run_scenario(scenario: Scenario, run_dir: Path, launch_env: Dict[str, str], 
             "show_name": show_name,
             "status": "exception",
             "exception": str(exc),
+            "saved_show_name": saved_show_name,
             "log_path": str(scenario_log_path),
             "screenshot_path": str(screenshot_path),
             "final_preamp": parse_final_preamp(effective_log_text, scenario.expected_channels),
             "selection_state": parse_selection_state(effective_log_text),
+            "timing": parse_timing_breakdown(effective_log_text),
             "errors": parse_recent_errors(effective_log_text),
         }
     finally:
@@ -708,6 +776,9 @@ def main() -> int:
         "MC_SHOW_LOG": args.show_log,
         "MC_FILTER_SOCKET_TYPE_ERRORS": args.filter_socket_errors,
     }
+    for key, value in os.environ.items():
+        if key.startswith(("MC_AUTOTEST_", "MC_EXPERIMENT_", "MC_ENABLE_", "MC_DISABLE_")):
+            launch_env[key] = value
 
     summary = {
         "run_dir": str(run_dir),
