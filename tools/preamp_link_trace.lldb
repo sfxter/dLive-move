@@ -1,0 +1,26 @@
+# LLDB trace for cChannelSelectorLite gain-path observer calls.
+# Logs to /tmp/preamp_link_trace.log (separate from movechannel.log).
+#
+# Usage:
+#   lldb -s tools/preamp_link_trace.lldb -- "/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
+#   (lldb) run
+#   ... reproduce scenario ...
+#   Ctrl-C, quit.
+#
+# Then:  cat /tmp/preamp_link_trace.log
+
+command script import tools/preamp_link_trace_helpers.py
+
+breakpoint set -n _ZN20cChannelSelectorLite15LinkInputPreAmpEh18eGigaACEConnectionh
+breakpoint command add -F preamp_link_trace_helpers.on_LinkInputPreAmp
+
+breakpoint set -n _ZN20cChannelSelectorLite17LinkSurfacePreAmpE17eAudioChannelTypehtR12sAudioSourcebbhb
+breakpoint command add -F preamp_link_trace_helpers.on_LinkSurfacePreAmp
+
+breakpoint set -n _ZN29cDL5000ChannelMapperDiscovery17HaveChangedSourceE11ePatchEventP12sAudioSourcet17eChannelStripType
+breakpoint command add -F preamp_link_trace_helpers.on_HaveChangedSource
+
+breakpoint set -n _ZN29cDL5000ChannelMapperDiscovery19AboutToChangeSourceE11ePatchEventP12sAudioSourcet17eChannelStripType
+breakpoint command add -F preamp_link_trace_helpers.on_AboutToChangeSource
+
+breakpoint list

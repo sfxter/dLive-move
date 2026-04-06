@@ -112,6 +112,10 @@ enum MCLogLevel {
 
 static int g_mcLogLevel = -1;
 static void refreshVisiblePreampUI(const char* phaseTag = nullptr);
+static void refreshAllStripPreampBindings(const char* phaseTag = nullptr);
+static void refreshAllWestForms(const char* phaseTag = nullptr);
+static void dumpWestWidgets(const char* phaseTag = nullptr);
+static void dumpChannelSourceFields(const char* phaseTag = nullptr);
 static void dumpPreampUiRegions(const char* phaseTag = nullptr);
 static void scanRootForVtableSlotCandidates(void* root,
                                             const char* rootLabel,
@@ -4072,6 +4076,64 @@ static bool writePreampDataForAudioSource(const sAudioSource& source, const Prea
     return writePreampDataForSocket(socketNum, preamp, directBoolWrites, writeBoolState);
 }
 
+static void probeChannelBindings(const char* tag, int loCh, int hiCh) {
+    typedef void*   (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+    typedef void*   (*fn_GetInputSource)(void* channel);
+    typedef void*   (*fn_GetProxy)(void* mgr, void* parent);
+    typedef uint8_t (*fn_GetActiveInputSource)(void* channel);
+    auto getChannel        = (fn_GetChannel)        RESOLVE(0x1006e3f90);
+    auto getInputSource    = (fn_GetInputSource)    RESOLVE(0x1006d8130);
+    auto getProxy          = (fn_GetProxy)          RESOLVE(0x100738720);
+    auto getActiveInputSrc = (fn_GetActiveInputSource)RESOLVE(0x1006d80d0);
+    typedef void* (*fn_AppInstance)();
+    auto appInstance = (fn_AppInstance)RESOLVE(0x100d5a120);
+    uint8_t* preampOptByteArr = nullptr;
+    if (appInstance) {
+        void* app = appInstance();
+        if (app) {
+            void* drbox = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(app) + 0xb8);
+            if (drbox) {
+                void* audioCore = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(drbox) + 0x48);
+                if (audioCore) {
+                    void* preampMgr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(audioCore) + 0x22b20);
+                    if (preampMgr) {
+                        preampOptByteArr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(preampMgr) + 0x88);
+                        fprintf(stderr, "[MC] %s preampMgr=%p byteArr=%p\n", tag, preampMgr, preampOptByteArr);
+                    }
+                }
+            }
+        }
+    }
+    if (!getChannel || !getInputSource || !g_channelManager) return;
+    void* mgr = (g_uiManagerHolder && getProxy)
+        ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + 0x118)
+        : nullptr;
+    for (int ch = loCh; ch <= hiCh; ++ch) {
+        void* chan = getChannel(g_channelManager, 1, (uint8_t)ch);
+        if (!chan) { fprintf(stderr, "[MC] %s ch%2d: chan=null\n", tag, ch+1); continue; }
+        void* sp = getInputSource(chan);
+        if (!sp) { fprintf(stderr, "[MC] %s ch%2d: chan=%p sendPt=null\n", tag, ch+1, chan); continue; }
+        void* parent = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(sp) + 0x30);
+        void* proxy = (mgr && parent) ? getProxy(mgr, parent) : nullptr;
+        unsigned sockEnum = 0;
+        if (proxy) sockEnum = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(proxy) + 0x28);
+        uint8_t activeSrc = getActiveInputSrc ? getActiveInputSrc(chan) : 0xff;
+        // cUIManagerHolder::Instance()->0x28->0x90[ch] (int32 array seen in ChangeChannel)
+        uint32_t holderTbl = 0xffffffff;
+        if (g_uiManagerHolder) {
+            void* sub = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + 0x28);
+            if (sub) holderTbl = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sub) + 0x90 + ch*4);
+        }
+        unsigned poByte = preampOptByteArr ? preampOptByteArr[ch] : 0xff;
+        fprintf(stderr, "[MC] %s ch%2d: chan=%p sp=%p proxy=%p sockEnum=0x%x activeSrc=0x%02x preampOpt[ch]=0x%02x\n",
+                tag, ch+1, chan, sp, proxy, sockEnum, activeSrc, poByte);
+        uint8_t* cb = reinterpret_cast<uint8_t*>(chan);
+        fprintf(stderr, "[MC] %s ch%2d bytes 0x50-0x7f:", tag, ch+1);
+        for (int o = 0x50; o < 0x80; ++o) fprintf(stderr, " %02x", cb[o]);
+        fprintf(stderr, "\n");
+    }
+}
+
 static void* getManagedInputChannel(int ch) {
     if (!g_channelManager || ch < 0 || ch > 127) return nullptr;
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
@@ -8012,6 +8074,8 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         }
     }
 
+    probeChannelBindings("PROBE/after-stereo-align:", std::max(0, lo-2), std::min(127, hi+2));
+
     // Write in new order. Preamp state is restored separately after patching,
     // because gain/pad/phantom live on the assigned socket, not on the strip.
     bool skipPreamp = true;
@@ -8024,6 +8088,44 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     phase("Phase: rewrite patching");
     fprintf(stderr, "[MC] Writing patching (%s; MixRack I/O Port: %s)...\n",
             patchPolicy, ioPortPolicy);
+    // Snapshot cDL5000ChannelMapperDiscovery::0x88 (A-patch sAudioSource array)
+    // so we can detect and restore collateral corruption on channels NOT in the
+    // move targetMap. Stereo reconfig in SetInputChannelSource can silently
+    // rewrite other channels' entries (root cause of ch15/16 gain bleed).
+    void* g_discBeforePatch = nullptr;
+    void* g_acMapperBefore = nullptr;
+    uint64_t g_preSrcArr[0x80] = {0};
+    uint64_t g_preAcArr[0x80]  = {0};
+    {
+        typedef void* (*fn_AppInstance3)();
+        auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
+        void* a3 = appInst3 ? appInst3() : nullptr;
+        void* s3 = a3 ? *reinterpret_cast<void**>((uint8_t*)a3 + 0xc0) : nullptr;
+        g_discBeforePatch = s3 ? *reinterpret_cast<void**>((uint8_t*)s3 + 0xa0) : nullptr;
+        if (g_discBeforePatch) {
+            uint64_t* srcArr = *reinterpret_cast<uint64_t**>((uint8_t*)g_discBeforePatch + 0x88);
+            if (srcArr) {
+                for (int i = 0; i < 0x80; ++i) g_preSrcArr[i] = srcArr[i];
+                fprintf(stderr, "[MC]   Snapshotted discovery->0x88 (disc=%p, arr=%p)\n",
+                        g_discBeforePatch, srcArr);
+            }
+        }
+        // Also snapshot AudioCore cChannelMapper->0x88 (app→0xb8→0x48→0xa8→0x20)
+        if (a3) {
+            void* drbox = *reinterpret_cast<void**>((uint8_t*)a3 + 0xb8);
+            void* acd   = drbox ? *reinterpret_cast<void**>((uint8_t*)drbox + 0x48) : nullptr;
+            void* wrap  = acd ? *reinterpret_cast<void**>((uint8_t*)acd + 0xa8) : nullptr;
+            g_acMapperBefore = wrap ? *reinterpret_cast<void**>((uint8_t*)wrap + 0x20) : nullptr;
+            if (g_acMapperBefore) {
+                uint64_t* acArr = *reinterpret_cast<uint64_t**>((uint8_t*)g_acMapperBefore + 0x88);
+                if (acArr) {
+                    for (int i = 0; i < 0x80; ++i) g_preAcArr[i] = acArr[i];
+                    fprintf(stderr, "[MC]   Snapshotted acMapper->0x88 (mapper=%p, arr=%p)\n",
+                            g_acMapperBefore, acArr);
+                }
+            }
+        }
+    }
         bool disablePatchMetadataSync = envFlagEnabled("MC_DISABLE_PATCH_METADATA_SYNC");
         fprintf(stderr,
                 "[MC]   Patch metadata sync after SetInputChannelSource: %s\n",
@@ -8156,6 +8258,204 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             QApplication::processEvents();
         }
         fprintf(stderr, "[MC]   Patching applied via SetInputChannelSource.\n");
+    // cAudioCoreDM::NewInputStereoConfiguration hammer: the app's own
+    // mono<->stereo reconfig entry point (0x1001a0f10). Given a 128-byte stereo
+    // map, it rebuilds input intermediates for pairs that flipped AND
+    // unconditionally calls cChannelSelectorManager::NewInputStereoConfiguration
+    // which loops every cChannelSelectorLite, refreshes selector->0xb0 from
+    // stagebox discovery, and re-fires CreateStageBoxPreAmpAssignments for all
+    // 128 channels. This is exactly what republishes the name-based preamp
+    // Links in the parameter registry, which is what our moveChannel is
+    // missing for channels whose stereo-pair position changed.
+    //
+    // We pass the CURRENT stereo map (read via isChannelStereo), so the
+    // diff-based intermediate-rebuild block inside the function is a no-op
+    // (no resets, no glitches), but the selector refresh still runs.
+    if (!envFlagEnabled("MC_DISABLE_NEW_STEREO_CFG")) {
+        typedef void* (*fn_AppInstance3)();
+        auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
+        void* audioCoreDM = nullptr;
+        if (appInst3) {
+            void* app3 = appInst3();
+            if (app3) {
+                void* drbox3 = *reinterpret_cast<void**>((uint8_t*)app3 + 0xb8);
+                if (drbox3) {
+                    audioCoreDM = *reinterpret_cast<void**>((uint8_t*)drbox3 + 0x48);
+                }
+            }
+        }
+        if (audioCoreDM) {
+            uint8_t cfg[128];
+            memset(cfg, 0, sizeof(cfg));
+            for (int i = 0; i < 128; i += 2) {
+                if (isChannelStereo(i)) { cfg[i] = 1; cfg[i + 1] = 1; }
+            }
+            fprintf(stderr, "[MC]   Calling cAudioCoreDM::NewInputStereoConfiguration(audioCoreDM=%p, cfg=%p)\n",
+                    audioCoreDM, cfg);
+            typedef void (*fn_NewStereoCfg)(void* self, const uint8_t* cfg);
+            auto newStereoCfg = (fn_NewStereoCfg)RESOLVE(0x1001a0f10);
+            newStereoCfg(audioCoreDM, cfg);
+            fprintf(stderr, "[MC]   cAudioCoreDM::NewInputStereoConfiguration returned\n");
+            QApplication::processEvents();
+        } else {
+            fprintf(stderr, "[MC]   WARN: could not resolve cAudioCoreDM for NewInputStereoConfiguration\n");
+        }
+    }
+    // Re-fire cDL5000ChannelMapperDiscovery AboutToChangeSource/HaveChangedSource
+    // observers for each affected channel. SetInputChannelSource updates the audio
+    // graph but bypasses cChannelMapperDiscovery::NewIPChannelAPatch, which is the
+    // normal UI-repatch path that invokes vtable[0xc0]/[0xc8] per channel to make
+    // cChannelSelectorLite::LinkInputPreAmp republish the West-form gain-knob
+    // binding. Without this, ch15/16 after a stereo-reconfig move keep their
+    // stale LinkSurfacePreAmp pointing at ch13/14's preamp (the gain bleed).
+    if (!envFlagEnabled("MC_DISABLE_REFIRE_DISCOVERY")) {
+        typedef void* (*fn_AppInstance2)();
+        auto appInst = (fn_AppInstance2)RESOLVE(0x100d5a120);
+        void* discovery = nullptr;
+        void* app2 = appInst ? appInst() : nullptr;
+        void* surface = app2 ? *reinterpret_cast<void**>((uint8_t*)app2 + 0xc0) : nullptr;
+        if (surface) {
+            discovery = *reinterpret_cast<void**>((uint8_t*)surface + 0xa0);
+        }
+        fprintf(stderr, "[MC]   Observer re-fire lookup: app=%p surface=%p discovery=%p\n",
+                app2, surface, discovery);
+        if (discovery) {
+            void** vt = *reinterpret_cast<void***>(discovery);
+            typedef void (*fn_changeSource)(void* self, int event, void* srcArr,
+                                            uint16_t chan, uint8_t stripType);
+            auto aboutTo = (fn_changeSource)vt[0xc0 / 8];
+            auto haveChg = (fn_changeSource)vt[0xc8 / 8];
+            void* srcArr = *reinterpret_cast<void**>((uint8_t*)discovery + 0x88);
+            fprintf(stderr,
+                    "[MC]   Re-firing discovery observers: disc=%p srcArr=%p\n",
+                    discovery, srcArr);
+            // Build set of channels the move legitimately touched.
+            std::set<int> movedSet;
+            for (auto& [tgtCh, si] : plan.targetMap) {
+                movedSet.insert(tgtCh);
+                if (isChannelStereo(tgtCh)) movedSet.insert(tgtCh + 1);
+            }
+            // Restore collateral-corrupted entries (channels NOT in movedSet
+            // whose srcArr[chan] changed versus pre-patch snapshot).
+            uint64_t* curArr = reinterpret_cast<uint64_t*>(srcArr);
+            int restored = 0;
+            if (discovery == g_discBeforePatch && curArr) {
+                for (int ch = 0; ch < 0x80; ++ch) {
+                    if (movedSet.count(ch)) continue;
+                    if (curArr[ch] == g_preSrcArr[ch]) continue;
+                    fprintf(stderr,
+                            "[MC]     Restore ch %d srcArr slot: 0x%016llx -> 0x%016llx\n",
+                            ch + 1,
+                            (unsigned long long)curArr[ch],
+                            (unsigned long long)g_preSrcArr[ch]);
+                    curArr[ch] = g_preSrcArr[ch];
+                    ++restored;
+                    haveChg(discovery, 0, (uint8_t*)discovery + 0x88,
+                            (uint16_t)ch, 0);
+                }
+            }
+            fprintf(stderr, "[MC]   Restored %d collateral srcArr entries\n", restored);
+            // Also diff/restore Audio Core cChannelMapper->0x88.
+            if (g_acMapperBefore) {
+                uint64_t* acCur = *reinterpret_cast<uint64_t**>(
+                    (uint8_t*)g_acMapperBefore + 0x88);
+                int acRestored = 0;
+                if (acCur) {
+                    for (int ch = 0; ch < 0x80; ++ch) {
+                        if (acCur[ch] == g_preAcArr[ch]) continue;
+                        fprintf(stderr,
+                                "[MC]     acMapper ch %d slot changed: 0x%016llx -> 0x%016llx (moved=%d)\n",
+                                ch + 1,
+                                (unsigned long long)g_preAcArr[ch],
+                                (unsigned long long)acCur[ch],
+                                movedSet.count(ch) ? 1 : 0);
+                        if (movedSet.count(ch)) continue;
+                        acCur[ch] = g_preAcArr[ch];
+                        ++acRestored;
+                    }
+                }
+                fprintf(stderr, "[MC]   Restored %d collateral acMapper entries\n", acRestored);
+            }
+            // Sync discovery->0x88 from acMapper->0x88 for moved channels.
+            // SetInputChannelSource writes the new source into the Audio Core
+            // cChannelMapper but the Surface-side cDL5000ChannelMapperDiscovery
+            // (which cChannelSelectorLite queries for preamp binding) is only
+            // updated by the NewIPChannelAPatch net-message path, which our
+            // move bypasses. Without this sync, re-firing the observer below
+            // would re-publish the stale pre-move source for each moved ch.
+            if (g_acMapperBefore && curArr) {
+                uint64_t* acCur = *reinterpret_cast<uint64_t**>(
+                    (uint8_t*)g_acMapperBefore + 0x88);
+                if (acCur) {
+                    int synced = 0;
+                    for (int ch : movedSet) {
+                        if (ch < 0 || ch > 0x7f) continue;
+                        if (curArr[ch] == acCur[ch]) continue;
+                        fprintf(stderr,
+                                "[MC]     Sync discovery ch %d: 0x%016llx -> 0x%016llx\n",
+                                ch + 1,
+                                (unsigned long long)curArr[ch],
+                                (unsigned long long)acCur[ch]);
+                        curArr[ch] = acCur[ch];
+                        ++synced;
+                    }
+                    fprintf(stderr, "[MC]   Synced %d discovery slots from acMapper\n", synced);
+                }
+            }
+            // Re-fire observers for moved channels (normal case).
+            for (int ch : movedSet) {
+                fprintf(stderr,
+                        "[MC]     Re-fire ch %d (AboutToChangeSource + HaveChangedSource)\n",
+                        ch + 1);
+                aboutTo(discovery, 0, (uint8_t*)discovery + 0x88,
+                        (uint16_t)ch, 0);
+                haveChg(discovery, 0, (uint8_t*)discovery + 0x88,
+                        (uint16_t)ch, 0);
+            }
+            QApplication::processEvents();
+        } else {
+            fprintf(stderr,
+                    "[MC]   WARN: could not resolve cDL5000ChannelMapperDiscovery for observer re-fire\n");
+        }
+    }
+    // Rebuild the cChannelMapper gain-sharing link registers so the West-form
+    // gain knob is re-bound to the correct preamp for channels whose input
+    // source changed. SetInputChannelSource updates the audio graph but not
+    // the ChannelMapper parameter-link table maintained via DoGainSharingLinking.
+    if (!envFlagEnabled("MC_DISABLE_REBUILD_PATCHBAY")) {
+        typedef void* (*fn_AppInstance)();
+        auto appInstance = (fn_AppInstance)RESOLVE(0x100d5a120);
+        void* mapper = nullptr;
+        if (appInstance) {
+            void* app = appInstance();
+            if (app) {
+                void* drbox = *reinterpret_cast<void**>((uint8_t*)app + 0xb8);
+                if (drbox) {
+                    void* audioCore = *reinterpret_cast<void**>((uint8_t*)drbox + 0x48);
+                    if (audioCore) {
+                        void* wrapper = *reinterpret_cast<void**>((uint8_t*)audioCore + 0xa8);
+                        if (wrapper) {
+                            mapper = *reinterpret_cast<void**>((uint8_t*)wrapper + 0x20);
+                        }
+                    }
+                }
+            }
+        }
+        if (mapper) {
+            typedef void (*fn_ConfigureIOModuleOutputPatchBay)(void* mapper);
+            auto cfg1 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b4cc0);
+            auto cfg2 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b4e70);
+            auto cfg3 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b5020);
+            fprintf(stderr, "[MC]   Rebuilding ChannelMapper IOModule patch bays (mapper=%p)\n", mapper);
+            if (cfg1) cfg1(mapper);
+            if (cfg2) cfg2(mapper);
+            if (cfg3) cfg3(mapper);
+            QApplication::processEvents();
+        } else {
+            fprintf(stderr, "[MC]   WARN: could not resolve cChannelMapper for patch-bay rebuild\n");
+        }
+    }
+    probeChannelBindings("PROBE/after-patching:", std::max(0, lo-2), std::min(127, hi+2));
     phase("Phase: restore preamp sockets");
     for (auto& [tgtCh, si] : plan.targetMap) {
         if (!snaps[si].validPreamp || !snaps[si].validPatch) continue;
@@ -8880,6 +9180,34 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             logFinalPreampStateForChannel(i);
         }
         refreshVisiblePreampUI("[MC] post-scene-ui-signal: ");
+    }
+
+    // Experimental: per-strip CreatePreAmpAssignments rebuild (no effect on West UI leak).
+    // Kept behind MC_REFRESH_ALL_STRIP_PREAMP=1 for A/B comparison only.
+    refreshAllStripPreampBindings("[MC] post-move: ");
+    refreshAllWestForms("[MC] post-move: ");
+    dumpWestWidgets("[MC] post-move: ");
+    dumpChannelSourceFields("[MC] post-move: ");
+
+    probeChannelBindings("PROBE/before-complete:", std::max(0, lo-2), std::min(127, hi+2));
+
+    if (envFlagEnabled("MC_REBIND_WEST_FORM")) {
+        const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
+        typedef void (*fn_ChangeChannel)(void* form, void* chan);
+        auto changeChannel = (fn_ChangeChannel)RESOLVE(0x100d69350);
+        int rebound = 0;
+        if (changeChannel) {
+            for (QWidget* w : QApplication::allWidgets()) {
+                if (!w) continue;
+                if (*reinterpret_cast<uintptr_t*>(w) != westVt) continue;
+                void* curChan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(w) + 0x200);
+                if (!curChan) continue;
+                changeChannel(w, nullptr);
+                changeChannel(w, curChan);
+                rebound++;
+            }
+        }
+        fprintf(stderr, "[MC] MC_REBIND_WEST_FORM: rebound %d cWestProcessingForm instance(s)\n", rebound);
     }
 
     phase("Phase: move complete");
@@ -9694,6 +10022,187 @@ static void refreshVisiblePreampUIOnTargets(const QList<QObject*>& targets,
             targets.size(), preampForms, sourceAssignPanels, overviewForms,
             actions);
     QApplication::processEvents();
+}
+
+// Force-rebuild the preamp parameter linking for every input strip, bypassing
+// cChannelSelectorLite's "only-selected-strip" gating that leaves non-selected
+// West-form wrappers pointing at stale cAnalogueInput objects after a stereo
+// config change. Calls cSurfaceChannels::LinkInputPreAmp, which forwards to
+// cStripInputChannel::CreatePreAmpAssignments; that function reads the strip's
+// CURRENT source via cChannelMapperBase::GetActiveInputChannelSource, so the
+// (connection, source) args we pass here are only used as identifiers inside
+// the parameter-linking command and do NOT redirect the binding.
+static void refreshAllStripPreampBindings(const char* phaseTag) {
+    if (!envFlagEnabled("MC_REFRESH_ALL_STRIP_PREAMP")) {
+        return;
+    }
+    if (!g_surfaceChannels) {
+        // Same deep discovery used by runSelectorLitePreampExperiment
+        const uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
+        const uintptr_t surfaceChannelsVt = (uintptr_t)0x106ce5900 + g_slide + 0x10;
+        void* app = g_AppInstance ? g_AppInstance() : nullptr;
+        void* selectorContainer = nullptr;
+        void* selectorObj = nullptr;
+        if (app && findChildContainerForTargetVtable(app, selectorLiteVt,
+                                                     &selectorContainer, &selectorObj,
+                                                     0x2000, 0x800)) {
+            void* surfaceContainer = nullptr;
+            void* surfaceObj = nullptr;
+            if (findChildContainerForTargetVtable(selectorContainer, surfaceChannelsVt,
+                                                  &surfaceContainer, &surfaceObj,
+                                                  0x8000, 0x2000)) {
+                g_surfaceChannels = surfaceObj;
+                fprintf(stderr,
+                        "[MC] %srefresh-all-strip-preamp: discovered surfaceChannels=%p\n",
+                        phaseTag ? phaseTag : "", g_surfaceChannels);
+            }
+        }
+    }
+    if (!g_surfaceChannels) {
+        fprintf(stderr,
+                "[MC] %srefresh-all-strip-preamp: g_surfaceChannels null, skip\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+    typedef void (*fn_LinkInputPreAmp)(void* sc, uint8_t strip, int conn, uint8_t source);
+    auto linkInputPreAmp = (fn_LinkInputPreAmp)RESOLVE(0x10040d290);
+    if (!linkInputPreAmp) {
+        fprintf(stderr,
+                "[MC] %srefresh-all-strip-preamp: cSurfaceChannels::LinkInputPreAmp not resolved\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+    fprintf(stderr,
+            "[MC] %srefresh-all-strip-preamp: begin surfaceChannels=%p\n",
+            phaseTag ? phaseTag : "", g_surfaceChannels);
+    int nRefreshed = 0;
+    for (int ch = 0; ch < 128; ++ch) {
+        linkInputPreAmp(g_surfaceChannels, (uint8_t)ch, 0, (uint8_t)ch);
+        nRefreshed++;
+    }
+    fprintf(stderr,
+            "[MC] %srefresh-all-strip-preamp: rebuilt %d strips\n",
+            phaseTag ? phaseTag : "", nRefreshed);
+    QApplication::processEvents();
+}
+
+// Force-rebind every cWestProcessingForm's preamp parameter wrapper by
+// re-invoking cWestProcessingForm::ChangeChannel(form->currentChannel).
+// Root-cause fix for the stereo-move West UI leak: ChangeChannel caches the
+// preamp parameter binding via westForm->0xf0 vtable[0x10] using channel->0x54
+// as the strip key. That cache is only refreshed when ChangeChannel() runs.
+// After a stereo moveChannel some strips never get their per-strip
+// ChannelChanged signal re-fired, leaving a stale binding that write-throughs
+// to a neighbor cAnalogueInput. We walk QApplication::allWidgets(), match by
+// cWestProcessingForm vtable, and re-invoke ChangeChannel on each.
+static void refreshAllWestForms(const char* phaseTag) {
+    if (!envFlagEnabled("MC_REFRESH_WEST_FORMS")) {
+        return;
+    }
+    const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
+    typedef void (*fn_ChangeChannel)(void* form, void* channel);
+    auto changeChannel = (fn_ChangeChannel)RESOLVE(0x100d69350);
+    if (!changeChannel) {
+        fprintf(stderr,
+                "[MC] %srefresh-west-forms: ChangeChannel not resolved\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+    int nMatched = 0, nRebound = 0, nSkipped = 0;
+    QWidgetList widgets = QApplication::allWidgets();
+    for (QWidget* w : widgets) {
+        if (!w) continue;
+        uintptr_t vt = *reinterpret_cast<uintptr_t*>(w);
+        if (vt != westVt) continue;
+        nMatched++;
+        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(w) + 0x200);
+        if (!chan) { nSkipped++; continue; }
+        changeChannel(w, chan);
+        nRebound++;
+    }
+    fprintf(stderr,
+            "[MC] %srefresh-west-forms: matched=%d rebound=%d skipped=%d\n",
+            phaseTag ? phaseTag : "", nMatched, nRebound, nSkipped);
+    QApplication::processEvents();
+}
+
+// Diagnostic: dump all widgets whose Qt class name contains preamp/gain-related
+// keywords, along with vtable, objectName, geometry, parent chain, and the
+// first 0x100 bytes interpreted as pointers. Goal: find the knob widget whose
+// binding is misbound post-stereo-move and identify its owning class.
+static void dumpWestWidgets(const char* phaseTag) {
+    if (!envFlagEnabled("MC_DUMP_WEST_WIDGETS")) return;
+    const char* tag = phaseTag ? phaseTag : "";
+    QWidgetList widgets = QApplication::allWidgets();
+    int nDumped = 0;
+    for (QWidget* w : widgets) {
+        if (!w) continue;
+        const QMetaObject* mo = w->metaObject();
+        if (!mo) continue;
+        const char* cls = mo->className();
+        if (!cls) continue;
+        QString clsQ = QString::fromUtf8(cls);
+        if (!(clsQ.contains("Preamp", Qt::CaseInsensitive) ||
+              clsQ.contains("Gain",   Qt::CaseInsensitive) ||
+              clsQ.contains("Rotary", Qt::CaseInsensitive) ||
+              clsQ.contains("West",   Qt::CaseInsensitive) ||
+              clsQ.contains("Continuous", Qt::CaseInsensitive))) continue;
+        uintptr_t vt = *reinterpret_cast<uintptr_t*>(w);
+        uintptr_t vtRel = vt > g_slide ? (vt - g_slide) : vt;
+        QRect g = w->geometry();
+        QPoint gp = w->mapToGlobal(QPoint(0,0));
+        QString oname = w->objectName();
+        // Build parent chain (up to 6 levels)
+        QStringList parents;
+        QObject* p = w->parent();
+        for (int i = 0; i < 6 && p; ++i) {
+            const QMetaObject* pmo = p->metaObject();
+            parents << (pmo ? QString::fromUtf8(pmo->className()) : "?");
+            p = p->parent();
+        }
+        fprintf(stderr,
+                "[MC] %sdump-west: w=%p cls=%s vt=0x%lx oname='%s' geom=%dx%d@(%d,%d) global=(%d,%d) parents=[%s]\n",
+                tag, (void*)w, cls, (unsigned long)vtRel,
+                oname.toUtf8().constData(),
+                g.width(), g.height(), g.x(), g.y(), gp.x(), gp.y(),
+                parents.join(" > ").toUtf8().constData());
+        nDumped++;
+        if (nDumped > 200) {
+            fprintf(stderr, "[MC] %sdump-west: truncated after 40 widgets\n", tag);
+            break;
+        }
+    }
+    fprintf(stderr, "[MC] %sdump-west: total matching widgets=%d\n", tag, nDumped);
+}
+
+// Diagnostic: dump cChannel fields used by cChannel::GetInputSource() to
+// locate which field goes stale post-stereo-move. GetInputSource computes:
+//   idx = ch->0x75 + ch->0x54 - 1
+//   rcx = ch->0x60
+//   source = *(int32_t*)(rcx + 0x90 + idx*4)
+//   cAudioSendPoint* = *(start+0x20) where start = GetInputChannelStart(source)
+static void dumpChannelSourceFields(const char* phaseTag) {
+    if (!envFlagEnabled("MC_DUMP_CHAN_FIELDS")) return;
+    const char* tag = phaseTag ? phaseTag : "";
+    // Dump a wider window of each input's DM field record so we can spot the
+    // cChannel pointer (likely one of the first few pointer-sized fields),
+    // and also its channel number location.
+    for (int ch = 0; ch < 32; ++ch) {
+        void* c = getInputChannel(ch);
+        if (!c) continue;
+        uint8_t* b = reinterpret_cast<uint8_t*>(c);
+        fprintf(stderr, "[MC] %sdumpchan ch=%2d rec=%p bytes[0x40..0x80]:", tag, ch, c);
+        for (int off = 0x40; off < 0x80; ++off) {
+            fprintf(stderr, " %02x", b[off]);
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[MC] %s  ptrs:", tag);
+        for (int i = 0; i < 16; ++i) {
+            void* p = *reinterpret_cast<void**>(b + i*8);
+            fprintf(stderr, " [%d]=%p", i, p);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 static void refreshVisiblePreampUI(const char* phaseTag) {
@@ -12345,11 +12854,122 @@ static void showMoveDialog() {
     auto* btnLayout = new QHBoxLayout();
     auto* moveBtn = new QPushButton("Move");
     auto* reorderBtn = new QPushButton("Reorder...");
+    auto* probeBtn = new QPushButton("Probe West Form");
     auto* closeBtn = new QPushButton("Close");
     btnLayout->addWidget(moveBtn);
     btnLayout->addWidget(reorderBtn);
+    btnLayout->addWidget(probeBtn);
     btnLayout->addWidget(closeBtn);
     layout->addLayout(btnLayout);
+
+    QObject::connect(probeBtn, &QPushButton::clicked, [=]() {
+        // Find the single cWestProcessingForm, read form->0x200 (cChannel*),
+        // call cChannel::GetInputSource, cAudioSendPoint::GetParentType, and
+        // cSocketProxyManager::GetProxy to see what pointer chain is live.
+        const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
+        typedef void* (*fn_GetInputSource)(void* ch);
+        typedef int   (*fn_GetParentType)(void* sendPoint);
+        typedef void* (*fn_GetProxy)(void* mgr, void* parent);
+        auto getInputSource = (fn_GetInputSource)RESOLVE(0x1006d8130);
+        auto getParentType  = (fn_GetParentType) RESOLVE(0x10040d2f0); // placeholder, resolved below
+        auto getProxy       = (fn_GetProxy)      RESOLVE(0x100738720);
+        // Resolve cAudioSendPoint::GetParentType by symbol-search via nm at build time is unavailable;
+        // fall back: many builds keep it at a fixed offset. We'll just log the raw send-point ptr
+        // and its first 8 bytes (vtable), plus a few fields, and let user decode offline.
+        (void)getParentType;
+
+        void* westForm = nullptr;
+        for (QWidget* w : QApplication::allWidgets()) {
+            if (!w) continue;
+            if (*reinterpret_cast<uintptr_t*>(w) == westVt) { westForm = w; break; }
+        }
+        if (!westForm) {
+            fprintf(stderr, "[MC] probe: cWestProcessingForm not found in widgets\n");
+            statusLabel->setText("Probe: West form not found");
+            return;
+        }
+        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(westForm) + 0x200);
+        fprintf(stderr, "[MC] probe: westForm=%p chan=%p\n", westForm, chan);
+        if (!chan) {
+            statusLabel->setText("Probe: no channel selected on West form");
+            return;
+        }
+        // Dump channel first 0x80 bytes as ptrs + some byte offsets
+        uint8_t* cb = reinterpret_cast<uint8_t*>(chan);
+        fprintf(stderr, "[MC] probe: chan ptrs[0..15]:");
+        for (int i = 0; i < 16; ++i) {
+            fprintf(stderr, " [%d]=%p", i, *reinterpret_cast<void**>(cb + i*8));
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[MC] probe: chan bytes 0x40..0x80:");
+        for (int off = 0x40; off < 0x80; ++off) fprintf(stderr, " %02x", cb[off]);
+        fprintf(stderr, "\n");
+
+        if (!getInputSource) {
+            statusLabel->setText("Probe: GetInputSource unresolved");
+            return;
+        }
+        void* sendPoint = getInputSource(chan);
+        fprintf(stderr, "[MC] probe: GetInputSource -> sendPoint=%p\n", sendPoint);
+        if (sendPoint) {
+            uint8_t* sb = reinterpret_cast<uint8_t*>(sendPoint);
+            void* spVt = *reinterpret_cast<void**>(sb);
+            uintptr_t spVtRel = (uintptr_t)spVt > g_slide ? (uintptr_t)spVt - g_slide : (uintptr_t)spVt;
+            fprintf(stderr, "[MC] probe: sendPoint vt=0x%lx first ptrs:", (unsigned long)spVtRel);
+            for (int i = 0; i < 12; ++i) {
+                fprintf(stderr, " [%d]=%p", i, *reinterpret_cast<void**>(sb + i*8));
+            }
+            fprintf(stderr, "\n");
+            void* parent = *reinterpret_cast<void**>(sb + 0x30); // from ShowWidgets disasm
+            fprintf(stderr, "[MC] probe: sendPoint->0x30 (parent?)=%p\n", parent);
+            if (getProxy && parent) {
+                void* mgrHolder = g_uiManagerHolder;
+                void* mgr = mgrHolder ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mgrHolder) + 0x118) : nullptr;
+                fprintf(stderr, "[MC] probe: uiMgrHolder=%p socketProxyMgr=%p\n", mgrHolder, mgr);
+                if (mgr) {
+                    void* proxy = getProxy(mgr, parent);
+                    fprintf(stderr, "[MC] probe: GetProxy(parent)=%p\n", proxy);
+                    if (proxy) {
+                        uint8_t* pb = reinterpret_cast<uint8_t*>(proxy);
+                        fprintf(stderr, "[MC] probe: proxy ptrs[0..8]:");
+                        for (int i = 0; i < 8; ++i) {
+                            fprintf(stderr, " [%d]=%p", i, *reinterpret_cast<void**>(pb + i*8));
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+
+        // Dump the per-channel source-state table at chan+0x60.
+        // cChannel::GetInputSource reads: src = *(int32_t*)(table + 0x90 + (table_stereo_off + chan_num - 1)*4)
+        // We don't know the exact row stride / layout, so dump a broad range of int32s
+        // so we can eyeball which entry corresponds to each channel number.
+        void* table = *reinterpret_cast<void**>(cb + 0x60);
+        fprintf(stderr, "[MC] probe: chan+0x60 table=%p chan[0x54]=0x%02x chan[0x75]=0x%02x\n",
+                table, cb[0x54], cb[0x75]);
+        if (table) {
+            uint8_t* tb = reinterpret_cast<uint8_t*>(table);
+            // Dump int32s from table+0x90 for 128 entries (512 bytes)
+            fprintf(stderr, "[MC] probe: table+0x90 int32[0..127]:\n");
+            for (int row = 0; row < 8; ++row) {
+                fprintf(stderr, "[MC] probe:   [%3d]", row*16);
+                for (int i = 0; i < 16; ++i) {
+                    int32_t v = *reinterpret_cast<int32_t*>(tb + 0x90 + (row*16 + i) * 4);
+                    fprintf(stderr, " %08x", (uint32_t)v);
+                }
+                fprintf(stderr, "\n");
+            }
+            // Also dump a wider raw byte window in case stride isn't 4
+            fprintf(stderr, "[MC] probe: table bytes 0x80..0x200:\n");
+            for (int row = 0; row < 24; ++row) {
+                fprintf(stderr, "[MC] probe:   +0x%03x", 0x80 + row*16);
+                for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", tb[0x80 + row*16 + i]);
+                fprintf(stderr, "\n");
+            }
+        }
+        statusLabel->setText("Probe: see movechannel.log");
+    });
 
     auto updateMoveUi = [=]() {
         updateStereoLabels();
