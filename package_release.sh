@@ -157,6 +157,8 @@ fi
 display dialog "This helper will do 2 things:\n\n1. Remove quarantine from this patch folder\n2. Re-sign your local dLive Director app with an ad-hoc signature so the community patch can be injected on Macs that block the stock signed app\n\nApp to modify:\n$APP_BUNDLE\n\nThis changes the code signature of your local Director install. If you want to undo it later, reinstall Director.\n\nmacOS may ask for an administrator password.\n\nContinue?" buttons {"Cancel", "Continue"} default button "Continue" with icon caution
 OSA
 
+/usr/bin/xattr -dr com.apple.quarantine "$DIR" >/dev/null 2>&1 || true
+
 TMP_SCRIPT="$(mktemp /tmp/dlive-prepare-director.XXXXXX.sh)"
 cleanup() {
   rm -f "$TMP_SCRIPT"
@@ -166,7 +168,6 @@ trap cleanup EXIT
 cat >"$TMP_SCRIPT" <<EOS
 #!/bin/bash
 set -euo pipefail
-/usr/bin/xattr -dr com.apple.quarantine "$DIR" || true
 /usr/bin/xattr -dr com.apple.quarantine "$APP_BUNDLE" || true
 /usr/bin/codesign --force --deep --sign - "$APP_BUNDLE"
 EOS
