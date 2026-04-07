@@ -227,6 +227,8 @@ How to run
 4. If Finder still warns later, use the same right-click `Open` flow again.
 5. If Director starts but the patch does not load on this Mac, run:
    `Prepare Director For Patch.command`
+   If macOS blocks that helper on first open, go to System Settings -> Privacy & Security
+   and press Open Anyway for the blocked helper, then run it again.
 6. If both supported Director versions are installed, the launcher will ask which one to start.
 
 Alternative launchers
@@ -238,6 +240,8 @@ If macOS blocks the app
 
 If Director opens but the patch still does not load
 - Run `Prepare Director For Patch.command`
+- If macOS blocks that helper, go to `System Settings -> Privacy & Security`
+- Press `Open Anyway` for the blocked helper, then run it again
 - This helper re-signs your local Director app with an ad-hoc signature
 - It is an opt-in workaround for Macs that refuse third-party dylib injection into the stock signed app
 - If you want to undo it later, reinstall Director

@@ -44,6 +44,8 @@ For most users, use the packaged build in [`dist/`](./dist):
 4. Later launches should be simpler, but if macOS still blocks the app, use the same right-click `Open` flow again.
 5. If Director opens but the patch still does not load on that Mac, run:
    `Prepare Director For Patch.command`
+   If macOS blocks that helper on first open, go to `System Settings -> Privacy & Security`
+   and press `Open Anyway` for the blocked helper, then run it again.
 
 `Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder, opens Terminal, and runs the required `sudo` commands to re-sign the user's local `dLive Director` app with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
 

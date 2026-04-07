@@ -11,6 +11,8 @@
 5. If macOS still blocks the launcher later, use the same right-click `Open` action again.
 6. If Director starts but the patch still does not load, run:
    `Prepare Director For Patch.command`
+   If macOS blocks that helper, open `System Settings -> Privacy & Security`,
+   find the blocked helper entry, and press `Open Anyway`.
 7. If both supported Director versions are installed, the launcher will ask which one to start.
 
 ## If The App Path Is Different
