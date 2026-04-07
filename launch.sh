@@ -3,7 +3,11 @@ set -u -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_APP="/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
-APP="${DLIVE_APP:-$DEFAULT_APP}"
+SUPPORTED_APPS=(
+  "/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11"
+  "/Applications/dLive Director V2.12.app/Contents/MacOS/dLive Director V2.12"
+)
+APP=""
 LOG="$DIR/movechannel.log"
 SHOW_LOG="${MC_SHOW_LOG:-0}"
 LOG_LEVEL="${MC_LOG_LEVEL:-1}"
@@ -12,8 +16,129 @@ TAIL_PID=""
 BASE_TMPDIR="${TMPDIR%/}"
 RUN_TMPDIR=""
 SAVED_STATE_DIR="$HOME/Library/Saved Application State/com.allen-heath.dLive.Director.savedState"
-DIRECTOR_TMP_DIR="$HOME/Library/Application Support/AllenAndHeath/AllenHeath/TLDV2.11/TLDData/Director/Tmp/TempShow"
+DIRECTOR_TMP_DIR=""
 BOOST_WAVES_DIR="/private/tmp/boost_waves_interprocess"
+
+director_version_for_app() {
+  local app_path="$1"
+  local app_name
+  app_name="$(basename "$app_path")"
+  if [[ "$app_name" =~ V([0-9]+\.[0-9]+)$ ]]; then
+    printf 'V%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  local bundle_name
+  bundle_name="$(basename "$(dirname "$(dirname "$app_path")")")"
+  if [[ "$bundle_name" =~ V([0-9]+\.[0-9]+)\.app$ ]]; then
+    printf 'V%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+director_tmp_dir_for_app() {
+  local app_path="$1"
+  local version
+  if ! version="$(director_version_for_app "$app_path")"; then
+    return 1
+  fi
+
+  printf '%s\n' "$HOME/Library/Application Support/AllenAndHeath/AllenHeath/TLD${version}/TLDData/Director/Tmp/TempShow"
+}
+
+pick_supported_app() {
+  local discovered=()
+  local labels=()
+
+  for candidate in "${SUPPORTED_APPS[@]}"; do
+    if [[ -x "$candidate" ]]; then
+      discovered+=("$candidate")
+      if version="$(director_version_for_app "$candidate")"; then
+        labels+=("$version")
+      else
+        labels+=("$(basename "$candidate")")
+      fi
+    fi
+  done
+
+  if (( ${#discovered[@]} == 0 )); then
+    APP="$DEFAULT_APP"
+    return 0
+  fi
+
+  if (( ${#discovered[@]} == 1 )); then
+    APP="${discovered[0]}"
+    return 0
+  fi
+
+  if [[ -n "${MC_SKIP_VERSION_PICKER:-}" ]]; then
+    APP="${discovered[0]}"
+    return 0
+  fi
+
+  if command -v osascript >/dev/null 2>&1; then
+    local apple_list=""
+    local i
+    for (( i=0; i<${#labels[@]}; i++ )); do
+      if (( i > 0 )); then
+        apple_list+=", "
+      fi
+      apple_list+="\"${labels[i]}\""
+    done
+
+    local selected=""
+    selected="$(osascript <<EOF 2>/dev/null
+set choices to {${apple_list}}
+set picked to choose from list choices with title "dLive Patch" with prompt "Choose which supported dLive Director version to launch with the patch:" default items {(item 1 of choices)} OK button name "Launch" cancel button name "Cancel"
+if picked is false then
+  return ""
+end if
+return item 1 of picked
+EOF
+)"
+    if [[ -z "$selected" ]]; then
+      echo "[launch] Launch cancelled."
+      exit 1
+    fi
+
+    for (( i=0; i<${#labels[@]}; i++ )); do
+      if [[ "${labels[i]}" == "$selected" ]]; then
+        APP="${discovered[i]}"
+        return 0
+      fi
+    done
+  fi
+
+  echo "[launch] Multiple supported Director versions were found:"
+  local i
+  for (( i=0; i<${#discovered[@]}; i++ )); do
+    echo "[launch]   $((i + 1)). ${labels[i]} -> ${discovered[i]}"
+  done
+  echo -n "[launch] Select version [1-${#discovered[@]}]: "
+  local selection=""
+  read -r selection
+  if [[ ! "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#discovered[@]} )); then
+    echo "[launch] Invalid selection."
+    exit 1
+  fi
+  APP="${discovered[selection - 1]}"
+}
+
+if [[ -n "${DLIVE_APP:-}" ]]; then
+  APP="$DLIVE_APP"
+else
+  pick_supported_app
+fi
+
+if [[ -z "$APP" ]]; then
+  APP="$DEFAULT_APP"
+fi
+
+if ! DIRECTOR_TMP_DIR="$(director_tmp_dir_for_app "$APP")"; then
+  DIRECTOR_TMP_DIR="$HOME/Library/Application Support/AllenAndHeath/AllenHeath/TLDV2.11/TLDData/Director/Tmp/TempShow"
+fi
 
 running_director_pids() {
   ps -axo pid=,stat=,command= \

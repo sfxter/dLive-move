@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST_DIR="$ROOT/dist"
-PKG_NAME="dLive-move-patch"
+PKG_NAME="dLive-move-patch-beta"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$DIST_DIR/$PKG_NAME-$STAMP"
 ZIP_PATH="$DIST_DIR/$PKG_NAME-$STAMP.zip"
@@ -12,6 +12,30 @@ LATEST_ZIP="$DIST_DIR/$PKG_NAME-latest.zip"
 DEFAULT_SIGN_ID="Developer ID Application: KAZYS RISKUS (X8345YNH39)"
 SIGN_ID="${SIGN_ID:-$DEFAULT_SIGN_ID}"
 
+pick_sign_mode() {
+  if [[ "${SIGN_ID:-}" == "-" ]]; then
+    echo "adhoc"
+    return 0
+  fi
+
+  if security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$SIGN_ID"; then
+    echo "developer_id"
+    return 0
+  fi
+
+  echo "adhoc"
+}
+
+codesign_file() {
+  local target="$1"
+  local mode="$2"
+  if [[ "$mode" == "developer_id" ]]; then
+    codesign --force --sign "$SIGN_ID" --timestamp "$target"
+  else
+    codesign --force --sign - "$target"
+  fi
+}
+
 mkdir -p "$OUT_DIR"
 
 echo "[package] Building plugin"
@@ -19,7 +43,9 @@ make -C "$ROOT"
 
 echo "[package] Generating app icon"
 if "$ROOT/tools/generate_app_icon.py" >/dev/null 2>&1; then
-  /usr/bin/iconutil -c icns "$ROOT/assets/StartPatcheddLive.iconset" -o "$ROOT/assets/StartPatcheddLive.icns"
+  if ! /usr/bin/iconutil -c icns "$ROOT/assets/StartPatcheddLive.iconset" -o "$ROOT/assets/StartPatcheddLive.icns"; then
+    echo "[package] (iconutil failed; using existing $ROOT/assets/StartPatcheddLive.icns)"
+  fi
 else
   echo "[package] (skipping icon regeneration; using existing $ROOT/assets/StartPatcheddLive.icns)"
 fi
@@ -56,12 +82,73 @@ cat >"$OUT_DIR/Prepare Director For Patch.command" <<'EOF'
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_APP_BUNDLE="/Applications/dLive Director V2.11.app"
-APP_BUNDLE="${DLIVE_APP_BUNDLE:-$DEFAULT_APP_BUNDLE}"
+SUPPORTED_BUNDLES=(
+  "/Applications/dLive Director V2.11.app"
+  "/Applications/dLive Director V2.12.app"
+)
+
+pick_app_bundle() {
+  local discovered=()
+  local labels=()
+  local bundle
+
+  for bundle in "${SUPPORTED_BUNDLES[@]}"; do
+    if [[ -d "$bundle" ]]; then
+      discovered+=("$bundle")
+      labels+=("$(basename "$bundle" .app)")
+    fi
+  done
+
+  if (( ${#discovered[@]} == 0 )); then
+    return 1
+  fi
+
+  if (( ${#discovered[@]} == 1 )); then
+    printf '%s\n' "${discovered[0]}"
+    return 0
+  fi
+
+  if command -v osascript >/dev/null 2>&1; then
+    local apple_list=""
+    local i
+    for (( i=0; i<${#labels[@]}; i++ )); do
+      if (( i > 0 )); then
+        apple_list+=", "
+      fi
+      apple_list+="\"${labels[i]}\""
+    done
+
+    local selected=""
+    selected="$(osascript <<OSA 2>/dev/null
+set choices to {${apple_list}}
+set picked to choose from list choices with title "Prepare Director For Patch" with prompt "Choose which supported dLive Director app to re-sign for the patch:" default items {(item 1 of choices)} OK button name "Continue" cancel button name "Cancel"
+if picked is false then
+  return ""
+end if
+return item 1 of picked
+OSA
+)"
+    if [[ -n "$selected" ]]; then
+      for (( i=0; i<${#labels[@]}; i++ )); do
+        if [[ "${labels[i]}" == "$selected" ]]; then
+          printf '%s\n' "${discovered[i]}"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  printf '%s\n' "${discovered[0]}"
+}
+
+APP_BUNDLE="${DLIVE_APP_BUNDLE:-}"
+if [[ -z "$APP_BUNDLE" ]]; then
+  APP_BUNDLE="$(pick_app_bundle || true)"
+fi
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
   /usr/bin/osascript <<OSA
-display dialog "Could not find dLive Director at:\n\n$APP_BUNDLE\n\nIf your app is installed somewhere else, run this command from Terminal with:\nDLIVE_APP_BUNDLE=\"/path/to/dLive Director V2.11.app\" ./Prepare Director For Patch.command" buttons {"OK"} default button "OK" with icon caution
+display dialog "Could not find a supported dLive Director app to prepare.\n\nIf your app is installed somewhere else, run this command from Terminal with:\nDLIVE_APP_BUNDLE=\"/path/to/dLive Director V2.11.app\" ./Prepare Director For Patch.command\n\nor\n\nDLIVE_APP_BUNDLE=\"/path/to/dLive Director V2.12.app\" ./Prepare Director For Patch.command" buttons {"OK"} default button "OK" with icon caution
 OSA
   exit 1
 fi
@@ -80,8 +167,8 @@ OSA
 EOF
 
 cat >"$OUT_DIR/README.txt" <<'EOF'
-dLive Move Patch
-================
+dLive Move Patch BETA
+=====================
 
 What is included
 - libmovechannel.dylib
@@ -92,7 +179,7 @@ What is included
 - Prepare Director For Patch.command
 
 What the target Mac needs
-- dLive Director V2.11.app, or another compatible Director app build
+- dLive Director V2.11.app or dLive Director V2.12.app
 - No LLDB is needed at runtime
 - No Homebrew Qt is needed at runtime
 
@@ -114,6 +201,7 @@ How to run
 4. If Finder still warns later, use the same right-click `Open` flow again.
 5. If Director starts but the patch does not load on this Mac, run:
    `Prepare Director For Patch.command`
+6. If both supported Director versions are installed, the launcher will ask which one to start.
 
 Alternative launchers
 - Double-click `Start Patched dLive.command`
@@ -134,12 +222,18 @@ Changing the app path
 Alternative app path
 - You can override the app path without editing the script:
   DLIVE_APP="/Applications/dLive Director V2.11.app/Contents/MacOS/dLive Director V2.11" ./_launch_internal.sh
+  or
+  DLIVE_APP="/Applications/dLive Director V2.12.app/Contents/MacOS/dLive Director V2.12" ./_launch_internal.sh
 
 If macOS blocks the files
 - Remove quarantine from the extracted folder:
   xattr -dr com.apple.quarantine .
 
 Notes
+- Beta release
+- Adds support for dLive Director V2.12
+- Tested offline; to be tested online
+- Fixed mix copy/paste with Cmd+C / Cmd+V
 - The launcher app and plugin are Developer ID signed during packaging.
 - This package is not notarized.
 - If the target Mac has a different Director app name/path, update DLIVE_APP.
@@ -206,10 +300,15 @@ cp "$OUT_DIR/_launch_internal.sh" "$APP_RES_DIR/_launch_internal.sh"
 cp "$ROOT/assets/StartPatcheddLive.icns" "$APP_RES_DIR/AppIcon.icns"
 chmod +x "$APP_RES_DIR/_launch_internal.sh"
 
-echo "[package] Signing with Developer ID: $SIGN_ID"
-codesign --force --sign "$SIGN_ID" --timestamp "$APP_RES_DIR/libmovechannel.dylib"
-codesign --force --sign "$SIGN_ID" --timestamp "$OUT_DIR/libmovechannel.dylib"
-codesign --force --sign "$SIGN_ID" --timestamp "$OUT_DIR/Start Patched dLive.app"
+SIGN_MODE="$(pick_sign_mode)"
+if [[ "$SIGN_MODE" == "developer_id" ]]; then
+  echo "[package] Signing with Developer ID: $SIGN_ID"
+else
+  echo "[package] Developer ID identity not available; using ad-hoc signing"
+fi
+codesign_file "$APP_RES_DIR/libmovechannel.dylib" "$SIGN_MODE"
+codesign_file "$OUT_DIR/libmovechannel.dylib" "$SIGN_MODE"
+codesign_file "$OUT_DIR/Start Patched dLive.app" "$SIGN_MODE"
 
 echo "[package] Creating zip: $ZIP_PATH"
 rm -f "$ZIP_PATH"

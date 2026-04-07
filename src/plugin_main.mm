@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
@@ -100,9 +101,413 @@ static bool safeReadValue(const void* addr, T* out) {
 // Image slide resolution
 // =============================================================================
 static intptr_t g_slide = 0;
+static const mach_header_64* g_directorImageHeader = nullptr;
+static const char* g_directorImagePath = nullptr;
 static const char* kMoveChannelLogPath = "/Users/sfx/Programavimas/dLive-patch/movechannel.log";
 struct sAudioSource;
 struct PreampData;
+
+enum class DirectorVersion {
+    Unknown,
+    V211,
+    V212,
+};
+
+struct BinaryLayout {
+    DirectorVersion version;
+    const char* label;
+
+    // Auto-generated function/vtable fields.
+#define MC_BINARY_LAYOUT_ENTRY(name, v211, v212) uintptr_t name;
+#include "generated_binary_layout_entries.inc"
+#undef MC_BINARY_LAYOUT_ENTRY
+
+    // Manual function anchors not yet covered by the generated pass.
+    uintptr_t fn_c_surface_channels_get_channel_e_channel_strip_type_unsigned_char;
+    uintptr_t fn_c_multifunction_channel_interface_get_selected_channel_int_const;
+    uintptr_t fn_c_discovery_object_base_find_object;
+    uintptr_t fn_hidden_merge_task_lists;
+
+    // Manual offset/layout fields. These remain hand-validated until offset
+    // generation/verification is added to the porting workflow.
+    uintptr_t off_channelMapper_selectorManager;
+    uintptr_t off_selectorManager_selectors_base;
+    uintptr_t off_selectorManager_selected_ids_base;
+    uintptr_t off_uiholder_audio_srp_manager;
+    uintptr_t off_uiholder_dyn_rack;
+    uintptr_t off_uiholder_channel_manager;
+    uintptr_t off_uiholder_library_manager_client;
+    uintptr_t off_app_drbox;
+    uintptr_t off_drbox_audio_core;
+    uintptr_t off_audio_core_input_mixer_wrapper;
+    uintptr_t off_audio_core_preamp_manager;
+    uintptr_t off_registry_router_table;
+    uintptr_t off_registry_entry_key58;
+    uintptr_t off_registry_entry_obj_id;
+    uintptr_t off_registry_entry_handle;
+    uintptr_t off_registry_entry_gain_ptr;
+    uintptr_t off_analogue_input_gain_ptr;
+    uintptr_t off_analogue_input_pad_ptr;
+    uintptr_t off_analogue_input_phantom_ptr;
+    uintptr_t off_audio_dm_input_mixer_driver;
+    uintptr_t off_audio_dm_controller;
+    uintptr_t off_audio_srp_manager_first_send_point;
+    uintptr_t off_audio_srp_manager_first_receive_point;
+    uintptr_t off_input_channel_processing_driver_array;
+    uintptr_t off_input_mixer_wrapper_group_mixer_array;
+    uintptr_t off_input_mixer_attrs;
+    uintptr_t off_insert_driver_object;
+    uintptr_t off_insert_object_in_enabled;
+    uintptr_t off_insert_intermediate_bypass;
+    uintptr_t off_uiholder_selected_channel_ptr;
+    uintptr_t off_channel_channel_number;
+    uintptr_t off_channel_strip_type;
+    uintptr_t off_west_form_current_channel;
+    uintptr_t off_stagebox_surface_name;
+    uintptr_t off_stagebox_input_config;
+    uintptr_t off_netobj_embedded_msg;
+    uintptr_t off_netobj_hdr10;
+    uintptr_t off_netobj_hdr14;
+    uintptr_t off_netobj_opcode;
+    uintptr_t off_analogue_input_type_marker;
+    uintptr_t off_uiholder_socket_proxy_manager;
+    uintptr_t off_send_point_parent;
+    uintptr_t off_sidechain_strip_type_ptr;
+    uintptr_t off_sidechain_channel_ptr;
+    uintptr_t off_stereo_image_width_ptr;
+    uintptr_t off_stereo_image_mode_ptr;
+    uintptr_t off_sidechain_cached_strip_type;
+    uintptr_t off_sidechain_cached_channel;
+    uintptr_t off_sidechain_dirty_flag;
+    uintptr_t off_preamp_manager_option_byte_array;
+    uintptr_t off_socket_proxy_socket_enum;
+    uintptr_t off_uiholder_probe_subsystem;
+    uintptr_t off_uiholder_probe_channel_table;
+    uintptr_t off_dyn_obj_key;
+    uintptr_t off_dyn_obj_system;
+    uintptr_t off_dyn_obj_data;
+    uintptr_t off_dyn_obj_raw_block;
+    uintptr_t off_dyn_system_dirty_flag;
+    uintptr_t off_dyn_unit_client_key;
+    uintptr_t off_west_form_gain_rotary;
+    uintptr_t off_west_form_gain_text;
+    uintptr_t off_west_form_pad_exponent;
+    uintptr_t off_west_form_trim_rotary;
+    uintptr_t off_west_form_trim_text;
+    uintptr_t off_west_form_dynamic_assign;
+    uintptr_t off_west_form_preamp_model_watcher;
+    uintptr_t off_west_form_socket_status_watcher;
+    uintptr_t off_west_form_on_surface_watcher;
+    uintptr_t off_wrapper_kind;
+    uintptr_t off_wrapper_ptr18;
+    uintptr_t off_wrapper_ptr20;
+    uintptr_t off_wrapper_linked_audio_obj;
+    uintptr_t off_wrapper_range_lower;
+    uintptr_t off_wrapper_range_upper;
+    uintptr_t off_linked_audio_controller_value;
+    uintptr_t off_linked_audio_controller_touched;
+    uintptr_t off_linked_audio_controller_driver;
+    uintptr_t off_linked_audio_controller_name_ptr;
+    uintptr_t off_selector_lite_ptr_a8;
+    uintptr_t off_selector_lite_ptr_150;
+    uintptr_t off_selector_lite_ptr_158;
+    uintptr_t off_selector_lite_ptr_160;
+    uintptr_t off_selector_lite_ptr_168;
+    uintptr_t off_selector_lite_u32_17c;
+    uintptr_t off_selector_lite_u32_180;
+    uintptr_t off_selector_lite_u32_184;
+    uintptr_t off_selector_lite_u32_188;
+    uintptr_t off_selector_lite_u32_18c;
+    uintptr_t off_input_mixer_driver_wrapper;
+    uintptr_t off_channel_mapper_usbdriver_mapper;
+    uintptr_t off_q_list_data_begin;
+    uintptr_t off_q_list_data_end;
+    uintptr_t off_q_list_data_array_base;
+    uintptr_t off_insert_return_connected_send_point;
+    uintptr_t off_audio_controller_system_slot_60;
+    uintptr_t off_audio_controller_system_slot_68;
+    uintptr_t off_audio_controller_system_slot_70;
+    uintptr_t off_input_mixer_wrapper_first_mixer;
+    uintptr_t off_gang_driver_strip_type;
+    uintptr_t off_gang_driver_members;
+    uintptr_t off_gang_driver_attrs;
+    uintptr_t off_digital_trim_gain_ptr;
+};
+
+static const BinaryLayout g_binaryLayoutV211 = {
+    DirectorVersion::V211,
+    "v2.11",
+#define MC_BINARY_LAYOUT_ENTRY(name, v211, v212) v211,
+#include "generated_binary_layout_entries.inc"
+#undef MC_BINARY_LAYOUT_ENTRY
+    0x10048ea90,
+    0x101098470,
+    0x10059caf0,
+    0x10069cd60,
+    0xd360,
+    0xa0,
+    0xe0,
+    0x20,
+    0x40,
+    0x78,
+    0x98,
+    0xb8,
+    0x48,
+    0xa8,
+    0x22b20,
+    0x3a9820,
+    0x58,
+    0x70,
+    0x74,
+    0x98,
+    0x98,
+    0xa0,
+    0xa8,
+    0x7A8,
+    0xb0,
+    0x350,
+    0x358,
+    0x28,
+    0x90,
+    0x200,
+    0x8,
+    0x88,
+    0x81,
+    0x50,
+    0x100,
+    0x104,
+    0x200,
+    0x99,
+    0x21e,
+    0x60,
+    0x70,
+    0x74,
+    0x7c,
+    0x84,
+    0x118,
+    0x30,
+    0x138,
+    0x140,
+    0xa0,
+    0xa8,
+    0x168,
+    0x16c,
+    0x174,
+    0x88,
+    0x28,
+    0x28,
+    0x90,
+    0x88,
+    0x90,
+    0x98,
+    0xa0,
+    0xca9,
+    0x68,
+    0xc8,
+    0xd0,
+    0xe8,
+    0xf8,
+    0x100,
+    0x128,
+    0x140,
+    0x160,
+    0x190,
+    0x10,
+    0x18,
+    0x20,
+    0x8,
+    0x10,
+    0x12,
+    0x80,
+    0x82,
+    0x88,
+    0x8,
+    0xa8,
+    0x150,
+    0x158,
+    0x160,
+    0x168,
+    0x17c,
+    0x180,
+    0x184,
+    0x188,
+    0x18c,
+    0x8,
+    0x20,
+    0x8,
+    0xc,
+    0x10,
+    0x20,
+    0x60,
+    0x68,
+    0x70,
+    0x90,
+    0x94,
+    0x98,
+    0xa8,
+    0x98,
+};
+
+static const BinaryLayout g_binaryLayoutV212 = {
+    DirectorVersion::V212,
+    "v2.12",
+#define MC_BINARY_LAYOUT_ENTRY(name, v211, v212) v212,
+#include "generated_binary_layout_entries.inc"
+#undef MC_BINARY_LAYOUT_ENTRY
+    0x100499dc0,
+    0x1010a79f0,
+    0x1005a7d70,
+    0x1006a8000,
+    0xd360, // TODO(v2.12): validate offset from constructor/layout
+    0xa0,   // TODO(v2.12): validate selector array base
+    0xe0,   // TODO(v2.12): validate selected-id base
+    0x20,   // TODO(v2.12): validate UIManagerHolder audio SRP manager
+    0x40,   // TODO(v2.12): validate UIManagerHolder dynamics rack
+    0x78,   // TODO(v2.12): validate UIManagerHolder channel manager
+    0x98,   // TODO(v2.12): validate UIManagerHolder library manager client
+    0xb8,   // TODO(v2.12): validate app -> drbox pointer
+    0x48,   // TODO(v2.12): validate drbox -> audio core pointer
+    0xa8,   // TODO(v2.12): validate audio core -> input mixer wrapper
+    0x22b20, // TODO(v2.12): validate audio core -> preamp manager
+    0x3a9820, // TODO(v2.12): validate registry router local table
+    0x58,   // TODO(v2.12): validate registry entry key58
+    0x70,   // TODO(v2.12): validate registry entry obj id
+    0x74,   // TODO(v2.12): validate registry entry handle
+    0x98,   // TODO(v2.12): validate registry entry gain ptr
+    0x98,   // TODO(v2.12): validate analogue input gain ptr
+    0xa0,   // TODO(v2.12): validate analogue input pad ptr
+    0xa8,   // TODO(v2.12): validate analogue input phantom ptr
+    0x7A8,  // TODO(v2.12): validate AudioCoreDM input mixer driver
+    0xb0,   // TODO(v2.12): validate AudioCoreDM controller
+    0x350,  // TODO(v2.12): validate Audio SRP manager first send point
+    0x358,  // TODO(v2.12): validate Audio SRP manager first receive point
+    0x28,   // TODO(v2.12): validate InputChannel processing driver array
+    0x90,   // TODO(v2.12): validate InputMixerWrapper group mixer array
+    0x200,  // TODO(v2.12): validate input mixer attrs
+    0x8,    // TODO(v2.12): validate insert driver -> insert object
+    0x88,   // TODO(v2.12): validate insert object IN enabled flag
+    0x81,   // TODO(v2.12): validate insert intermediate bypass flag
+    0x50,   // TODO(v2.12): validate UIManagerHolder selected-channel pointer
+    0x100,  // TODO(v2.12): validate cChannel channel-number field
+    0x104,  // TODO(v2.12): validate cChannel strip-type field
+    0x200,  // TODO(v2.12): validate cWestProcessingForm current-channel pointer
+    0x99,   // TODO(v2.12): validate stagebox object surface-name field
+    0x21e,  // TODO(v2.12): validate stagebox input-configuration block
+    0x60,   // TODO(v2.12): validate embedded message buffer pointer
+    0x70,   // TODO(v2.12): validate net object hdr10 field
+    0x74,   // TODO(v2.12): validate net object hdr14 field
+    0x7c,   // TODO(v2.12): validate net object opcode field
+    0x84,   // TODO(v2.12): validate analogue input type marker field
+    0x118,  // TODO(v2.12): validate UIManagerHolder socket-proxy manager pointer
+    0x30,   // TODO(v2.12): validate send-point parent pointer
+    0x138,  // TODO(v2.12): validate sidechain strip-type pointer
+    0x140,  // TODO(v2.12): validate sidechain channel pointer
+    0xa0,   // TODO(v2.12): validate stereo-image width pointer
+    0xa8,   // TODO(v2.12): validate stereo-image mode pointer
+    0x168,  // TODO(v2.12): validate sidechain cached strip-type field
+    0x16c,  // TODO(v2.12): validate sidechain cached channel field
+    0x174,  // TODO(v2.12): validate sidechain dirty flag
+    0x88,   // TODO(v2.12): validate preamp manager option-byte-array pointer
+    0x28,   // TODO(v2.12): validate socket-proxy socket-enum field
+    0x28,   // TODO(v2.12): validate UIManagerHolder probe subsystem pointer
+    0x90,   // TODO(v2.12): validate UIManagerHolder probe channel table base
+    0x88,   // TODO(v2.12): validate dynamics object key blob
+    0x90,   // TODO(v2.12): validate dynamics object system pointer
+    0x98,   // TODO(v2.12): validate dynamics object data block
+    0xa0,   // TODO(v2.12): validate dynamics object raw data block
+    0xca9,  // TODO(v2.12): validate dynamics system dirty flag
+    0x68,   // TODO(v2.12): validate dynamics unit client key
+    0xc8,   // TODO(v2.12): validate West form gain rotary pointer
+    0xd0,   // TODO(v2.12): validate West form gain text pointer
+    0xe8,   // TODO(v2.12): validate West form pad exponent pointer
+    0xf8,   // TODO(v2.12): validate West form trim rotary pointer
+    0x100,  // TODO(v2.12): validate West form trim text pointer
+    0x128,  // TODO(v2.12): validate West form dynamic assign pointer
+    0x140,  // TODO(v2.12): validate West form preamp model watcher pointer
+    0x160,  // TODO(v2.12): validate West form socket status watcher pointer
+    0x190,  // TODO(v2.12): validate West form on-surface watcher pointer
+    0x10,   // TODO(v2.12): validate wrapper kind field
+    0x18,   // TODO(v2.12): validate wrapper ptr18 field
+    0x20,   // TODO(v2.12): validate wrapper ptr20 field
+    0x8,    // TODO(v2.12): validate linked-wrapper audio-object pointer
+    0x10,   // TODO(v2.12): validate linked-wrapper lower-range field
+    0x12,   // TODO(v2.12): validate linked-wrapper upper-range field
+    0x80,   // TODO(v2.12): validate linked-audio cached controller value
+    0x82,   // TODO(v2.12): validate linked-audio touched flag
+    0x88,   // TODO(v2.12): validate linked-audio controller driver pointer
+    0x8,    // TODO(v2.12): validate linked-audio controller name pointer
+    0xa8,   // TODO(v2.12): validate selector-lite ptr A8
+    0x150,  // TODO(v2.12): validate selector-lite ptr 150
+    0x158,  // TODO(v2.12): validate selector-lite ptr 158
+    0x160,  // TODO(v2.12): validate selector-lite ptr 160
+    0x168,  // TODO(v2.12): validate selector-lite ptr 168
+    0x17c,  // TODO(v2.12): validate selector-lite u32 17c
+    0x180,  // TODO(v2.12): validate selector-lite u32 180
+    0x184,  // TODO(v2.12): validate selector-lite u32 184
+    0x188,  // TODO(v2.12): validate selector-lite u32 188
+    0x18c,  // TODO(v2.12): validate selector-lite u32 18c
+    0x8,    // TODO(v2.12): validate input mixer driver -> wrapper pointer
+    0x20,   // TODO(v2.12): validate channel-mapper USB driver -> mapper pointer
+    0x8,    // TODO(v2.12): validate QList private begin field
+    0xc,    // TODO(v2.12): validate QList private end field
+    0x10,   // TODO(v2.12): validate QList private array base
+    0x20,   // TODO(v2.12): validate insert return -> connected send point
+    0x60,   // TODO(v2.12): validate audio controller system slot 0x60
+    0x68,   // TODO(v2.12): validate audio controller system slot 0x68
+    0x70,   // TODO(v2.12): validate audio controller system slot 0x70
+    0x90,   // TODO(v2.12): validate input mixer wrapper first-mixer pointer
+    0x94,   // TODO(v2.12): validate gang driver strip-type field
+    0x98,   // TODO(v2.12): validate gang driver member array
+    0xa8,   // TODO(v2.12): validate gang driver attrs field
+    0x98,   // TODO(v2.12): validate digital trim gain pointer
+};
+
+static const BinaryLayout* g_binaryLayout = &g_binaryLayoutV211;
+static DirectorVersion g_detectedDirectorVersion = DirectorVersion::Unknown;
+
+static const char* directorVersionToString(DirectorVersion version) {
+    switch (version) {
+    case DirectorVersion::V211: return "v2.11";
+    case DirectorVersion::V212: return "v2.12";
+    default: return "unknown";
+    }
+}
+
+static DirectorVersion detectDirectorVersion() {
+    @autoreleasepool {
+        NSBundle* bundle = [NSBundle mainBundle];
+        if (!bundle)
+            return DirectorVersion::Unknown;
+        NSString* bundleName = [bundle.bundlePath lastPathComponent];
+        NSString* shortVersion = [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        NSString* combined = [NSString stringWithFormat:@"%@ %@", bundleName ?: @"", shortVersion ?: @""];
+        if ([combined containsString:@"2.12"])
+            return DirectorVersion::V212;
+        if ([combined containsString:@"2.11"])
+            return DirectorVersion::V211;
+    }
+    return DirectorVersion::Unknown;
+}
+
+static void initializeBinaryLayout() {
+    g_detectedDirectorVersion = detectDirectorVersion();
+    switch (g_detectedDirectorVersion) {
+    case DirectorVersion::V212:
+        g_binaryLayout = &g_binaryLayoutV212;
+        break;
+    case DirectorVersion::V211:
+        g_binaryLayout = &g_binaryLayoutV211;
+        break;
+    default:
+        g_binaryLayout = &g_binaryLayoutV211;
+        break;
+    }
+
+    fprintf(stderr,
+            "[MC] binary layout selected: detected=%s active=%s\n",
+            directorVersionToString(g_detectedDirectorVersion),
+            g_binaryLayout ? g_binaryLayout->label : "(null)");
+}
 
 enum MCLogLevel {
     MC_LOG_QUIET = 0,
@@ -111,7 +516,6 @@ enum MCLogLevel {
 };
 
 static int g_mcLogLevel = -1;
-static void refreshVisiblePreampUI(const char* phaseTag = nullptr);
 static void refreshAllStripPreampBindings(const char* phaseTag = nullptr);
 static void refreshAllWestForms(const char* phaseTag = nullptr);
 static void dumpWestWidgets(const char* phaseTag = nullptr);
@@ -170,16 +574,16 @@ static void dumpSelectorLiteState(void* selectorLite, const char* phaseTag = nul
     uint64_t ptr_160 = 0;
     uint64_t ptr_168 = 0;
 
-    safeReadValue((uint8_t*)selectorLite + 0x17c, &u32_17c);
-    safeReadValue((uint8_t*)selectorLite + 0x180, &u32_180);
-    safeReadValue((uint8_t*)selectorLite + 0x184, &u32_184);
-    safeReadValue((uint8_t*)selectorLite + 0x188, &u32_188);
-    safeReadValue((uint8_t*)selectorLite + 0x18c, &u32_18c);
-    safeReadValue((uint8_t*)selectorLite + 0xa8, &ptr_a8);
-    safeReadValue((uint8_t*)selectorLite + 0x150, &ptr_150);
-    safeReadValue((uint8_t*)selectorLite + 0x158, &ptr_158);
-    safeReadValue((uint8_t*)selectorLite + 0x160, &ptr_160);
-    safeReadValue((uint8_t*)selectorLite + 0x168, &ptr_168);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_u32_17c, &u32_17c);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_u32_180, &u32_180);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_u32_184, &u32_184);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_u32_188, &u32_188);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_u32_18c, &u32_18c);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_ptr_a8, &ptr_a8);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_ptr_150, &ptr_150);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_ptr_158, &ptr_158);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_ptr_160, &ptr_160);
+    safeReadValue((uint8_t*)selectorLite + g_binaryLayout->off_selector_lite_ptr_168, &ptr_168);
 
     SelectedStripInfo sel = getSelectedStripInfo(false);
     fprintf(stderr,
@@ -212,10 +616,10 @@ static void scanRootForKnownSelectorObjects(void* root,
     if (!root || (uintptr_t)root < 0x100000000ULL)
         return;
 
-    const uintptr_t selectorMgrVt = (uintptr_t)0x106c77ca0 + g_slide + 0x10;
-    const uintptr_t selectorVt = (uintptr_t)0x106c77c58 + g_slide + 0x10;
-    const uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
-    const uintptr_t surfaceChannelsVt = (uintptr_t)0x106ce5900 + g_slide + 0x10;
+    const uintptr_t selectorMgrVt = (uintptr_t)g_binaryLayout->vt_channel_selector_manager + g_slide + 0x10;
+    const uintptr_t selectorVt = (uintptr_t)g_binaryLayout->vt_channel_selector + g_slide + 0x10;
+    const uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+    const uintptr_t surfaceChannelsVt = (uintptr_t)g_binaryLayout->vt_surface_channels + g_slide + 0x10;
 
     struct TargetDesc {
         const char* name;
@@ -297,7 +701,7 @@ static void scanRootForKnownSelectorObjects(void* root,
                                 ptr,
                                 "AppInstanceSelectorContainer",
                                 phaseTag,
-                                (uintptr_t)0x1001e3360 + g_slide,
+                                (uintptr_t)g_binaryLayout->fn_c_channel_selector_dl5000_preamp_gain_rotary + g_slide,
                                 "DL5000PreampGainRotary",
                                 0x12000,
                                 0x3000,
@@ -307,7 +711,7 @@ static void scanRootForKnownSelectorObjects(void* root,
                                 ptr,
                                 "AppInstanceSelectorContainer",
                                 phaseTag,
-                                (uintptr_t)0x1001ddcd0 + g_slide,
+                                (uintptr_t)g_binaryLayout->fn_c_channel_selector_inform_dl5000_control_surface_pre_amp_controls + g_slide,
                                 "InformDL5000ControlSurfacePreAmpControls",
                                 0x12000,
                                 0x3000,
@@ -573,6 +977,8 @@ static void resolveSlide() {
         const char* name = _dyld_get_image_name(i);
         if (name && strstr(name, "dLive Director")) {
             g_slide = _dyld_get_image_vmaddr_slide(i);
+            g_directorImageHeader = reinterpret_cast<const mach_header_64*>(_dyld_get_image_header(i));
+            g_directorImagePath = name;
             fprintf(stderr, "[MC] slide = 0x%lx\n", (unsigned long)g_slide);
             return;
         }
@@ -580,19 +986,61 @@ static void resolveSlide() {
     fprintf(stderr, "[MC] ERROR: dLive Director image not found!\n");
 }
 
+static char* findDirectorCString(const char* needle) {
+    if (!needle || !needle[0] || !g_directorImageHeader)
+        return nullptr;
+
+    const mach_header_64* mh = g_directorImageHeader;
+    if (mh->magic != MH_MAGIC_64)
+        return nullptr;
+
+    const uint8_t* cmdPtr = reinterpret_cast<const uint8_t*>(mh + 1);
+    const size_t needleLen = strlen(needle);
+    for (uint32_t i = 0; i < mh->ncmds; ++i) {
+        const load_command* lc = reinterpret_cast<const load_command*>(cmdPtr);
+        if (lc->cmd == LC_SEGMENT_64) {
+            const segment_command_64* seg = reinterpret_cast<const segment_command_64*>(cmdPtr);
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                const section_64* sec = reinterpret_cast<const section_64*>(seg + 1);
+                for (uint32_t s = 0; s < seg->nsects; ++s, ++sec) {
+                    if (strcmp(sec->sectname, "__cstring") != 0)
+                        continue;
+                    const char* start = reinterpret_cast<const char*>(static_cast<uintptr_t>(sec->addr) + g_slide);
+                    const char* end = start + sec->size;
+                    for (const char* p = start; p < end;) {
+                        size_t remaining = static_cast<size_t>(end - p);
+                        size_t len = strnlen(p, remaining);
+                        if (len == needleLen && memcmp(p, needle, needleLen) == 0)
+                            return const_cast<char*>(p);
+                        if (len >= remaining)
+                            break;
+                        p += len + 1;
+                    }
+                }
+            }
+        }
+        cmdPtr += lc->cmdsize;
+    }
+    return nullptr;
+}
+
 static void maybePatchDirectorSingletonKey() {
     const char* flag = getenv("MC_PATCH_DIRECTOR_SINGLETON_KEY");
     if (!flag || flag[0] == '\0' || strcmp(flag, "0") == 0)
         return;
-    if (!g_slide) {
-        fprintf(stderr, "[MC] singleton patch: skipped, slide unresolved\n");
+    if (!g_slide || !g_directorImageHeader) {
+        fprintf(stderr, "[MC] singleton patch: skipped, Director image unresolved\n");
         return;
     }
 
-    constexpr uintptr_t kDirectorSingletonKeyAddr = 0x10125bf15;
-    char* keyPtr = (char*)((uintptr_t)kDirectorSingletonKeyAddr + g_slide);
+    char* keyPtr = findDirectorCString("dLiveDirectorRunning");
     if (!keyPtr)
+    {
+        fprintf(stderr,
+                "[MC] singleton patch: could not find 'dLiveDirectorRunning' in %s\n",
+                g_directorImagePath ? g_directorImagePath : "(unknown image)");
         return;
+    }
 
     char original[32] = {};
     memcpy(original, keyPtr, sizeof(original) - 1);
@@ -652,11 +1100,11 @@ static void* findSurfaceDiscoveryNamedObject(const char* name) {
     typedef void* (*fn_DiscoveryObjectBaseFindObject)(void*, const char*);
 
     auto surfaceDiscoveryInstance =
-        (fn_SurfaceDiscoveryInstance)((uintptr_t)0x1006ab790 + g_slide);
+        (fn_SurfaceDiscoveryInstance)((uintptr_t)g_binaryLayout->fn_c_surface_discovery_instance + g_slide);
     auto getSurfaceDiscoveryObject =
-        (fn_GetSurfaceDiscoveryObject)((uintptr_t)0x1006ab820 + g_slide);
+        (fn_GetSurfaceDiscoveryObject)((uintptr_t)g_binaryLayout->fn_c_surface_discovery_get_surface_discovery_object + g_slide);
     auto findObject =
-        (fn_DiscoveryObjectBaseFindObject)((uintptr_t)0x10059caf0 + g_slide);
+        (fn_DiscoveryObjectBaseFindObject)((uintptr_t)g_binaryLayout->fn_c_discovery_object_base_find_object + g_slide);
     if (!surfaceDiscoveryInstance || !getSurfaceDiscoveryObject || !findObject)
         return nullptr;
 
@@ -730,35 +1178,66 @@ struct ProcDescB {
 };
 
 static ProcDescA g_procA[] = {
-    {"DigiTube",  2,  0x1002d4170, 0x1002d42c0, 0x1002d53b0}, // cPreampModel = tube modeling, NOT analog gain
-    {"HPF",       5,  0x10028d4d0, 0x10028d5c0, 0x10028d9c0},
-    {"LPF",       6,  0x100b1e790, 0x100b1e8d0, 0x100b1efa0},
-    {"Compressor",7,  0x1001f1040, 0x1001f1700, 0x1001f43a0},
-    {"GateSCPEQ", 8,  0x1002d0d30, 0x1002d0ed0, 0x1002d1b30},
-    {"Gate",      9,  0x100287a00, 0x100287b30, 0x100288f00},
-    {"PEQ",       10, 0x100b1cdc0, 0x100b1cf00, 0x100b1d7f0},
+    {"DigiTube",  2,  0, 0, 0}, // cPreampModel = tube modeling, NOT analog gain
+    {"HPF",       5,  0, 0, 0},
+    {"LPF",       6,  0, 0, 0},
+    {"Compressor",7,  0, 0, 0},
+    {"GateSCPEQ", 8,  0, 0, 0},
+    {"Gate",      9,  0, 0, 0},
+    {"PEQ",       10, 0, 0, 0},
 };
 static const int NUM_PROC_A = sizeof(g_procA) / sizeof(g_procA[0]);
+
+static void initializeProcessingDescriptors() {
+    g_procA[0].fillGetStatusAddr = g_binaryLayout->fn_c_preamp_model_fill_get_status;
+    g_procA[0].directlyRecallAddr = g_binaryLayout->fn_c_preamp_model_directly_recall_status;
+    g_procA[0].reportDataAddr = g_binaryLayout->fn_c_preamp_model_report_data;
+
+    g_procA[1].fillGetStatusAddr = g_binaryLayout->fn_c_high_pass_filter_fill_get_status;
+    g_procA[1].directlyRecallAddr = g_binaryLayout->fn_c_high_pass_filter_directly_recall_status;
+    g_procA[1].reportDataAddr = g_binaryLayout->fn_c_high_pass_filter_report_data;
+
+    g_procA[2].fillGetStatusAddr = g_binaryLayout->fn_c_biquad_one_band_net_object_fill_get_status;
+    g_procA[2].directlyRecallAddr = g_binaryLayout->fn_c_biquad_one_band_net_object_directly_recall_status;
+    g_procA[2].reportDataAddr = g_binaryLayout->fn_c_biquad_one_band_net_object_report_data;
+
+    g_procA[3].fillGetStatusAddr = g_binaryLayout->fn_c_compressor_fill_get_status;
+    g_procA[3].directlyRecallAddr = g_binaryLayout->fn_c_compressor_directly_recall_status;
+    g_procA[3].reportDataAddr = g_binaryLayout->fn_c_compressor_report_data;
+
+    g_procA[4].fillGetStatusAddr = g_binaryLayout->fn_c_gate_side_chain_peqnet_object_fill_get_status;
+    g_procA[4].directlyRecallAddr = g_binaryLayout->fn_c_gate_side_chain_peqnet_object_directly_recall_status;
+    g_procA[4].reportDataAddr = g_binaryLayout->fn_c_gate_side_chain_peqnet_object_report_data;
+
+    g_procA[5].fillGetStatusAddr = g_binaryLayout->fn_c_gate_fill_get_status;
+    g_procA[5].directlyRecallAddr = g_binaryLayout->fn_c_gate_directly_recall_status;
+    g_procA[5].reportDataAddr = g_binaryLayout->fn_c_gate_report_data;
+
+    g_procA[6].fillGetStatusAddr = g_binaryLayout->fn_c_biquad_four_band_net_object_fill_get_status;
+    g_procA[6].directlyRecallAddr = g_binaryLayout->fn_c_biquad_four_band_net_object_directly_recall_status;
+    g_procA[6].reportDataAddr = g_binaryLayout->fn_c_biquad_four_band_net_object_report_data;
+
+}
 
 // Field layouts derived from disassembling each class's GetStatus:
 // subFieldIdx: 0 = object is directly at chOffset, >0 = driver at chOffset, net obj at driver[subFieldIdx]
 static ProcDescB g_procB[] = {
     // cDigitalAttenuator (preamp digital trim): via driver at ch[4], net obj at driver[1]
     // ptr-deref: +0x98→gain(SWORD), +0xa0→mute(UBYTE_BOOL), +0xa8→polarity(UBYTE_BOOL)
-    {"DigitalTrim", 4, 0x106c781f0, 7, 0x01, 1, 0, 3, {
+    {"DigitalTrim", 4, 0, 7, 0x01, 1, 0, 3, {
         {0x98, FT_SWORD,      1},
         {0xa0, FT_UBYTE_BOOL, 3},
         {0xa8, FT_UBYTE_BOOL, 4},
     }},
     // cDelay (via cInputDelayDriver at ch[17], net obj at driver[1])
     // ptr-deref: +0x98→delay(UWORD), +0xa0→bypass(UBYTE_BOOL)
-    {"Delay", 17, 0x106c78078, 4, 0x01, 1, 0, 2, {
+    {"Delay", 17, 0, 4, 0x01, 1, 0, 2, {
         {0x98, FT_UWORD,      1},
         {0xa0, FT_UBYTE_BOOL, 3},
     }},
     // cDirectOutput: EXCLUDED — direct output stays tied to position
     // cProcessingOrderingSelect: via cProcessingOrderingSelectDriver at ch[16]→driver[1]
-    {"ProcOrder", 16, 0x106c7a228, 2, 0x01, 1, 0, 1, {
+    {"ProcOrder", 16, 0, 2, 0x01, 1, 0, 1, {
         {0x88, FT_UBYTE_BOOL, 1},
     }},
     // cInsertNetObject (via InsertDriver1 at ch[12]→driver[1]): len=3, version=0x00
@@ -792,6 +1271,15 @@ static ProcDescB g_procB[] = {
 static const int NUM_PROC_B = sizeof(g_procB) / sizeof(g_procB[0]);
 static const int kProcStereoImageIdx = 7;
 static const int kNumMuteGroups = 8;
+
+static void initializeProcessingDescriptorScanAnchors() {
+    // These scan anchors are currently unused because all live ProcDescB
+    // descriptors resolve through fixed channel offsets, not vtable scans.
+    // Still populate the known ones from BinaryLayout so the remaining raw
+    // literal bucket stays honest and small during the v2.12 port.
+    g_procB[1].vtableStatic = g_binaryLayout->vt_delay_0x10;
+    g_procB[2].vtableStatic = g_binaryLayout->vt_processing_ordering_select;
+}
 
 static const size_t MSG_BUF_SIZE = 0x1000;
 static const size_t kCsvImportPreampManagerSize = 0x200;
@@ -870,27 +1358,29 @@ static void* g_csvImportPreampManager = nullptr;
 static dispatch_queue_t g_csvPreampQueue = nullptr;
 
 static void discoverSelectorManagerFromChannelMapper(const char* phaseTag) {
-    const uintptr_t selectorMgrVt = (uintptr_t)0x106c77ca0 + g_slide + 0x10;
-    const uintptr_t selectorVt = (uintptr_t)0x106c77c58 + g_slide + 0x10;
+    const uintptr_t selectorMgrVt = (uintptr_t)g_binaryLayout->vt_channel_selector_manager + g_slide + 0x10;
+    const uintptr_t selectorVt = (uintptr_t)g_binaryLayout->vt_channel_selector + g_slide + 0x10;
 
     if (!g_channelMapper || (uintptr_t)g_channelMapper < 0x100000000ULL)
         return;
 
     if (!g_channelSelectorManager) {
         void* ptr = nullptr;
-        if (safeRead((uint8_t*)g_channelMapper + 0xd360, &ptr, sizeof(ptr)) &&
+        if (safeRead((uint8_t*)g_channelMapper + g_binaryLayout->off_channelMapper_selectorManager, &ptr, sizeof(ptr)) &&
             ptr && (uintptr_t)ptr >= 0x100000000ULL) {
             void* vt = nullptr;
             if (safeRead(ptr, &vt, sizeof(vt)) && (uintptr_t)vt == selectorMgrVt) {
                 g_channelSelectorManager = ptr;
                 fprintf(stderr,
-                        "[MC] %sselector-manager discovery: from ChannelMapper+0xd360 = %p\n",
+                        "[MC] %sselector-manager discovery: from ChannelMapper+0x%lx = %p\n",
                         phaseTag ? phaseTag : "",
+                        (unsigned long)g_binaryLayout->off_channelMapper_selectorManager,
                         g_channelSelectorManager);
             } else {
                 fprintf(stderr,
-                        "[MC] %sselector-manager discovery: ChannelMapper+0xd360 candidate=%p vt=%p expected=%p\n",
+                        "[MC] %sselector-manager discovery: ChannelMapper+0x%lx candidate=%p vt=%p expected=%p\n",
                         phaseTag ? phaseTag : "",
+                        (unsigned long)g_binaryLayout->off_channelMapper_selectorManager,
                         ptr,
                         vt,
                         (void*)selectorMgrVt);
@@ -901,7 +1391,8 @@ static void discoverSelectorManagerFromChannelMapper(const char* phaseTag) {
     if (!g_channelSelector && g_channelSelectorManager) {
         for (int idx = 0; idx < 8; ++idx) {
             void* selector = nullptr;
-            if (!safeRead((uint8_t*)g_channelSelectorManager + 0xa0 + idx * 8,
+            if (!safeRead((uint8_t*)g_channelSelectorManager +
+                              g_binaryLayout->off_selectorManager_selectors_base + idx * 8,
                           &selector,
                           sizeof(selector))) {
                 continue;
@@ -932,9 +1423,9 @@ static void discoverSelectorObjectsFallback(const char* phaseTag) {
 
     g_selectorFallbackDiscoveryAttempted = true;
 
-    uintptr_t selectorVt = (uintptr_t)0x106c77c58 + g_slide + 0x10;
-    uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
-    uintptr_t visibilityVt = (uintptr_t)0x106ce2a68 + g_slide + 0x10;
+    uintptr_t selectorVt = (uintptr_t)g_binaryLayout->vt_channel_selector + g_slide + 0x10;
+    uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+    uintptr_t visibilityVt = (uintptr_t)g_binaryLayout->vt_processing_surface_visibility_manager + g_slide + 0x10;
 
     std::vector<std::pair<const char*, void*>> roots;
     auto addRoot = [&](const char* label, void* ptr) {
@@ -961,9 +1452,9 @@ static void discoverSelectorObjectsFallback(const char* phaseTag) {
     typedef void* (*fn_SurfaceDiscoveryInstance)();
     typedef void* (*fn_GetSurfaceDiscoveryObject)(void*);
     auto surfaceDiscoveryInstance =
-        (fn_SurfaceDiscoveryInstance)((uintptr_t)0x1006ab790 + g_slide);
+        (fn_SurfaceDiscoveryInstance)((uintptr_t)g_binaryLayout->fn_c_surface_discovery_instance + g_slide);
     auto getSurfaceDiscoveryObject =
-        (fn_GetSurfaceDiscoveryObject)((uintptr_t)0x1006ab820 + g_slide);
+        (fn_GetSurfaceDiscoveryObject)((uintptr_t)g_binaryLayout->fn_c_surface_discovery_get_surface_discovery_object + g_slide);
     if (surfaceDiscoveryInstance && getSurfaceDiscoveryObject) {
         void* discovery = surfaceDiscoveryInstance();
         addRoot("SurfaceDiscovery", discovery);
@@ -1056,15 +1547,15 @@ struct GangSnapshot {
 };
 
 static void resolveSymbols() {
-    g_AppInstance        = (fn_void_void)RESOLVE(0x100d5a120);
-    g_CPRHelpersInstance = (fn_void_void)RESOLVE(0x100403270);
-    g_msgCtorCap         = (fn_MsgCtorCap)RESOLVE(0x1000ed490);
-    g_msgDtor            = (fn_MsgDtor)RESOLVE(0x1000e9810);
-    g_getChannelName     = (fn_GetChannelName)RESOLVE(0x1001a3750);
-    g_setChannelName     = (fn_SetChannelName)RESOLVE(0x1001a3670);
-    g_getChannelColour   = (fn_GetChannelColour)RESOLVE(0x1001a34a0);
-    g_setChannelColour   = (fn_SetChannelColour)RESOLVE(0x1001a3580);
-    g_channelIsStereo    = (fn_ChannelIsStereo)RESOLVE(0x100405740);
+    g_AppInstance        = (fn_void_void)RESOLVE(g_binaryLayout->fn_c_application_instance);
+    g_CPRHelpersInstance = (fn_void_void)RESOLVE(g_binaryLayout->fn_c_copy_paste_reset_helpers_instance);
+    g_msgCtorCap         = (fn_MsgCtorCap)RESOLVE(g_binaryLayout->fn_c_ahnet_message_ctor_ui);
+    g_msgDtor            = (fn_MsgDtor)RESOLVE(g_binaryLayout->fn_c_ahnet_message_dtor);
+    g_getChannelName     = (fn_GetChannelName)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_get_channel_name);
+    g_setChannelName     = (fn_SetChannelName)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_set_channel_name);
+    g_getChannelColour   = (fn_GetChannelColour)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_get_channel_colour);
+    g_setChannelColour   = (fn_SetChannelColour)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_set_channel_colour);
+    g_channelIsStereo    = (fn_ChannelIsStereo)RESOLVE(g_binaryLayout->fn_c_copy_paste_reset_helpers_channel_is_stereo);
 }
 
 // =============================================================================
@@ -1074,7 +1565,7 @@ static bool findAudioCoreDM() {
     void* app = g_AppInstance();
     if (!app) { fprintf(stderr, "[MC] App instance is null!\n"); return false; }
 
-    void* expectedDMVtable = (void*)((uintptr_t)RESOLVE(0x106c77998) + 16);
+    void* expectedDMVtable = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_audio_core_dm) + 16);
     void** appFields = (void**)app;
 
     for (int i = 0; i < 200; i++) {
@@ -1101,7 +1592,7 @@ static bool findAudioCoreDM() {
 
     if (!g_audioDM) { fprintf(stderr, "[MC] AudioCoreDM not found!\n"); return false; }
 
-    void* inputChVtable = (void*)((uintptr_t)RESOLVE(0x106c79978) + 16);
+    void* inputChVtable = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_input_channel) + 16);
     int count = 0;
     for (int i = 0; i < 300; i++) {
         void* field;
@@ -1133,16 +1624,16 @@ static bool findAudioCoreDM() {
     // Find InputMixerWrapper: AudioCoreDM+0x7A8 → driver → driver+0x8 → wrapper
     uint8_t* dmBytes = (uint8_t*)g_audioDM;
     void* mixerDriver = nullptr;
-    if (safeRead(dmBytes + 0x7A8, &mixerDriver, sizeof(mixerDriver)) && mixerDriver) {
-        void* wrapper = nullptr;
-        safeRead((uint8_t*)mixerDriver + 0x8, &wrapper, sizeof(wrapper));
-        if (wrapper) {
+    if (safeRead(dmBytes + g_binaryLayout->off_audio_dm_input_mixer_driver, &mixerDriver, sizeof(mixerDriver)) && mixerDriver) {
+        void* mixerWrapper = nullptr;
+        safeRead((uint8_t*)mixerDriver + g_binaryLayout->off_input_mixer_driver_wrapper, &mixerWrapper, sizeof(mixerWrapper));
+        if (mixerWrapper) {
             // Verify by checking if wrapper+0x90 points to valid mixer objects
             void* firstMixer = nullptr;
-            safeRead((uint8_t*)wrapper + 0x90, &firstMixer, sizeof(firstMixer));
+            safeRead((uint8_t*)mixerWrapper + g_binaryLayout->off_input_mixer_wrapper_first_mixer, &firstMixer, sizeof(firstMixer));
             if (firstMixer && (uintptr_t)firstMixer > 0x100000000ULL) {
-                g_inputMixerWrapper = wrapper;
-                fprintf(stderr, "[MC] InputMixerWrapper at %p\n", wrapper);
+                g_inputMixerWrapper = mixerWrapper;
+                fprintf(stderr, "[MC] InputMixerWrapper at %p\n", mixerWrapper);
             }
         }
     }
@@ -1153,8 +1644,8 @@ static bool findAudioCoreDM() {
     // cChannelMapperUSBDriver vtable+16 = 0x106c77c38, cChannelMapper at driver+0x20
     // cChannelMapper is 0xe108 bytes, vtable+16 = 0x106c77bc8
     {
-        void* usbDrvVt = (void*)((uintptr_t)RESOLVE(0x106c77c28) + 16);
-        void* cmVt = (void*)((uintptr_t)RESOLVE(0x106c77bb8) + 16);
+        void* usbDrvVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_channel_mapper_usbdriver) + 16);
+        void* cmVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_channel_mapper) + 16);
 
         // Scan DM fields for cChannelMapperUSBDriver
         if (g_dmFields) {
@@ -1167,7 +1658,7 @@ static bool findAudioCoreDM() {
                 if (vt == usbDrvVt) {
                     // Found USB driver, cChannelMapper is at driver+0x20
                     void* mapper = nullptr;
-                    if (safeRead((uint8_t*)field + 0x20, &mapper, sizeof(mapper)) && mapper) {
+                    if (safeRead((uint8_t*)field + g_binaryLayout->off_channel_mapper_usbdriver_mapper, &mapper, sizeof(mapper)) && mapper) {
                         void* mvt = nullptr;
                         safeRead(mapper, &mvt, sizeof(mvt));
                         fprintf(stderr, "[MC] ChannelMapperUSBDriver at dm[%d] = %p\n", i, field);
@@ -1196,14 +1687,14 @@ static bool findAudioCoreDM() {
     // Layout: +0x98→gain_ptr(int16), +0xa0→pad_ptr(bool), +0xa8→phantom_ptr(bool)
     // =========================================================================
     {
-        void** rrPtr = (void**)RESOLVE(0x106fb6670);
+        void** rrPtr = (void**)RESOLVE(g_binaryLayout->fn_g_registry_router);
         void* rr = nullptr;
         safeRead(rrPtr, &rr, sizeof(rr));
         g_registryRouter = rr;
 
         if (rr) {
-            void* aiVtExpected = (void*)((uintptr_t)RESOLVE(0x106ce7930) + 16);
-            uint8_t* base = (uint8_t*)rr + 0x3a9820;
+            void* aiVtExpected = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_analogue_input) + 16);
+            uint8_t* base = (uint8_t*)rr + g_binaryLayout->off_registry_router_table;
 
             // Find first cAnalogueInput index
             for (int i = 0; i < 1000; i++) {
@@ -1226,9 +1717,9 @@ static bool findAudioCoreDM() {
     // Also scan ch0 for StereoImage and Delay correct offsets
     // =========================================================================
     {
-        void* daVt = (void*)((uintptr_t)RESOLVE(0x106c78198));
+        void* daVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_digital_attenuator_0x10));
         if (g_registryRouter) {
-            uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
+            uint8_t* base = (uint8_t*)g_registryRouter + g_binaryLayout->off_registry_router_table;
             int daCount = 0, firstDA = -1;
             for (int i = 0; i < 2000 && daCount < 5; i++) {
                 void* entry = nullptr;
@@ -1240,11 +1731,11 @@ static bool findAudioCoreDM() {
                     if (firstDA < 0) firstDA = i;
                     // Read objectId and handle from the object's embedded msg
                     uint16_t objId = 0; uint32_t handle = 0;
-                    safeRead((uint8_t*)entry + 0x70, &objId, 2);
-                    safeRead((uint8_t*)entry + 0x74, &handle, 4);
+                    safeRead((uint8_t*)entry + g_binaryLayout->off_registry_entry_obj_id, &objId, 2);
+                    safeRead((uint8_t*)entry + g_binaryLayout->off_registry_entry_handle, &handle, 4);
                     // Read gain value
                     void* gainPtr = nullptr; int16_t gain = 0;
-                    safeRead((uint8_t*)entry + 0x98, &gainPtr, sizeof(gainPtr));
+                    safeRead((uint8_t*)entry + g_binaryLayout->off_registry_entry_gain_ptr, &gainPtr, sizeof(gainPtr));
                     if (gainPtr && (uintptr_t)gainPtr > 0x100000000ULL)
                         safeRead(gainPtr, &gain, 2);
                     fprintf(stderr, "[MC] DigAtten router[%d]: objId=0x%x handle=0x%x gain=%d obj=%p\n",
@@ -1260,9 +1751,9 @@ static bool findAudioCoreDM() {
         safeRead(&g_dmFields[g_firstInputChIdx], &inputCh, sizeof(inputCh));
         if (inputCh) {
             void** chF = (void**)inputCh;
-            void* siDrvVt = (void*)((uintptr_t)RESOLVE(0x106c7a860));
-            void* delDrvVt = (void*)((uintptr_t)RESOLVE(0x106c780d0));    // cDelayDriver base
-            void* idelDrvVt = (void*)((uintptr_t)RESOLVE(0x106c799a8));   // cInputDelayDriver (vtable+16)
+            void* siDrvVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_stereo_image_driver_0x10));
+            void* delDrvVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_delay_driver_0x10));    // cDelayDriver base
+            void* idelDrvVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_input_delay_driver_0x10));   // cInputDelayDriver (vtable+16)
             for (int fi = 0; fi < 120; fi++) {
                 void* field = nullptr;
                 safeRead(&chF[fi], &field, sizeof(field));
@@ -1285,8 +1776,8 @@ static bool findAudioCoreDM() {
     // =========================================================================
     {
         if (g_registryRouter) {
-            void* dnoVt = (void*)((uintptr_t)RESOLVE(0x106c78e28) + 16);
-            uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
+            void* dnoVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_dynamics_net_object) + 16);
+            uint8_t* base = (uint8_t*)g_registryRouter + g_binaryLayout->off_registry_router_table;
             g_dynNetObjCount = 0;
             for (int i = 0; i < 5000 && g_dynNetObjCount < 256; i++) {
                 void* entry = nullptr;
@@ -1308,7 +1799,7 @@ static bool findAudioCoreDM() {
                 safeRead(base + g_dynNetObjIndices[n] * 8, &entry, sizeof(entry));
                 if (!entry) continue;
                 uint32_t key58 = 0;
-                safeRead((uint8_t*)entry + 0x58, &key58, 4);
+                safeRead((uint8_t*)entry + g_binaryLayout->off_registry_entry_key58, &key58, 4);
                 fprintf(stderr, "[MC]   #%d registryIdx=%d obj=%p key58=0x%08x\n",
                         n, g_dynNetObjIndices[n], entry, key58);
             }
@@ -1322,7 +1813,7 @@ static bool findAudioCoreDM() {
                     safeRead(base + g_dynNetObjIndices[n] * 8, &entry, sizeof(entry));
                     if (!entry) continue;
                     uint32_t key58 = 0;
-                    safeRead((uint8_t*)entry + 0x58, &key58, 4);
+                    safeRead((uint8_t*)entry + g_binaryLayout->off_registry_entry_key58, &key58, 4);
                     fprintf(stderr, "[MC]   #%d registryIdx=%d obj=%p key58=0x%08x\n",
                             n, g_dynNetObjIndices[n], entry, key58);
                 }
@@ -1336,21 +1827,27 @@ static bool findAudioCoreDM() {
     // =========================================================================
     {
         typedef void* (*fn_Instance)();
-        auto getInstance = (fn_Instance)RESOLVE(0x10076d170);
+        auto getInstance = (fn_Instance)RESOLVE(g_binaryLayout->fn_c_uimanager_holder_instance);
         void* uiHolder = getInstance();
         if (uiHolder) {
             g_uiManagerHolder = uiHolder;
-            safeRead((uint8_t*)uiHolder + 0x78, &g_channelManager, sizeof(g_channelManager));
-            safeRead((uint8_t*)uiHolder + 0x20, &g_audioSRPManager, sizeof(g_audioSRPManager));
+            safeRead((uint8_t*)uiHolder + g_binaryLayout->off_uiholder_channel_manager,
+                     &g_channelManager,
+                     sizeof(g_channelManager));
+            safeRead((uint8_t*)uiHolder + g_binaryLayout->off_uiholder_audio_srp_manager,
+                     &g_audioSRPManager,
+                     sizeof(g_audioSRPManager));
             fprintf(stderr, "[MC] UIManagerHolder: channelMgr=%p audioSRPMgr=%p\n",
                     g_channelManager, g_audioSRPManager);
 
-            // Store cDynamicsRack (at UIManagerHolder+0x40, confirmed by vtable scan)
-            safeRead((uint8_t*)uiHolder + 0x40, &g_dynRack, sizeof(g_dynRack));
+            // Store cDynamicsRack (offset confirmed on v2.11, pending v2.12 validation)
+            safeRead((uint8_t*)uiHolder + g_binaryLayout->off_uiholder_dyn_rack,
+                     &g_dynRack,
+                     sizeof(g_dynRack));
             fprintf(stderr, "[MC] DynamicsRack=%p\n", g_dynRack);
 
             // Find cSceneManagerIntermediateClient by vtable scan
-            uintptr_t sceneClientVt = (uintptr_t)RESOLVE(0x106c9de30) + 0x10; // vtable symbol + 0x10
+            uintptr_t sceneClientVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_scene_manager_intermediate_client) + 0x10; // vtable symbol + 0x10
             for (int off = 0; off < 0x300; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1365,12 +1862,12 @@ static bool findAudioCoreDM() {
             }
             if (!g_sceneClient) fprintf(stderr, "[MC] SceneManagerIntermediateClient not found in UIManagerHolder\n");
 
-            uintptr_t showMgrBaseVt = (uintptr_t)RESOLVE(0x106c9e138) + 0x10;
-            uintptr_t showMgrVt = (uintptr_t)RESOLVE(0x106d0da90) + 0x10;
-            uintptr_t vmrShowMgrVt = (uintptr_t)RESOLVE(0x106cfb420) + 0x10;
-            uintptr_t sceneImportMgrVt = (uintptr_t)RESOLVE(0x106c9dd10) + 0x10;
-            uintptr_t uiChannelSelectListenerVt = (uintptr_t)RESOLVE(0x106d0f240) + 0x10;
-            uintptr_t uiListenManagerVt = (uintptr_t)RESOLVE(0x106c9eea0) + 0x10;
+            uintptr_t showMgrBaseVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_show_manager_client_base) + 0x10;
+            uintptr_t showMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_show_manager_client) + 0x10;
+            uintptr_t vmrShowMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_virtual_mix_rack_show_manager_client) + 0x10;
+            uintptr_t sceneImportMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_scene_import_manager_client) + 0x10;
+            uintptr_t uiChannelSelectListenerVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_uichannel_select_listener) + 0x10;
+            uintptr_t uiListenManagerVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_uilisten_manager) + 0x10;
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1410,12 +1907,14 @@ static bool findAudioCoreDM() {
             if (!g_uiChannelSelectListener) fprintf(stderr, "[MC] UIChannelSelectListener not found in UIManagerHolder\n");
             if (!g_uiListenManager) fprintf(stderr, "[MC] UIListenManager not found in UIManagerHolder\n");
 
-            // cLibraryManagerClient at UIManagerHolder+0x98 (confirmed from PerformRecall disasm)
-            safeRead((uint8_t*)uiHolder + 0x98, &g_libraryMgrClient, sizeof(g_libraryMgrClient));
+            // cLibraryManagerClient offset confirmed on v2.11, pending v2.12 validation.
+            safeRead((uint8_t*)uiHolder + g_binaryLayout->off_uiholder_library_manager_client,
+                     &g_libraryMgrClient,
+                     sizeof(g_libraryMgrClient));
             fprintf(stderr, "[MC] LibraryManagerClient=%p\n", g_libraryMgrClient);
 
             // Find cGangingManager by vtable scan
-            uintptr_t gangingMgrVt = (uintptr_t)RESOLVE(0x106ced990) + 0x10; // vtable symbol + 0x10
+            uintptr_t gangingMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_ganging_manager) + 0x10; // vtable symbol + 0x10
             for (int off = 0; off < 0x300; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1431,7 +1930,7 @@ static bool findAudioCoreDM() {
             if (!g_gangingManager) fprintf(stderr, "[MC] GangingManager not found in UIManagerHolder\n");
 
             // Find cSurfaceChannels by vtable scan
-            uintptr_t surfaceChannelsVt = (uintptr_t)RESOLVE(0x106ce5900) + 0x10; // vtable symbol + 0x10
+            uintptr_t surfaceChannelsVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_surface_channels) + 0x10; // vtable symbol + 0x10
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1446,7 +1945,7 @@ static bool findAudioCoreDM() {
             }
             if (!g_surfaceChannels) fprintf(stderr, "[MC] SurfaceChannels not found in UIManagerHolder\n");
 
-            uintptr_t uiCprMgrVt = (uintptr_t)RESOLVE(0x106c9eba8) + 0x10;
+            uintptr_t uiCprMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_uicopy_paste_reset_manager) + 0x10;
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1462,7 +1961,7 @@ static bool findAudioCoreDM() {
             if (!g_uiCopyPasteResetManager)
                 fprintf(stderr, "[MC] UICopyPasteResetManager not found in UIManagerHolder\n");
 
-            uintptr_t cprSwitchInterpVt = (uintptr_t)RESOLVE(0x106ce1fe8) + 0x10;
+            uintptr_t cprSwitchInterpVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_copy_paste_reset_switch_interpreter) + 0x10;
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1478,7 +1977,7 @@ static bool findAudioCoreDM() {
             if (!g_copyPasteResetSwitchInterpreter)
                 fprintf(stderr, "[MC] CopyPasteResetSwitchInterpreter not found in UIManagerHolder\n");
 
-            uintptr_t selectorMgrVt = (uintptr_t)RESOLVE(0x106c77ca0) + 0x10;
+            uintptr_t selectorMgrVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_channel_selector_manager) + 0x10;
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1494,8 +1993,8 @@ static bool findAudioCoreDM() {
             if (!g_channelSelectorManager)
                 fprintf(stderr, "[MC] ChannelSelectorManager not found in UIManagerHolder\n");
             else {
-                uintptr_t selectorVt = (uintptr_t)RESOLVE(0x106c77c58) + 0x10;
-                uintptr_t selectorLiteVt = (uintptr_t)RESOLVE(0x106c7c098) + 0x10;
+                uintptr_t selectorVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_channel_selector) + 0x10;
+                uintptr_t selectorLiteVt = (uintptr_t)RESOLVE(g_binaryLayout->vt_channel_selector_lite) + 0x10;
                 g_channelSelector = findChildObjectByVtable(g_channelSelectorManager, selectorVt);
                 g_channelSelectorLite = findChildObjectByVtable(g_channelSelectorManager, selectorLiteVt);
                 if (g_channelSelector) {
@@ -1514,7 +2013,8 @@ static bool findAudioCoreDM() {
             if (!g_channelSelectorManager || !g_channelSelector)
                 discoverSelectorManagerFromChannelMapper("[MC] ");
 
-            uintptr_t multiFuncGetSelected = (uintptr_t)RESOLVE(0x1001098470);
+            uintptr_t multiFuncGetSelected =
+                (uintptr_t)RESOLVE(g_binaryLayout->fn_c_multifunction_channel_interface_get_selected_channel_int_const);
             for (int off = 0; off < 0x400; off += 8) {
                 void* ptr = nullptr;
                 safeRead((uint8_t*)uiHolder + off, &ptr, sizeof(ptr));
@@ -1547,7 +2047,7 @@ static bool findAudioCoreDM() {
 static void* getDynNetObj(int unitIdx, int module = 0) {
     int arrayIdx = module * 64 + unitIdx;
     if (arrayIdx < 0 || arrayIdx >= g_dynNetObjCount) return nullptr;
-    uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
+    uint8_t* base = (uint8_t*)g_registryRouter + g_binaryLayout->off_registry_router_table;
     void* entry = nullptr;
     safeRead(base + g_dynNetObjIndices[arrayIdx] * 8, &entry, sizeof(entry));
     return entry;
@@ -1560,11 +2060,11 @@ static void* readQListFirst(void* obj, int objOffset) {
     if (!safeRead((uint8_t*)obj + objOffset, &listDPtr, sizeof(listDPtr))) return nullptr;
     if (!listDPtr || (uintptr_t)listDPtr < 0x100000000ULL) return nullptr;
     int32_t begin = 0, end = 0;
-    safeRead((uint8_t*)listDPtr + 0x8, &begin, 4);
-    safeRead((uint8_t*)listDPtr + 0xc, &end, 4);
+    safeRead((uint8_t*)listDPtr + g_binaryLayout->off_q_list_data_begin, &begin, 4);
+    safeRead((uint8_t*)listDPtr + g_binaryLayout->off_q_list_data_end, &end, 4);
     if (begin == end) return nullptr;  // empty list
     void* elem = nullptr;
-    safeRead((uint8_t*)listDPtr + 0x10 + begin * 8, &elem, sizeof(elem));
+    safeRead((uint8_t*)listDPtr + g_binaryLayout->off_q_list_data_array_base + begin * 8, &elem, sizeof(elem));
     return elem;
 }
 
@@ -1572,7 +2072,7 @@ static void* readQListFirst(void* obj, int objOffset) {
 static void* getDynUnitClient(int idx) {
     if (!g_dynRack || idx < 0 || idx >= 64) return nullptr;
     typedef void* (*fn_GetDUC)(void* rack, uint8_t idx);
-    auto getDUC = (fn_GetDUC)RESOLVE(0x1005ce200);
+    auto getDUC = (fn_GetDUC)RESOLVE(g_binaryLayout->fn_c_dynamics_rack_get_dynamics_unit_client);
     return getDUC(g_dynRack, (uint8_t)idx);
 }
 
@@ -1595,28 +2095,28 @@ static void* getDyn8RecvPoint(int unitIdx) {
 static void* getDyn8SendPointFromManager(int unitIdx) {
     if (!g_audioSRPManager || unitIdx < 0 || unitIdx >= 64) return nullptr;
     typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
     return getSendPoint(g_audioSRPManager, 0x27, (uint16_t)unitIdx);
 }
 
 static void* getDyn8RecvPointFromManager(int unitIdx) {
     if (!g_audioSRPManager || unitIdx < 0 || unitIdx >= 64) return nullptr;
     typedef void* (*fn_GetReceivePoint)(void* mgr, uint32_t targetType, uint16_t targetNum);
-    auto getReceivePoint = (fn_GetReceivePoint)RESOLVE(0x1006c8a30);
+    auto getReceivePoint = (fn_GetReceivePoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_receive_point);
     return getReceivePoint(g_audioSRPManager, 0x25, (uint16_t)unitIdx);
 }
 
 static void* getDefaultInsertSendPoint() {
     if (!g_audioSRPManager) return nullptr;
     void* pt = nullptr;
-    safeRead((uint8_t*)g_audioSRPManager + 0x350, &pt, sizeof(pt));
+    safeRead((uint8_t*)g_audioSRPManager + g_binaryLayout->off_audio_srp_manager_first_send_point, &pt, sizeof(pt));
     return pt;
 }
 
 static void* getDefaultInsertReceivePoint() {
     if (!g_audioSRPManager) return nullptr;
     void* pt = nullptr;
-    safeRead((uint8_t*)g_audioSRPManager + 0x358, &pt, sizeof(pt));
+    safeRead((uint8_t*)g_audioSRPManager + g_binaryLayout->off_audio_srp_manager_first_receive_point, &pt, sizeof(pt));
     return pt;
 }
 
@@ -1691,7 +2191,7 @@ static QList<MCShowKey> getShowsForLocation(int location) {
     if (!client)
         return out;
     typedef void (*fn_GetShows)(void* client, QList<MCShowKey>& out, int location);
-    auto getShows = (fn_GetShows)RESOLVE(0x100723bc0);
+    auto getShows = (fn_GetShows)RESOLVE(g_binaryLayout->fn_c_show_manager_client_base_get_shows);
     getShows(client, out, location);
     return out;
 }
@@ -1796,7 +2296,7 @@ static bool recallShowByName(const QString& wantedName) {
     }
 
     typedef void (*fn_RecallShow)(void* client, MCShowKey key, bool arg1, bool arg2);
-    auto recallShow = (fn_RecallShow)RESOLVE(0x1007249e0);
+    auto recallShow = (fn_RecallShow)RESOLVE(g_binaryLayout->fn_c_show_manager_client_base_recall_show);
     fprintf(stderr,
             "[MC] recallShowByName('%s'): recalling key name='%s' loc=%d(%s) slot=%u aux='%s'\n",
             wantedName.toUtf8().constData(),
@@ -1867,7 +2367,7 @@ static bool copyShowByNameToLocation(const QString& sourceName,
                                 int copyAction,
                                 QString destName,
                                 int destLocation);
-    auto copyShow = (fn_CopyShow)RESOLVE(0x1007246f0);
+    auto copyShow = (fn_CopyShow)RESOLVE(g_binaryLayout->fn_c_show_manager_client_base_copy_show);
     fprintf(stderr,
             "[MC] copyShowByNameToLocation('%s' -> '%s'): source loc=%d(%s) slot=%u, dest loc=%d(%s), action=%d\n",
             sourceName.toUtf8().constData(),
@@ -2004,13 +2504,13 @@ static void recallScene(int sceneNum) {
     }
     uint16_t idx = (uint16_t)(sceneNum - 1); // 0-indexed
     typedef void (*fn_SetGoSceneIndex)(void* client, uint16_t idx);
-    auto setGoSceneIndex = (fn_SetGoSceneIndex)RESOLVE(0x10071e2c0);
+    auto setGoSceneIndex = (fn_SetGoSceneIndex)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_set_go_scene_index);
     typedef void (*fn_RecallCurrentSettings)(void* client);
-    auto recallSettings = (fn_RecallCurrentSettings)RESOLVE(0x10071e5b0);
+    auto recallSettings = (fn_RecallCurrentSettings)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_recall_current_settings);
 
     setGoSceneIndex(g_sceneClient, idx);
     typedef void (*fn_PerformGo)(void* client);
-    auto performGo = (fn_PerformGo)RESOLVE(0x10071e350);
+    auto performGo = (fn_PerformGo)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_perform_go);
     performGo(g_sceneClient);
     fprintf(stderr, "[MC] recallScene(%d): SetGoSceneIndex(%d) + PerformGo called\n", sceneNum, idx);
 }
@@ -2023,7 +2523,7 @@ static void recallCurrentSettingsViaSceneClient() {
         return;
     }
     typedef void (*fn_RecallCurrentSettings)(void* client);
-    auto recallCurrentSettings = (fn_RecallCurrentSettings)RESOLVE(0x10071e5b0);
+    auto recallCurrentSettings = (fn_RecallCurrentSettings)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_recall_current_settings);
     recallCurrentSettings(g_sceneClient);
     fprintf(stderr, "[MC] recallCurrentSettingsViaSceneClient: RecallCurrentSettings() called\n");
 }
@@ -2036,7 +2536,7 @@ static void emitSceneCurrentSettingsRecalledSignal() {
         return;
     }
     typedef void (*fn_SceneCurrentSettingsRecalled)(void* client);
-    auto emitSignal = (fn_SceneCurrentSettingsRecalled)RESOLVE(0x100368070);
+    auto emitSignal = (fn_SceneCurrentSettingsRecalled)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_scene_current_settings_recalled);
     emitSignal(g_sceneClient);
     fprintf(stderr, "[MC] emitSceneCurrentSettingsRecalledSignal: SceneCurrentSettingsRecalled() emitted\n");
 }
@@ -2229,7 +2729,7 @@ static bool waitForShowArchived() {
 
 static bool storeCurrentSettingsViaSceneClient() {
     typedef void (*fn_StoreCurrentSettings)(void* client);
-    auto storeCurrentSettings = (fn_StoreCurrentSettings)RESOLVE(0x10071e5a0);
+    auto storeCurrentSettings = (fn_StoreCurrentSettings)RESOLVE(g_binaryLayout->fn_c_scene_manager_intermediate_client_store_current_settings);
     if (!g_sceneClient || !storeCurrentSettings) {
         fprintf(stderr,
                 "[MC][SHOWSAVE] scene current-settings store path unavailable\n");
@@ -2455,11 +2955,11 @@ static bool waitForInputConfigurationChangedSignal(QObject* sender,
 
 static bool sendStereoConfigViaDiscovery(const uint8_t config[64], const char* tag) {
     typedef void* (*fn_DiscoveryInstance)();
-    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(0x10059c610);
+    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(g_binaryLayout->fn_c_discovery_instance);
     typedef void* (*fn_GetSBDiscovery)(void*);
-    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(0x10059c9a0);
+    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(g_binaryLayout->fn_c_discovery_get_stage_box_discovery_object);
     typedef void (*fn_SendInputConfigSetMessage)(void* sbObj, const void* cfg, bool flag);
-    auto sendInputConfigSetMessage = (fn_SendInputConfigSetMessage)RESOLVE(0x1005b0db0);
+    auto sendInputConfigSetMessage = (fn_SendInputConfigSetMessage)RESOLVE(g_binaryLayout->fn_c_stage_box_discovery_object_base_send_input_configuration_set_message);
 
     void* disc = discoveryInstance ? discoveryInstance() : nullptr;
     if (!disc || !getStageBox || !sendInputConfigSetMessage) {
@@ -2598,13 +3098,13 @@ static void collectAssignedDyn8Units(std::set<int>& usedUnits) {
     if (!g_channelManager) return;
 
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
     typedef bool (*fn_HasInserts)(void* channel, int insertPoint);
-    auto hasInserts = (fn_HasInserts)RESOLVE(0x1006df5e0);
+    auto hasInserts = (fn_HasInserts)RESOLVE(g_binaryLayout->fn_has_inserts_c_channel_e_insert_point_const);
     typedef void* (*fn_GetInsertReturnPoint)(void* channel, int insertPoint);
-    auto getReturnPoint = (fn_GetInsertReturnPoint)RESOLVE(0x1006d9850);
+    auto getReturnPoint = (fn_GetInsertReturnPoint)RESOLVE(g_binaryLayout->fn_get_insert_return_point_c_channel_e_insert_point_const);
     typedef int (*fn_GetParentType)(void* sendPoint);
-    auto getParentType = (fn_GetParentType)RESOLVE(0x1006cd690);
+    auto getParentType = (fn_GetParentType)RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_parent_type);
     if (!getChannel || !hasInserts || !getReturnPoint || !getParentType)
         return;
 
@@ -2616,7 +3116,7 @@ static void collectAssignedDyn8Units(std::set<int>& usedUnits) {
             void* returnPt = getReturnPoint(cChannel, ip);
             if (!returnPt) continue;
             void* connSendPt = nullptr;
-            safeRead((uint8_t*)returnPt + 0x20, &connSendPt, sizeof(connSendPt));
+            safeRead((uint8_t*)returnPt + g_binaryLayout->off_insert_return_connected_send_point, &connSendPt, sizeof(connSendPt));
             if (!connSendPt || getParentType(connSendPt) != 5) continue;
             int dynIdx = findDyn8UnitIdx(connSendPt);
             if (dynIdx >= 0)
@@ -2672,9 +3172,9 @@ static void resolveDynNamePrefix() {
     g_dynNamePrefix[0] = '\0';
 
     typedef void* (*fn_DiscoveryInstance)();
-    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(0x10059c610);
+    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(g_binaryLayout->fn_c_discovery_instance);
     typedef void* (*fn_GetSBDiscovery)(void*);
-    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(0x10059c9a0);
+    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(g_binaryLayout->fn_c_discovery_get_stage_box_discovery_object);
 
     void* disc = discoveryInstance();
     if (!disc) { fprintf(stderr, "[MC] Discovery::Instance() returned null\n"); return; }
@@ -2683,7 +3183,7 @@ static void resolveDynNamePrefix() {
 
     // Read C string at sbObj+0x99
     char buf[128] = {0};
-    safeRead((uint8_t*)sbObj + 0x99, buf, sizeof(buf) - 1);
+    safeRead((uint8_t*)sbObj + g_binaryLayout->off_stagebox_surface_name, buf, sizeof(buf) - 1);
     strncpy(g_dynNamePrefix, buf, sizeof(g_dynNamePrefix) - 1);
     fprintf(stderr, "[MC] Dynamics name prefix: '%s'\n", g_dynNamePrefix);
 }
@@ -2812,7 +3312,7 @@ static bool libraryStoreDyn8(int unitIdx, const char* presetName) {
     uint64_t stripKey = 0; // zero-initialized (same as UI ActionAdd code)
 
     typedef void (*fn_CreateLibrary)(void* client, void* libKey, void* qlistStr, void* qlistBool, uint64_t stripKey);
-    auto createLibrary = (fn_CreateLibrary)RESOLVE(0x1006f2020);
+    auto createLibrary = (fn_CreateLibrary)RESOLVE(g_binaryLayout->fn_c_library_manager_client_create_library);
 
     fprintf(stderr, "[MC] libraryStoreDyn8: storing unit %d ('%s') as '%s'...\n",
             unitIdx, dynUnitName, presetName);
@@ -2845,7 +3345,7 @@ static bool libraryRecallDyn8(int tgtCh, const char* presetName, const char* sto
     // RecallObjectFromLibrary(this, &sLibraryKey, eLibraryObject, &QString, &QList<bool>, sChannelStripKey, bool)
     typedef void (*fn_RecallFromLib)(void* client, void* libKey, uint32_t libObj,
                                       void* qstr, void* qlistBool, uint64_t stripKey, bool flag);
-    auto recallFromLib = (fn_RecallFromLib)RESOLVE(0x1006f3f80);
+    auto recallFromLib = (fn_RecallFromLib)RESOLVE(g_binaryLayout->fn_c_library_manager_client_recall_object_from_library);
 
     fprintf(stderr, "[MC] libraryRecallDyn8: recalling '%s' (obj='%s') onto ch %d...\n",
             presetName, storedObjName, tgtCh+1);
@@ -2866,7 +3366,7 @@ static bool libraryDeleteDyn8(const char* presetName) {
     void* libKey = makeLibraryKey(nameQStr, 1, 0xb); // location=1
 
     typedef void (*fn_DeleteLibrary)(void* client, void* libKey);
-    auto deleteLibrary = (fn_DeleteLibrary)RESOLVE(0x1006f1cb0);
+    auto deleteLibrary = (fn_DeleteLibrary)RESOLVE(g_binaryLayout->fn_c_library_manager_client_delete_library);
 
     fprintf(stderr, "[MC] libraryDeleteDyn8: deleting '%s'...\n", presetName);
     deleteLibrary(g_libraryMgrClient, libKey);
@@ -2878,7 +3378,7 @@ static bool libraryDeleteDyn8(const char* presetName) {
 
 static void probeLibraryTypesForChannel(int ch) {
     typedef uint8_t (*fn_GetLibraryObjectIndex)(uint32_t type, uint32_t object);
-    auto getLibraryObjectIndex = (fn_GetLibraryObjectIndex)RESOLVE(0x1005a1c70);
+    auto getLibraryObjectIndex = (fn_GetLibraryObjectIndex)RESOLVE(g_binaryLayout->fn_s_library_key_get_library_object_index);
     if (!getLibraryObjectIndex) return;
 
     struct ProbeObj { uint32_t obj; const char* name; };
@@ -2946,7 +3446,7 @@ static void* makeQListQStringN(const std::vector<void*>& qstrs) {
 
 static void* getChannelLibraryTargetQString(uint32_t libType, uint32_t libObj, uint64_t stripKey) {
     typedef void (*fn_GetTargetName)(void* retQStr, uint32_t libType, uint32_t libObj, uint64_t stripKey);
-    auto getTargetName = (fn_GetTargetName)RESOLVE(0x1000d88f0);
+    auto getTargetName = (fn_GetTargetName)RESOLVE(g_binaryLayout->fn_c_library_recall_utils_get_channel_library_target_object_name);
     if (!getTargetName) return nullptr;
     void* qstr = nullptr;
     getTargetName(&qstr, libType, libObj, stripKey);
@@ -2975,7 +3475,7 @@ static bool libraryStoreInputChannel(int srcCh, const char* presetName) {
     void* qlistBool = makeQListBoolN(targets.size(), true);
 
     typedef void (*fn_CreateLibrary)(void* client, void* libKey, void* qlistStr, void* qlistBool, uint64_t stripKey);
-    auto createLibrary = (fn_CreateLibrary)RESOLVE(0x1006f2020);
+    auto createLibrary = (fn_CreateLibrary)RESOLVE(g_binaryLayout->fn_c_library_manager_client_create_library);
     fprintf(stderr, "[MC] libraryStoreInputChannel: storing ch %d as '%s' (%zu objs)\n",
             srcCh + 1, presetName, targets.size());
     createLibrary(g_libraryMgrClient, libKey, qlistStr, qlistBool, stripKey);
@@ -2994,7 +3494,7 @@ static bool libraryRecallInputChannel(int tgtCh, const char* presetName) {
     void* libKey = makeLibraryKey(nameQStr, 1, kInputChannelLibraryType);
     typedef void (*fn_RecallFromLib)(void* client, void* libKey, uint32_t libObj,
                                      void* objNameQStrPtr, void* qlistBool, uint64_t stripKey, bool);
-    auto recallFromLib = (fn_RecallFromLib)RESOLVE(0x1006f3f80);
+    auto recallFromLib = (fn_RecallFromLib)RESOLVE(g_binaryLayout->fn_c_library_manager_client_recall_object_from_library);
 
     fprintf(stderr, "[MC] libraryRecallInputChannel: recalling '%s' onto ch %d\n",
             presetName, tgtCh + 1);
@@ -3016,7 +3516,7 @@ static bool libraryDeleteInputChannel(const char* presetName) {
     if (!nameQStr) return false;
     void* libKey = makeLibraryKey(nameQStr, 1, kInputChannelLibraryType);
     typedef void (*fn_DeleteLibrary)(void* client, void* libKey);
-    auto deleteLibrary = (fn_DeleteLibrary)RESOLVE(0x1006f1cb0);
+    auto deleteLibrary = (fn_DeleteLibrary)RESOLVE(g_binaryLayout->fn_c_library_manager_client_delete_library);
     fprintf(stderr, "[MC] libraryDeleteInputChannel: deleting '%s'\n", presetName);
     deleteLibrary(g_libraryMgrClient, libKey);
     free(libKey);
@@ -3057,16 +3557,16 @@ static bool selectInputChannelForUI(int ch, const char* phaseTag = nullptr) {
         return false;
     }
     typedef void (*fn_SetCurrentlySelectedChannel)(void* holder, void* channel);
-    auto setCurrentlySelectedChannel = (fn_SetCurrentlySelectedChannel)RESOLVE(0x10076c070);
+    auto setCurrentlySelectedChannel = (fn_SetCurrentlySelectedChannel)RESOLVE(g_binaryLayout->fn_c_uimanager_holder_set_currently_selected_channel);
     typedef void (*fn_UIListenChangeChannel)(void* mgr, void* channel);
-    auto uiListenChangeChannel = (fn_UIListenChangeChannel)RESOLVE(0x100370060);
+    auto uiListenChangeChannel = (fn_UIListenChangeChannel)RESOLVE(g_binaryLayout->fn_c_uilisten_manager_change_channel);
     struct UIChannelStripKey {
         uint32_t stripType = 0;
         uint8_t channel = 0xFF;
         uint8_t pad[3] = {0, 0, 0};
     };
     typedef void (*fn_SelectChannelByKey)(void* listener, UIChannelStripKey key);
-    auto selectChannelByKey = (fn_SelectChannelByKey)RESOLVE(0x10076bf50);
+    auto selectChannelByKey = (fn_SelectChannelByKey)RESOLVE(g_binaryLayout->fn_c_uichannel_select_listener_select_channel);
     if (!setCurrentlySelectedChannel) {
         fprintf(stderr, "[MC] %sselectInputChannelForUI: SetCurrentlySelectedChannel unavailable\n",
                 phaseTag ? phaseTag : "");
@@ -3192,31 +3692,31 @@ static void waitForStereoConfigReset();
 // Read the current stereo config (64 bytes) from the StageBox discovery object.
 static bool readStereoConfig(uint8_t config[64]) {
     typedef void* (*fn_DiscoveryInstance)();
-    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(0x10059c610);
+    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(g_binaryLayout->fn_c_discovery_instance);
     typedef void* (*fn_GetSBDiscovery)(void*);
-    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(0x10059c9a0);
+    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(g_binaryLayout->fn_c_discovery_get_stage_box_discovery_object);
 
     void* disc = discoveryInstance();
     if (!disc) { fprintf(stderr, "[MC] readStereoConfig: Discovery null\n"); return false; }
     void* sbObj = getStageBox(disc);
     if (!sbObj) { fprintf(stderr, "[MC] readStereoConfig: sbObj null\n"); return false; }
 
-    return safeRead((uint8_t*)sbObj + 0x21e, config, 64);
+    return safeRead((uint8_t*)sbObj + g_binaryLayout->off_stagebox_input_config, config, 64);
 }
 
 // Write stereo config (64 bytes) to the StageBox discovery object.
 static bool writeStereoConfig(const uint8_t config[64]) {
     typedef void* (*fn_DiscoveryInstance)();
-    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(0x10059c610);
+    auto discoveryInstance = (fn_DiscoveryInstance)RESOLVE(g_binaryLayout->fn_c_discovery_instance);
     typedef void* (*fn_GetSBDiscovery)(void*);
-    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(0x10059c9a0);
+    auto getStageBox = (fn_GetSBDiscovery)RESOLVE(g_binaryLayout->fn_c_discovery_get_stage_box_discovery_object);
 
     void* disc = discoveryInstance();
     if (!disc) return false;
     void* sbObj = getStageBox(disc);
     if (!sbObj) return false;
 
-    return safeWrite((uint8_t*)sbObj + 0x21e, config, 64);
+    return safeWrite((uint8_t*)sbObj + g_binaryLayout->off_stagebox_input_config, config, 64);
 }
 
 // Change a channel pair's stereo status and apply.
@@ -3280,7 +3780,9 @@ static void* getInsertNetObj(int ch, int ip) {
     if (!inputCh) return nullptr;
     int chIdx = 12 + ip;
     void** drvArr = nullptr;
-    safeRead((uint8_t*)inputCh + 0x28 + chIdx * 8, &drvArr, sizeof(drvArr));
+    safeRead((uint8_t*)inputCh + g_binaryLayout->off_input_channel_processing_driver_array + chIdx * 8,
+             &drvArr,
+             sizeof(drvArr));
     if (!drvArr) return nullptr;
     void* insertNetObj = nullptr;
     safeRead(&drvArr[1], &insertNetObj, sizeof(insertNetObj));
@@ -3295,11 +3797,13 @@ static uint8_t* getInputAttrsPtr(int ch) {
     int chInGrp = ch & 7;     // ch % 8
 
     void* mixer = nullptr;
-    safeRead((uint8_t*)g_inputMixerWrapper + 0x90 + group * 8, &mixer, sizeof(mixer));
+    safeRead((uint8_t*)g_inputMixerWrapper + g_binaryLayout->off_input_mixer_wrapper_group_mixer_array + group * 8,
+             &mixer,
+             sizeof(mixer));
     if (!mixer) return nullptr;
 
     void* attrs = nullptr;
-    safeRead((uint8_t*)mixer + 0x200, &attrs, sizeof(attrs));
+    safeRead((uint8_t*)mixer + g_binaryLayout->off_input_mixer_attrs, &attrs, sizeof(attrs));
     if (!attrs) return nullptr;
 
     return (uint8_t*)attrs + chInGrp * SINPUTATTRS_SIZE;
@@ -3512,7 +4016,7 @@ static bool getAnalogueSocketIndexForAudioSource(const sAudioSource& source, int
 static void* getAnalogueInput(int socketNum) {
     if (!g_registryRouter || g_firstAnalogueInputIdx < 0 ||
         socketNum < 0 || socketNum > kMaxAnalogueInputSocket) return nullptr;
-    uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
+    uint8_t* base = (uint8_t*)g_registryRouter + g_binaryLayout->off_registry_router_table;
     void* entry = nullptr;
     safeRead(base + (g_firstAnalogueInputIdx + socketNum) * 8, &entry, sizeof(entry));
     return entry;
@@ -3523,12 +4027,12 @@ static bool readPreampDataForSocket(int socketNum, PreampData& pd) {
     if (!ai) return false;
 
     void* gainPtr = nullptr;
-    safeRead((uint8_t*)ai + 0x98, &gainPtr, sizeof(gainPtr));
+    safeRead((uint8_t*)ai + g_binaryLayout->off_analogue_input_gain_ptr, &gainPtr, sizeof(gainPtr));
     if (!gainPtr) return false;
     safeRead(gainPtr, &pd.gain, sizeof(pd.gain));
 
     void* padPtr = nullptr;
-    safeRead((uint8_t*)ai + 0xa0, &padPtr, sizeof(padPtr));
+    safeRead((uint8_t*)ai + g_binaryLayout->off_analogue_input_pad_ptr, &padPtr, sizeof(padPtr));
     if (padPtr) {
         uint8_t rawPad = 0;
         safeRead(padPtr, &rawPad, sizeof(rawPad));
@@ -3537,7 +4041,7 @@ static bool readPreampDataForSocket(int socketNum, PreampData& pd) {
     else pd.pad = 0;
 
     void* phantomPtr = nullptr;
-    safeRead((uint8_t*)ai + 0xa8, &phantomPtr, sizeof(phantomPtr));
+    safeRead((uint8_t*)ai + g_binaryLayout->off_analogue_input_phantom_ptr, &phantomPtr, sizeof(phantomPtr));
     if (phantomPtr) {
         uint8_t rawPhantom = 0;
         safeRead(phantomPtr, &rawPhantom, sizeof(rawPhantom));
@@ -3566,8 +4070,8 @@ static void* findLiveCsvImportPreampManager() {
     if (!g_registryRouter)
         return nullptr;
 
-    void* expectedVt = (void*)((uintptr_t)RESOLVE(0x106d248c0) + 16);
-    uint8_t* base = (uint8_t*)g_registryRouter + 0x3a9820;
+    void* expectedVt = (void*)((uintptr_t)RESOLVE(g_binaryLayout->vt_import_preamp_data_manager) + 16);
+    uint8_t* base = (uint8_t*)g_registryRouter + g_binaryLayout->off_registry_router_table;
     for (int i = 0; i < 10000; ++i) {
         void* entry = nullptr;
         if (!safeRead(base + i * 8, &entry, sizeof(entry)))
@@ -3606,11 +4110,11 @@ static bool writePreampDataViaCsvImport(const sAudioSource& source,
 
     void* mgr = ensureCsvImportPreampManager();
     auto sourceTypeToSocketLocation =
-        (fn_SourceTypeToSocketLocation)RESOLVE(0x100f5bc70);
-    auto gainToUword = (fn_GainToUWORD)RESOLVE(0x100105fa0);
-    auto reset = (fn_CsvImportPreampReset)RESOLVE(0x10108c040);
-    auto insertPreamp = (fn_CsvImportPreampInsert)RESOLVE(0x10108c940);
-    auto startSeeking = (fn_CsvImportPreampStartSeeking)RESOLVE(0x10108bf50);
+        (fn_SourceTypeToSocketLocation)RESOLVE(g_binaryLayout->fn_csvimport_utilities_source_type_to_socket_location);
+    auto gainToUword = (fn_GainToUWORD)RESOLVE(g_binaryLayout->fn_gain_to_uword);
+    auto reset = (fn_CsvImportPreampReset)RESOLVE(g_binaryLayout->fn_c_import_preamp_data_manager_reset);
+    auto insertPreamp = (fn_CsvImportPreampInsert)RESOLVE(g_binaryLayout->fn_c_import_preamp_data_manager_insert_preamp);
+    auto startSeeking = (fn_CsvImportPreampStartSeeking)RESOLVE(g_binaryLayout->fn_c_import_preamp_data_manager_start_seeking);
     if (!mgr || !sourceTypeToSocketLocation || !gainToUword || !reset ||
         !insertPreamp || !startSeeking) {
         fprintf(stderr,
@@ -3730,14 +4234,14 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
     typedef void (*fn_SetSWORD)(void*, int16_t, uint32_t);
     typedef void (*fn_SetUBYTE)(void*, uint8_t, uint32_t);
 
-    auto midiSetGain = (fn_MIDISetGain)RESOLVE(0x1004ecf80);
-    auto midiSetPad = (fn_MIDISetPad)RESOLVE(0x1004ed020);
-    auto midiSetPhantom = (fn_MIDISetPhantom)RESOLVE(0x1004ed0a0);
-    auto setStatus = (fn_SetStatus)RESOLVE(0x1004ed410);
-    auto informOthers = (fn_InformOtherObjects)RESOLVE(0x1000eb020);
-    auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
-    auto setSWord = (fn_SetSWORD)RESOLVE(0x1000eb000);
-    auto setUByte = (fn_SetUBYTE)RESOLVE(0x1000ebde0);
+    auto midiSetGain = (fn_MIDISetGain)RESOLVE(g_binaryLayout->fn_c_analogue_input_midiset_gain);
+    auto midiSetPad = (fn_MIDISetPad)RESOLVE(g_binaryLayout->fn_c_analogue_input_midiset_pad);
+    auto midiSetPhantom = (fn_MIDISetPhantom)RESOLVE(g_binaryLayout->fn_c_analogue_input_midiset_phantom_power);
+    auto setStatus = (fn_SetStatus)RESOLVE(g_binaryLayout->fn_c_analogue_input_set_status);
+    auto informOthers = (fn_InformOtherObjects)RESOLVE(g_binaryLayout->fn_c_net_object_inform_other_objects);
+    auto setLen = (fn_SetLength)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_length);
+    auto setSWord = (fn_SetSWORD)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_sword);
+    auto setUByte = (fn_SetUBYTE)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_ubyte);
 
     fprintf(stderr,
             "[MC]     Preamp write begin socket %d ai=%p gain=%d pad=%d phantom=%d\n",
@@ -3751,7 +4255,7 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
         return true;
     }
     if (directBoolWrites) {
-        void* embMsg = (uint8_t*)ai + 0x60;
+            void* embMsg = (uint8_t*)ai + g_binaryLayout->off_netobj_embedded_msg;
         if (setStatus && setLen && setSWord && setUByte) {
             int16_t wantGain = pd.gain;
             bool wantPad = pd.pad != 0;
@@ -3781,14 +4285,14 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
         }
 
         void* padPtr = nullptr;
-        safeRead((uint8_t*)ai + 0xa0, &padPtr, sizeof(padPtr));
+        safeRead((uint8_t*)ai + g_binaryLayout->off_analogue_input_pad_ptr, &padPtr, sizeof(padPtr));
         if (padPtr) {
             uint8_t pad = pd.pad ? 1 : 0;
             safeWrite(padPtr, &pad, sizeof(pad));
         }
 
         void* phantomPtr = nullptr;
-        safeRead((uint8_t*)ai + 0xa8, &phantomPtr, sizeof(phantomPtr));
+        safeRead((uint8_t*)ai + g_binaryLayout->off_analogue_input_phantom_ptr, &phantomPtr, sizeof(phantomPtr));
         if (phantomPtr) {
             uint8_t phantom = pd.phantom ? 1 : 0;
             safeWrite(phantomPtr, &phantom, sizeof(phantom));
@@ -3797,14 +4301,14 @@ static bool writePreampDataForSocket(int socketNum, const PreampData& pd,
         uint8_t type5 = 0x5;
         uint16_t hdr10 = 0xFFFF;
         uint32_t hdr14 = 0xFFFFFFFF;
-        safeWrite((uint8_t*)ai + 0x84, &type5, sizeof(type5));
-        safeWrite((uint8_t*)ai + 0x70, &hdr10, sizeof(hdr10));
-        safeWrite((uint8_t*)ai + 0x74, &hdr14, sizeof(hdr14));
+        safeWrite((uint8_t*)ai + g_binaryLayout->off_analogue_input_type_marker, &type5, sizeof(type5));
+        safeWrite((uint8_t*)ai + g_binaryLayout->off_netobj_hdr10, &hdr10, sizeof(hdr10));
+        safeWrite((uint8_t*)ai + g_binaryLayout->off_netobj_hdr14, &hdr14, sizeof(hdr14));
 
         auto sendBoolUpdate = [&](uint64_t opcode, uint8_t value) {
             if (!informOthers || !setLen || !setUByte)
                 return;
-            safeWrite((uint8_t*)ai + 0x7c, &opcode, sizeof(opcode));
+            safeWrite((uint8_t*)ai + g_binaryLayout->off_netobj_opcode, &opcode, sizeof(opcode));
             setLen(embMsg, 1);
             setUByte(embMsg, value ? 1 : 0, 0);
             informOthers(ai, embMsg);
@@ -3877,7 +4381,7 @@ static bool getSendPointForAudioSource(const sAudioSource& source, void*& sendPt
     sendPt = nullptr;
     if (!g_audioSRPManager) return false;
     typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
     if (!getSendPoint) return false;
     sendPt = getSendPoint(g_audioSRPManager, source.type, (uint16_t)source.number);
     return sendPt != nullptr;
@@ -3886,7 +4390,9 @@ static bool getSendPointForAudioSource(const sAudioSource& source, void*& sendPt
 static void* getUnassignedInputSendPoint() {
     if (!g_audioSRPManager) return nullptr;
     void* sendPt = nullptr;
-    safeRead((uint8_t*)g_audioSRPManager + 0x350, &sendPt, sizeof(sendPt));
+    safeRead((uint8_t*)g_audioSRPManager + g_binaryLayout->off_audio_srp_manager_first_send_point,
+             &sendPt,
+             sizeof(sendPt));
     return sendPt;
 }
 
@@ -3895,7 +4401,7 @@ static bool audioSourceIsSocketBackedPreamp(const sAudioSource& source) {
     if (!getSendPointForAudioSource(source, sendPt) || !sendPt)
         return false;
     typedef int (*fn_GetParentType)(void* sendPoint);
-    auto getParentType = (fn_GetParentType)RESOLVE(0x1006cd690);
+    auto getParentType = (fn_GetParentType)RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_parent_type);
     return getParentType && getParentType(sendPt) == 3;
 }
 
@@ -4068,23 +4574,26 @@ static void probeChannelBindings(const char* tag, int loCh, int hiCh) {
     typedef void*   (*fn_GetInputSource)(void* channel);
     typedef void*   (*fn_GetProxy)(void* mgr, void* parent);
     typedef uint8_t (*fn_GetActiveInputSource)(void* channel);
-    auto getChannel        = (fn_GetChannel)        RESOLVE(0x1006e3f90);
-    auto getInputSource    = (fn_GetInputSource)    RESOLVE(0x1006d8130);
-    auto getProxy          = (fn_GetProxy)          RESOLVE(0x100738720);
-    auto getActiveInputSrc = (fn_GetActiveInputSource)RESOLVE(0x1006d80d0);
+    auto getChannel        = (fn_GetChannel)        RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
+    auto getInputSource    = (fn_GetInputSource)    RESOLVE(g_binaryLayout->fn_c_channel_get_input_source_const);
+    auto getProxy          = (fn_GetProxy)          RESOLVE(g_binaryLayout->fn_c_socket_proxy_manager_get_proxy);
+    auto getActiveInputSrc = (fn_GetActiveInputSource)RESOLVE(g_binaryLayout->fn_c_channel_get_active_input_source_const);
     typedef void* (*fn_AppInstance)();
-    auto appInstance = (fn_AppInstance)RESOLVE(0x100d5a120);
+    auto appInstance = (fn_AppInstance)RESOLVE(g_binaryLayout->fn_c_application_instance);
     uint8_t* preampOptByteArr = nullptr;
     if (appInstance) {
         void* app = appInstance();
         if (app) {
-            void* drbox = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(app) + 0xb8);
+            void* drbox = *reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(app) + g_binaryLayout->off_app_drbox);
             if (drbox) {
-                void* audioCore = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(drbox) + 0x48);
+                void* audioCore = *reinterpret_cast<void**>(
+                    reinterpret_cast<uint8_t*>(drbox) + g_binaryLayout->off_drbox_audio_core);
                 if (audioCore) {
-                    void* preampMgr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(audioCore) + 0x22b20);
+                    void* preampMgr = *reinterpret_cast<void**>(
+                        reinterpret_cast<uint8_t*>(audioCore) + g_binaryLayout->off_audio_core_preamp_manager);
                     if (preampMgr) {
-                        preampOptByteArr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(preampMgr) + 0x88);
+                        preampOptByteArr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(preampMgr) + g_binaryLayout->off_preamp_manager_option_byte_array);
                         fprintf(stderr, "[MC] %s preampMgr=%p byteArr=%p\n", tag, preampMgr, preampOptByteArr);
                     }
                 }
@@ -4093,23 +4602,23 @@ static void probeChannelBindings(const char* tag, int loCh, int hiCh) {
     }
     if (!getChannel || !getInputSource || !g_channelManager) return;
     void* mgr = (g_uiManagerHolder && getProxy)
-        ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + 0x118)
+        ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + g_binaryLayout->off_uiholder_socket_proxy_manager)
         : nullptr;
     for (int ch = loCh; ch <= hiCh; ++ch) {
         void* chan = getChannel(g_channelManager, 1, (uint8_t)ch);
         if (!chan) { fprintf(stderr, "[MC] %s ch%2d: chan=null\n", tag, ch+1); continue; }
         void* sp = getInputSource(chan);
         if (!sp) { fprintf(stderr, "[MC] %s ch%2d: chan=%p sendPt=null\n", tag, ch+1, chan); continue; }
-        void* parent = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(sp) + 0x30);
+        void* parent = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(sp) + g_binaryLayout->off_send_point_parent);
         void* proxy = (mgr && parent) ? getProxy(mgr, parent) : nullptr;
         unsigned sockEnum = 0;
-        if (proxy) sockEnum = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(proxy) + 0x28);
+        if (proxy) sockEnum = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(proxy) + g_binaryLayout->off_socket_proxy_socket_enum);
         uint8_t activeSrc = getActiveInputSrc ? getActiveInputSrc(chan) : 0xff;
         // cUIManagerHolder::Instance()->0x28->0x90[ch] (int32 array seen in ChangeChannel)
         uint32_t holderTbl = 0xffffffff;
         if (g_uiManagerHolder) {
-            void* sub = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + 0x28);
-            if (sub) holderTbl = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sub) + 0x90 + ch*4);
+            void* sub = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(g_uiManagerHolder) + g_binaryLayout->off_uiholder_probe_subsystem);
+            if (sub) holderTbl = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(sub) + g_binaryLayout->off_uiholder_probe_channel_table + ch*4);
         }
         unsigned poByte = preampOptByteArr ? preampOptByteArr[ch] : 0xff;
         fprintf(stderr, "[MC] %s ch%2d: chan=%p sp=%p proxy=%p sockEnum=0x%x activeSrc=0x%02x preampOpt[ch]=0x%02x\n",
@@ -4124,14 +4633,15 @@ static void probeChannelBindings(const char* tag, int loCh, int hiCh) {
 static void* getManagedInputChannel(int ch) {
     if (!g_channelManager || ch < 0 || ch > 127) return nullptr;
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
     return getChannel ? getChannel(g_channelManager, 1, (uint8_t)ch) : nullptr;
 }
 
 static void* getInputStripControl(int ch) {
     if (!g_surfaceChannels || ch < 0 || ch > 127) return nullptr;
     typedef void* (*fn_GetSurfaceChannel)(void* surfaceChannels, uint32_t stripType, uint8_t chNum);
-    auto getSurfaceChannel = (fn_GetSurfaceChannel)RESOLVE(0x1048ea90);
+    auto getSurfaceChannel =
+        (fn_GetSurfaceChannel)RESOLVE(g_binaryLayout->fn_c_surface_channels_get_channel_e_channel_strip_type_unsigned_char);
     return getSurfaceChannel ? getSurfaceChannel(g_surfaceChannels, 1, (uint8_t)ch) : nullptr;
 }
 
@@ -4141,7 +4651,7 @@ static bool readMuteGroupMaskForChannel(int ch, uint8_t& maskOut) {
     if (!stripCtrl) return false;
 
     typedef bool (*fn_GetMuteGroupAssign)(void* stripCtrl, uint8_t groupIdx);
-    auto getMuteGroupAssign = (fn_GetMuteGroupAssign)RESOLVE(0x100331bd0);
+    auto getMuteGroupAssign = (fn_GetMuteGroupAssign)RESOLVE(g_binaryLayout->fn_c_channel_strip_control_get_mute_group_assign_unsigned_char_const);
     if (!getMuteGroupAssign) return false;
 
     for (int group = 0; group < kNumMuteGroups; group++) {
@@ -4182,7 +4692,7 @@ static bool g_sendPointSourceCacheBuilt = false;
 
 static bool readNumSendPointsForType(uint32_t sourceType, uint16_t& count) {
     if (sourceType >= 0x2f) return false;
-    const uint16_t* counts = (const uint16_t*)RESOLVE(0x1029851c0);
+    const uint16_t* counts = (const uint16_t*)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_numbers_of_audio_send_points);
     return safeRead((const void*)(counts + sourceType), &count, sizeof(count));
 }
 
@@ -4190,7 +4700,7 @@ static void buildSendPointSourceCache() {
     if (g_sendPointSourceCacheBuilt || !g_audioSRPManager) return;
 
     typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
     if (!getSendPoint) return;
 
     for (uint32_t sourceType = 0; sourceType < 0x2f; sourceType++) {
@@ -4222,7 +4732,7 @@ static bool resolveAudioSourceFromSendPoint(void* sendPt, sAudioSource& source) 
 static bool resolveLocalAnalogueSourceFromSendPoint(void* sendPt, sAudioSource& source) {
     if (!sendPt || !g_audioSRPManager) return false;
     typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-    auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
     if (!getSendPoint) return false;
 
     uint16_t count = 0;
@@ -4404,8 +4914,8 @@ static bool readSidechainRef(void* obj, uint8_t& stripType, uint8_t& channel) {
     if (!obj) return false;
     void* pStripType = nullptr;
     void* pChannel   = nullptr;
-    safeRead((uint8_t*)obj + 0x138, &pStripType, sizeof(pStripType));
-    safeRead((uint8_t*)obj + 0x140, &pChannel, sizeof(pChannel));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_sidechain_strip_type_ptr, &pStripType, sizeof(pStripType));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_sidechain_channel_ptr, &pChannel, sizeof(pChannel));
     if (!pStripType || !pChannel) return false;
 
     uint32_t st32 = 0;
@@ -4421,8 +4931,8 @@ static bool readStereoImageState(void* obj, uint16_t& width, uint8_t& mode) {
     if (!obj) return false;
     void* widthPtr = nullptr;
     void* modePtr = nullptr;
-    safeRead((uint8_t*)obj + 0xA0, &widthPtr, sizeof(widthPtr));
-    safeRead((uint8_t*)obj + 0xA8, &modePtr, sizeof(modePtr));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_stereo_image_width_ptr, &widthPtr, sizeof(widthPtr));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_stereo_image_mode_ptr, &modePtr, sizeof(modePtr));
     if (!widthPtr || !modePtr) return false;
     if (!safeRead(widthPtr, &width, sizeof(width))) return false;
     if (!safeRead(modePtr, &mode, sizeof(mode))) return false;
@@ -4440,19 +4950,19 @@ static void writeSidechainRef(void* obj, int procIdx, int ch,
     typedef void (*fn_SetLength)(void*, uint32_t);
     typedef void (*fn_SetUBYTE)(void*, uint8_t, uint32_t);
 
-    auto setStatus = (fn_SetStatus)RESOLVE(0x1002e5690);
-    auto identifyAndRefresh = (fn_IdentifyAndRefresh)RESOLVE(0x1002e4e80);
-    auto informOthers = (fn_InformOtherObjects)RESOLVE(0x1000eb020);
-    auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
-    auto setUByte = (fn_SetUBYTE)RESOLVE(0x1000ebde0);
+    auto setStatus = (fn_SetStatus)RESOLVE(g_binaryLayout->fn_c_side_chain_select_set_status);
+    auto identifyAndRefresh = (fn_IdentifyAndRefresh)RESOLVE(g_binaryLayout->fn_c_side_chain_select_identify_and_refresh);
+    auto informOthers = (fn_InformOtherObjects)RESOLVE(g_binaryLayout->fn_c_net_object_inform_other_objects);
+    auto setLen = (fn_SetLength)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_length);
+    auto setUByte = (fn_SetUBYTE)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_ubyte);
 
-    void* embMsg = (uint8_t*)obj + 0x60;
+    void* embMsg = (uint8_t*)obj + g_binaryLayout->off_netobj_embedded_msg;
     uint16_t hdr10 = 0xFFFF;
     uint32_t hdr14 = 0xFFFFFFFF;
     uint32_t hdr1c = 0x1000;
-    safeWrite((uint8_t*)obj + 0x70, &hdr10, 2);
-    safeWrite((uint8_t*)obj + 0x74, &hdr14, 4);
-    safeWrite((uint8_t*)obj + 0x7c, &hdr1c, 4);
+    safeWrite((uint8_t*)obj + g_binaryLayout->off_netobj_hdr10, &hdr10, 2);
+    safeWrite((uint8_t*)obj + g_binaryLayout->off_netobj_hdr14, &hdr14, 4);
+    safeWrite((uint8_t*)obj + g_binaryLayout->off_netobj_opcode, &hdr1c, 4);
 
     if (setStatus && setLen && setUByte) {
         setLen(embMsg, 3);
@@ -4490,16 +5000,16 @@ static void writeSidechainRef(void* obj, int procIdx, int ch,
 
     void* pStripType = nullptr;
     void* pChannel   = nullptr;
-    safeRead((uint8_t*)obj + 0x138, &pStripType, sizeof(pStripType));
-    safeRead((uint8_t*)obj + 0x140, &pChannel, sizeof(pChannel));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_sidechain_strip_type_ptr, &pStripType, sizeof(pStripType));
+    safeRead((uint8_t*)obj + g_binaryLayout->off_sidechain_channel_ptr, &pChannel, sizeof(pChannel));
     if (pStripType && pChannel) {
         uint32_t st32 = wantStripType;
         safeWrite((uint8_t*)pStripType, &st32, sizeof(st32));
         safeWrite((uint8_t*)pChannel, &wantChannel, sizeof(wantChannel));
-        safeWrite((uint8_t*)obj + 0x168, &st32, sizeof(st32));
-        safeWrite((uint8_t*)obj + 0x16c, &wantChannel, sizeof(wantChannel));
+        safeWrite((uint8_t*)obj + g_binaryLayout->off_sidechain_cached_strip_type, &st32, sizeof(st32));
+        safeWrite((uint8_t*)obj + g_binaryLayout->off_sidechain_cached_channel, &wantChannel, sizeof(wantChannel));
         uint8_t one = 1;
-        safeWrite((uint8_t*)obj + 0x174, &one, 1);
+        safeWrite((uint8_t*)obj + g_binaryLayout->off_sidechain_dirty_flag, &one, 1);
     }
 
     fprintf(stderr, "[MC]   %s%s on ch %d: stripType=%d channel=%d via raw path\n",
@@ -4654,6 +5164,36 @@ static int16_t readMixerSWord(const uint8_t* mixerData, size_t offset) {
     return value;
 }
 
+static void logMixerDiffSummary(const uint8_t* expected,
+                                const uint8_t* actual,
+                                size_t len,
+                                int ch,
+                                const char* prefix) {
+    if (!expected || !actual || len == 0)
+        return;
+    int diffCount = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (expected[i] == actual[i])
+            continue;
+        fprintf(stderr,
+                "%sch %d mixer diff[%zu]: expected=%02x got=%02x\n",
+                prefix ? prefix : "[MC][VERIFY] ",
+                ch + 1,
+                i,
+                expected[i],
+                actual[i]);
+        diffCount++;
+        if (diffCount >= 24)
+            break;
+    }
+    if (diffCount == 0) {
+        fprintf(stderr,
+                "%sch %d mixer diff: payloads differ but no byte difference was found\n",
+                prefix ? prefix : "[MC][VERIFY] ",
+                ch + 1);
+    }
+}
+
 static void logMixerAssignmentSummary(const char* phaseTag, int ch, const uint8_t* mixerData) {
     bool mainOn = false;
     bool mainMonoOn = false;
@@ -4671,15 +5211,110 @@ static void logMixerAssignmentSummary(const char* phaseTag, int ch, const uint8_
             groupList);
 }
 
+static bool sameRelevantMixerData(const uint8_t* expected,
+                                  const uint8_t* actual,
+                                  int ch,
+                                  const char* prefix) {
+    if (!expected || !actual)
+        return expected == actual;
+
+    bool ok = true;
+    auto logByteMismatch = [&](const char* label, int index, uint8_t expVal, uint8_t actVal) {
+        fprintf(stderr,
+                "%sch %d mixer %s[%d] mismatch: expected=%02x got=%02x\n",
+                prefix ? prefix : "[MC][VERIFY] ",
+                ch + 1,
+                label,
+                index,
+                expVal,
+                actVal);
+        ok = false;
+    };
+    auto logWordMismatch = [&](const char* label, int index, int16_t expVal, int16_t actVal) {
+        fprintf(stderr,
+                "%sch %d mixer %s[%d] mismatch: expected=%d got=%d\n",
+                prefix ? prefix : "[MC][VERIFY] ",
+                ch + 1,
+                label,
+                index,
+                (int)expVal,
+                (int)actVal);
+        ok = false;
+    };
+
+    if (expected[kMixerMainMuteOffset] != actual[kMixerMainMuteOffset])
+        logByteMismatch("mainMute", 0, expected[kMixerMainMuteOffset], actual[kMixerMainMuteOffset]);
+
+    for (int dca = 0; dca < kMixerNumDCAs; ++dca) {
+        uint8_t expVal = expected[kMixerDCAOffset + dca];
+        uint8_t actVal = actual[kMixerDCAOffset + dca];
+        if (expVal != actVal)
+            logByteMismatch("dcaAssign", dca, expVal, actVal);
+    }
+
+    for (int group = 0; group < kMixerNumGroups; ++group) {
+        uint8_t expVal = expected[kMixerGroupOnOffset + group];
+        uint8_t actVal = actual[kMixerGroupOnOffset + group];
+        if (expVal != actVal)
+            logByteMismatch("groupOn", group, expVal, actVal);
+    }
+
+    for (int aux = 0; aux < kMixerNumAuxes; ++aux) {
+        uint8_t expOn = expected[kMixerAuxOnOffset + aux];
+        uint8_t actOn = actual[kMixerAuxOnOffset + aux];
+        if (expOn != actOn)
+            logByteMismatch("auxOn", aux, expOn, actOn);
+
+        uint8_t expPre = expected[kMixerAuxPreOffset + aux];
+        uint8_t actPre = actual[kMixerAuxPreOffset + aux];
+        if (expPre != actPre)
+            logByteMismatch("auxPre", aux, expPre, actPre);
+
+        int16_t expGain = readMixerSWord(expected, kMixerAuxGainOffset + aux * kMixerGainStride);
+        int16_t actGain = readMixerSWord(actual, kMixerAuxGainOffset + aux * kMixerGainStride);
+        if (expGain != actGain)
+            logWordMismatch("auxGain", aux, expGain, actGain);
+    }
+
+    for (int matrix = 0; matrix < kMixerNumMatrices; ++matrix) {
+        uint8_t expOn = expected[kMixerMatrixOnOffset + matrix];
+        uint8_t actOn = actual[kMixerMatrixOnOffset + matrix];
+        if (expOn != actOn)
+            logByteMismatch("matrixOn", matrix, expOn, actOn);
+
+        uint8_t expPre = expected[kMixerMatrixPreOffset + matrix];
+        uint8_t actPre = actual[kMixerMatrixPreOffset + matrix];
+        if (expPre != actPre)
+            logByteMismatch("matrixPre", matrix, expPre, actPre);
+
+        int16_t expGain = readMixerSWord(expected, kMixerMatrixGainOffset + matrix * kMixerGainStride);
+        int16_t actGain = readMixerSWord(actual, kMixerMatrixGainOffset + matrix * kMixerGainStride);
+        if (expGain != actGain)
+            logWordMismatch("matrixGain", matrix, expGain, actGain);
+    }
+
+    if (expected[kMixerMainOnOffset] != actual[kMixerMainOnOffset])
+        logByteMismatch("mainOn", 0, expected[kMixerMainOnOffset], actual[kMixerMainOnOffset]);
+    if (expected[kMixerMainMonoOnOffset] != actual[kMixerMainMonoOnOffset])
+        logByteMismatch("mainMonoOn", 0, expected[kMixerMainMonoOnOffset], actual[kMixerMainMonoOnOffset]);
+
+    int16_t expMainGain = readMixerSWord(expected, kMixerMainGainOffset);
+    int16_t actMainGain = readMixerSWord(actual, kMixerMainGainOffset);
+    if (expMainGain != actMainGain)
+        logWordMismatch("mainGain", 0, expMainGain, actMainGain);
+
+    return ok;
+}
+
 static void* getAudioCoreDM() {
     typedef void* (*fn_AppInstance3)();
-    auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
+    auto appInst3 = (fn_AppInstance3)RESOLVE(g_binaryLayout->fn_c_application_instance);
     if (!appInst3) return nullptr;
     void* app = appInst3();
     if (!app) return nullptr;
-    void* drbox = *reinterpret_cast<void**>((uint8_t*)app + 0xb8);
+    void* drbox = *reinterpret_cast<void**>((uint8_t*)app + g_binaryLayout->off_app_drbox);
     if (!drbox) return nullptr;
-    return *reinterpret_cast<void**>((uint8_t*)drbox + 0x48);
+    return *reinterpret_cast<void**>((uint8_t*)drbox + g_binaryLayout->off_drbox_audio_core);
 }
 
 static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
@@ -4801,14 +5436,13 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
         typedef bool (*fn_HasActiveInputSourceAssigned)(void* channel, int activeInputSource);
         typedef void* (*fn_GetInputChannelSource)(void* channel, int activeInputSource);
 
-        auto getActiveInputSource = (fn_GetActiveInputSource)RESOLVE(0x1006d80d0);
-        auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(0x1006df840);
-        auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(0x1006d81e0);
+        auto getActiveInputSource = (fn_GetActiveInputSource)RESOLVE(g_binaryLayout->fn_c_channel_get_active_input_source_const);
+        auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(g_binaryLayout->fn_c_channel_has_active_input_source_assigned_e_active_input_source_const);
+        auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(g_binaryLayout->fn_c_channel_get_input_channel_source_e_active_input_source_const);
 
         if (getActiveInputSource)
             snap.activeInputSource = (uint8_t)getActiveInputSource(cChannel);
         snap.abcdEnabled = snap.activeInputSource != 0;
-
         for (int activeInputSource = 1; activeInputSource <= 4; activeInputSource++) {
             ActiveInputSourceData& aid = snap.activeInputData[activeInputSource - 1];
             if (!hasActiveInputSourceAssigned || !getInputChannelSource ||
@@ -4840,17 +5474,17 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
     //        → sendPt->GetParentType() → if 2 or 6: sendPt+0x30 - 0xa8 = cFXUnit*
     if (g_channelManager) {
         typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-        auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+        auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
         typedef bool (*fn_HasInserts)(void* channel, int insertPoint);
-        auto hasInserts = (fn_HasInserts)RESOLVE(0x1006df5e0);
+        auto hasInserts = (fn_HasInserts)RESOLVE(g_binaryLayout->fn_has_inserts_c_channel_e_insert_point_const);
         typedef void* (*fn_GetInsertReturnPoint)(void* channel, int insertPoint);
-        auto getReturnPoint = (fn_GetInsertReturnPoint)RESOLVE(0x1006d9850);
+        auto getReturnPoint = (fn_GetInsertReturnPoint)RESOLVE(g_binaryLayout->fn_get_insert_return_point_c_channel_e_insert_point_const);
         typedef int (*fn_GetParentType)(void* sendPoint);
-        auto getParentType = (fn_GetParentType)RESOLVE(0x1006cd690);
+        auto getParentType = (fn_GetParentType)RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_parent_type);
         typedef void* (*fn_GetSendPoint)(void* channel, int insertPoint);
-        auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006d9780);
+        auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_get_insert_send_point_c_channel_e_insert_point_const);
         typedef void* (*fn_GetFirstRecvPt)(void* sendPoint);
-        auto getFirstRecvPt = (fn_GetFirstRecvPt)RESOLVE(0x1006cd7b0);
+        auto getFirstRecvPt = (fn_GetFirstRecvPt)RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_first_receive_point);
 
         void* cChannel = getChannel(g_channelManager, 1, (uint8_t)ch);
         for (int ip = 0; ip < 2; ip++) {
@@ -4865,10 +5499,12 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
                 safeRead((uint8_t*)cChannel + baseOff, &insertDriver, sizeof(insertDriver));
                 if (insertDriver) {
                     void* insertObj = nullptr;
-                    safeRead((uint8_t*)insertDriver + 0x8, &insertObj, sizeof(insertObj));
+                    safeRead((uint8_t*)insertDriver + g_binaryLayout->off_insert_driver_object,
+                             &insertObj,
+                             sizeof(insertObj));
                     if (insertObj) {
                         uint8_t inB = 0;
-                        if (safeRead((uint8_t*)insertObj + 0x88, &inB, 1)) {
+                        if (safeRead((uint8_t*)insertObj + g_binaryLayout->off_insert_object_in_enabled, &inB, 1)) {
                             snap.insertInfo[ip].inEnabled = (inB != 0);
                         }
                     }
@@ -4881,7 +5517,7 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
                              &intermediate, sizeof(intermediate));
                     if (intermediate) {
                         uint8_t byB = 0;
-                        if (safeRead((uint8_t*)intermediate + 0x81, &byB, 1)) {
+                        if (safeRead((uint8_t*)intermediate + g_binaryLayout->off_insert_intermediate_bypass, &byB, 1)) {
                             snap.insertInfo[ip].bypass = (byB != 0);
                             snap.insertInfo[ip].validInBypass = true;
                             fprintf(stderr, "[MC]   Insert%c ch %d: in=%d bypass=%d (intermediate=%p)\n",
@@ -4899,7 +5535,7 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
             void* returnPt = getReturnPoint(cChannel, ip);
             if (!returnPt) continue;
             void* connSendPt = nullptr;  // FX output send point
-            safeRead((uint8_t*)returnPt + 0x20, &connSendPt, sizeof(connSendPt));
+            safeRead((uint8_t*)returnPt + g_binaryLayout->off_insert_return_connected_send_point, &connSendPt, sizeof(connSendPt));
             if (!connSendPt) continue;
 
             int pType = getParentType(connSendPt);
@@ -4915,7 +5551,7 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
 
             if (pType == 2 || pType == 6) {
                 void* parent = nullptr;
-                safeRead((uint8_t*)connSendPt + 0x30, &parent, sizeof(parent));
+                safeRead((uint8_t*)connSendPt + g_binaryLayout->off_send_point_parent, &parent, sizeof(parent));
                 if (parent)
                     snap.insertInfo[ip].fxUnit = (void*)((uintptr_t)parent - 0xa8);
                 fprintf(stderr, "[MC]   Insert%c ch %d: parentType=%d fxUnit=%p fxSend=%p fxRecv=%p\n",
@@ -4958,7 +5594,7 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
                     if (dynNetObj) {
                         // Snapshot sDynamicsData (0x94 bytes at obj+0x98)
                         memset(snap.dyn8Data, 0, sizeof(snap.dyn8Data));
-                        safeRead((uint8_t*)dynNetObj + 0x98, snap.dyn8Data, 0x94);
+                        safeRead((uint8_t*)dynNetObj + g_binaryLayout->off_dyn_obj_data, snap.dyn8Data, 0x94);
                         snap.validDyn8 = true;
                         fprintf(stderr, "[MC]   Snapshot Dyn8[%d] sDynamicsData for ch %d: type=%u first16=",
                                 dynIdx, ch+1, *(uint32_t*)snap.dyn8Data);
@@ -5048,7 +5684,7 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
             writeTypeBFields(obj, g_procB[p], snap.dataB[p].buf);
             // cDigitalAttenuator::InformObjectsOfNewSettings() — reads current state, notifies UI
             typedef void (*fn_method_void)(void* obj);
-            auto informNewSettings = (fn_method_void)RESOLVE(0x1002046d0);
+            auto informNewSettings = (fn_method_void)RESOLVE(g_binaryLayout->fn_c_digital_attenuator_inform_objects_of_new_settings);
             informNewSettings(obj);
             fprintf(stderr, "[MC]   Recall DigitalTrim on ch %d: gain=%d mute=%d pol=%d\n",
                     ch+1, (int16_t)wantGain,
@@ -5062,11 +5698,11 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
             uint8_t wantBypass = snap.dataB[p].buf[3];
             // cDelay::SetDelayAndInformOthers(unsigned short)
             typedef void (*fn_setDelay)(void*, uint16_t);
-            auto setDelayInform = (fn_setDelay)RESOLVE(0x100202590);
+            auto setDelayInform = (fn_setDelay)RESOLVE(g_binaryLayout->fn_c_delay_set_delay_and_inform_others);
             setDelayInform(obj, wantDelay);
             // cDelay::SetBypassAndInformOthers(bool)
             typedef void (*fn_setBypass)(void*, bool);
-            auto setBypassInform = (fn_setBypass)RESOLVE(0x100202660);
+            auto setBypassInform = (fn_setBypass)RESOLVE(g_binaryLayout->fn_c_delay_set_bypass_and_inform_others);
             setBypassInform(obj, wantBypass != 0);
             fprintf(stderr, "[MC]   Recall Delay on ch %d: delay=%u bypass=%d\n",
                     ch+1, wantDelay, wantBypass);
@@ -5102,14 +5738,17 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
                 // Call RefreshMixer on the mixer object to push fader/gains to UI
                 int group = ch >> 3;
                 void* mixer = nullptr;
-                safeRead((uint8_t*)g_inputMixerWrapper + 0x90 + group * 8, &mixer, sizeof(mixer));
+                safeRead((uint8_t*)g_inputMixerWrapper +
+                             g_binaryLayout->off_input_mixer_wrapper_group_mixer_array + group * 8,
+                         &mixer,
+                         sizeof(mixer));
                 if (mixer) {
                     // Call SyncMainGain to push fader value through proper notification + UI path
                     // SyncMainGain calls SetMainGain internally AND InformOtherObjects to notify QML
                     int chInGrp = ch & 7;
                     int16_t mainGain = 0;
                     memcpy(&mainGain, snap.mixerData + 0xA88, sizeof(int16_t));
-                    auto syncMainGain = (fn_SyncMainGain)RESOLVE(0x1002927e0);
+                    auto syncMainGain = (fn_SyncMainGain)RESOLVE(g_binaryLayout->fn_c_input_mixer_sync_main_gain);
                     syncMainGain(mixer, (uint8_t)chInGrp, mainGain);
                     fprintf(stderr, "[MC]   SyncMainGain ch %d (group %d, chInGrp %d) gain=%d\n",
                             ch+1, group, chInGrp, (int)mainGain);
@@ -5130,10 +5769,10 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
     // and fires InformOtherObjects → propagates to FPGA, UI, scene system).
     {
         typedef void (*fn_AssignInsert)(void* inputCh, bool in, bool bypass);
-        auto assignInsert1 = (fn_AssignInsert)RESOLVE(0x100290490);
-        auto assignInsert2 = (fn_AssignInsert)RESOLVE(0x1002905b0);
+        auto assignInsert1 = (fn_AssignInsert)RESOLVE(g_binaryLayout->fn_c_input_channel_assign_insert1);
+        auto assignInsert2 = (fn_AssignInsert)RESOLVE(g_binaryLayout->fn_c_input_channel_assign_insert2);
         typedef void (*fn_SetInsertBypassed)(void* intermediate, bool bypass);
-        auto setInsertBypassed = (fn_SetInsertBypassed)RESOLVE(0x1002a4410);
+        auto setInsertBypassed = (fn_SetInsertBypassed)RESOLVE(g_binaryLayout->fn_c_insert_intermediate_set_insert_bypassed);
         void* acdm = getAudioCoreDM();
         for (int ip = 0; ip < 2; ip++) {
             if (!snap.insertInfo[ip].validInBypass) continue;
@@ -5257,7 +5896,7 @@ static void refreshDyn8InsertAssignment(int unitIdx, int tgtCh, const char* phas
 static void* getSystemController() {
     if (!g_audioDM) return nullptr;
     void* controller = nullptr;
-    safeRead((uint8_t*)g_audioDM + 0xb0, &controller, sizeof(controller));
+    safeRead((uint8_t*)g_audioDM + g_binaryLayout->off_audio_dm_controller, &controller, sizeof(controller));
     return controller;
 }
 
@@ -5265,7 +5904,7 @@ static void* getCompressorSystem() {
     void* controller = getSystemController();
     if (!controller) return nullptr;
     void* system = nullptr;
-    safeRead((uint8_t*)controller + 0x60, &system, sizeof(system));
+    safeRead((uint8_t*)controller + g_binaryLayout->off_audio_controller_system_slot_60, &system, sizeof(system));
     return system;
 }
 
@@ -5273,7 +5912,7 @@ static void* getGateSystem() {
     void* controller = getSystemController();
     if (!controller) return nullptr;
     void* system = nullptr;
-    safeRead((uint8_t*)controller + 0x68, &system, sizeof(system));
+    safeRead((uint8_t*)controller + g_binaryLayout->off_audio_controller_system_slot_68, &system, sizeof(system));
     return system;
 }
 
@@ -5281,7 +5920,7 @@ static void* getBiquadSystem() {
     void* controller = getSystemController();
     if (!controller) return nullptr;
     void* system = nullptr;
-    safeRead((uint8_t*)controller + 0x70, &system, sizeof(system));
+    safeRead((uint8_t*)controller + g_binaryLayout->off_audio_controller_system_slot_70, &system, sizeof(system));
     return system;
 }
 
@@ -5292,13 +5931,13 @@ static void resetInputProcessingGangMaster(int ch, const char* phaseTag) {
     typedef void (*fn_BiquadSyncAllInputFilterStereoGangData)(void*);
     typedef void (*fn_BiquadSyncAllInputPEQStereoGangData)(void*);
 
-    auto resetComp = (fn_ResetGangMaster)RESOLVE(0x100e62ee0);
-    auto resetGate = (fn_ResetGangMaster)RESOLVE(0x100304900);
-    auto resetBiquad = (fn_ResetGangMaster)RESOLVE(0x100b15f70);
-    auto syncComp = (fn_CompSyncAllInputStereoGangData)RESOLVE(0x100e62e40);
-    auto syncGate = (fn_GateSyncAllInputStereoGangData)RESOLVE(0x1003048b0);
-    auto syncBiquadFilter = (fn_BiquadSyncAllInputFilterStereoGangData)RESOLVE(0x100b15ed0);
-    auto syncBiquadPEQ = (fn_BiquadSyncAllInputPEQStereoGangData)RESOLVE(0x100b15f30);
+    auto resetComp = (fn_ResetGangMaster)RESOLVE(g_binaryLayout->fn_c_compressor_system_reset_input_channel_gang_master);
+    auto resetGate = (fn_ResetGangMaster)RESOLVE(g_binaryLayout->fn_c_gate_system_reset_input_channel_gang_master);
+    auto resetBiquad = (fn_ResetGangMaster)RESOLVE(g_binaryLayout->fn_c_biquad_system_reset_input_channel_gang_master);
+    auto syncComp = (fn_CompSyncAllInputStereoGangData)RESOLVE(g_binaryLayout->fn_c_compressor_system_sync_all_input_stereo_gang_data);
+    auto syncGate = (fn_GateSyncAllInputStereoGangData)RESOLVE(g_binaryLayout->fn_c_gate_system_sync_all_input_stereo_gang_data);
+    auto syncBiquadFilter = (fn_BiquadSyncAllInputFilterStereoGangData)RESOLVE(g_binaryLayout->fn_c_biquad_system_sync_all_input_filter_stereo_gang_data);
+    auto syncBiquadPEQ = (fn_BiquadSyncAllInputPEQStereoGangData)RESOLVE(g_binaryLayout->fn_c_biquad_system_sync_all_input_peqstereo_gang_data);
 
     void* comp = getCompressorSystem();
     void* gate = getGateSystem();
@@ -5323,9 +5962,9 @@ static void refreshSideChainStateForChannel(int ch, const char* phaseTag) {
     if (!inputCh) return;
 
     typedef void (*fn_method_void)(void*);
-    auto informCompSideChain = (fn_method_void)RESOLVE(0x1001f39d0);
-    auto informGateSideChain = (fn_method_void)RESOLVE(0x1002d1970);
-    auto identifyAndRefreshSideChain = (fn_method_void)RESOLVE(0x1002e4e80);
+    auto informCompSideChain = (fn_method_void)RESOLVE(g_binaryLayout->fn_c_compressor_inform_objects_of_new_side_chain_settings);
+    auto informGateSideChain = (fn_method_void)RESOLVE(g_binaryLayout->fn_c_gate_side_chain_peqnet_object_inform_objects_of_new_side_chain_settings);
+    auto identifyAndRefreshSideChain = (fn_method_void)RESOLVE(g_binaryLayout->fn_c_side_chain_select_identify_and_refresh);
 
     void* compObj = getProcessingObj(inputCh, g_procA[3].chOffset);
     if (compObj && informCompSideChain) {
@@ -5364,9 +6003,9 @@ static void setDelayForChannel(int ch, uint16_t delay, bool bypass) {
     if (!obj) return;
 
     typedef void (*fn_setDelay)(void*, uint16_t);
-    auto setDelayInform = (fn_setDelay)RESOLVE(0x100202590);
+    auto setDelayInform = (fn_setDelay)RESOLVE(g_binaryLayout->fn_c_delay_set_delay_and_inform_others);
     typedef void (*fn_setBypass)(void*, bool);
-    auto setBypassInform = (fn_setBypass)RESOLVE(0x100202660);
+    auto setBypassInform = (fn_setBypass)RESOLVE(g_binaryLayout->fn_c_delay_set_bypass_and_inform_others);
 
     setDelayInform(obj, delay);
     setBypassInform(obj, bypass);
@@ -5389,7 +6028,7 @@ static void replayStereoImageForChannel(int ch,
     writeTypeBFields(obj, g_procB[kProcStereoImageIdx], snap.dataB[kProcStereoImageIdx].buf);
 
     typedef void (*fn_method_void)(void* obj);
-    auto informNewSettings = (fn_method_void)RESOLVE(0x1002f5850);
+    auto informNewSettings = (fn_method_void)RESOLVE(g_binaryLayout->fn_c_stereo_image_inform_objects_of_new_settings);
     if (informNewSettings)
         informNewSettings(obj);
 
@@ -5400,8 +6039,8 @@ static void replayStereoImageForChannel(int ch,
     bool usingWrapperSync = false;
     if (g_inputMixerWrapper) {
         typedef void (*fn_WrapperSyncChannelCopy)(void* wrapper, uint8_t srcCh, uint8_t dstCh);
-        auto wrapperSyncImageControl1 = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d600);
-        auto wrapperSyncImageControl2 = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d6c0);
+        auto wrapperSyncImageControl1 = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_image_control1);
+        auto wrapperSyncImageControl2 = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_image_control2);
         if (wrapperSyncImageControl1 && wrapperSyncImageControl2) {
             wrapperSyncImageControl1(g_inputMixerWrapper, (uint8_t)ch, (uint8_t)ch);
             wrapperSyncImageControl2(g_inputMixerWrapper, (uint8_t)ch, (uint8_t)ch);
@@ -5429,8 +6068,8 @@ static void replayMuteGroupsForChannel(int ch,
 
     typedef void (*fn_SetMuteGroupAssign)(void* stripCtrl, bool assign, uint8_t groupIdx);
     typedef bool (*fn_GetMuteGroupAssign)(void* stripCtrl, uint8_t groupIdx);
-    auto setMuteGroupAssign = (fn_SetMuteGroupAssign)RESOLVE(0x100331be0);
-    auto getMuteGroupAssign = (fn_GetMuteGroupAssign)RESOLVE(0x100331bd0);
+    auto setMuteGroupAssign = (fn_SetMuteGroupAssign)RESOLVE(g_binaryLayout->fn_c_channel_strip_control_set_mute_group_assign);
+    auto getMuteGroupAssign = (fn_GetMuteGroupAssign)RESOLVE(g_binaryLayout->fn_c_channel_strip_control_get_mute_group_assign_unsigned_char_const);
     if (!setMuteGroupAssign || !getMuteGroupAssign) return;
 
     for (int group = 0; group < kNumMuteGroups; group++) {
@@ -5464,7 +6103,9 @@ static void replayMixerStateForChannel(int ch,
     int group = ch >> 3;
     int chInGrp = ch & 7;
     void* mixer = nullptr;
-    safeRead((uint8_t*)g_inputMixerWrapper + 0x90 + group * 8, &mixer, sizeof(mixer));
+    safeRead((uint8_t*)g_inputMixerWrapper + g_binaryLayout->off_input_mixer_wrapper_group_mixer_array + group * 8,
+             &mixer,
+             sizeof(mixer));
     if (!mixer) return;
 
     typedef void (*fn_SetMainOnSwitch)(void* mixer, uint8_t chInGrp, bool on);
@@ -5499,24 +6140,24 @@ static void replayMixerStateForChannel(int ch,
                                                     bool assign,
                                                     bool cacheAssign);
 
-    auto setMainOnSwitch = (fn_SetMainOnSwitch)RESOLVE(0x100037e10);
-    auto setMainMonoOnSwitch = (fn_SetMainMonoOnSwitch)RESOLVE(0x100037e70);
-    auto informMainOnSetting = (fn_InformObjectsOfNewMainOnSetting)RESOLVE(0x10003faf0);
-    auto informMainMonoOnSetting = (fn_InformObjectsOfNewMainMonoOnSetting)RESOLVE(0x10003fb60);
-    auto wrapperSetMainMute = (fn_WrapperMIDISetMainMute)RESOLVE(0x10029cc20);
-    auto wrapperSetInputAuxOn = (fn_WrapperMIDISetInputAuxOn)RESOLVE(0x10029c7f0);
-    auto wrapperSetAuxGain = (fn_WrapperMIDISetAuxGain)RESOLVE(0x10029c8f0);
-    auto syncAuxPreSwitches = (fn_SyncAuxPreSwitches)RESOLVE(0x100294d50);
-    auto wrapperSetInputMatrixOn = (fn_WrapperMIDISetInputMatrixOn)RESOLVE(0x10029cd90);
-    auto syncMatrixPreSwitches = (fn_SyncMatrixPreSwitches)RESOLVE(0x100294f40);
-    auto syncMatrixGains = (fn_SyncMatrixGains)RESOLVE(0x100294f80);
-    auto wrapperSyncImageControl1 = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d600);
-    auto wrapperSyncImageControl2 = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d6c0);
-    auto wrapperSyncAuxPans = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d840);
-    auto wrapperSyncMatrixPans = (fn_WrapperSyncChannelCopy)RESOLVE(0x10029d960);
-    auto setDCAGroupAssign = (fn_SetDCAGroupAssign)RESOLVE(0x100039c40);
-    auto informInDCAGroupSetting = (fn_InformObjectsOfNewInDCAGroupSetting)RESOLVE(0x10003fee0);
-    auto wrapperSetDCAGroupAssign = (fn_WrapperMIDISetDCAGroupAssign)RESOLVE(0x10029cc90);
+    auto setMainOnSwitch = (fn_SetMainOnSwitch)RESOLVE(g_binaryLayout->fn_c_mixer_module_set_main_on_switch);
+    auto setMainMonoOnSwitch = (fn_SetMainMonoOnSwitch)RESOLVE(g_binaryLayout->fn_c_mixer_module_set_main_mono_on_switch);
+    auto informMainOnSetting = (fn_InformObjectsOfNewMainOnSetting)RESOLVE(g_binaryLayout->fn_c_mixer_module_inform_objects_of_new_main_on_setting);
+    auto informMainMonoOnSetting = (fn_InformObjectsOfNewMainMonoOnSetting)RESOLVE(g_binaryLayout->fn_c_mixer_module_inform_objects_of_new_main_mono_on_setting);
+    auto wrapperSetMainMute = (fn_WrapperMIDISetMainMute)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_midiset_main_mute);
+    auto wrapperSetInputAuxOn = (fn_WrapperMIDISetInputAuxOn)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_midiset_input_aux_on);
+    auto wrapperSetAuxGain = (fn_WrapperMIDISetAuxGain)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_midiset_aux_gain);
+    auto syncAuxPreSwitches = (fn_SyncAuxPreSwitches)RESOLVE(g_binaryLayout->fn_c_input_mixer_sync_aux_pre_switches);
+    auto wrapperSetInputMatrixOn = (fn_WrapperMIDISetInputMatrixOn)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_midiset_input_matrix_on);
+    auto syncMatrixPreSwitches = (fn_SyncMatrixPreSwitches)RESOLVE(g_binaryLayout->fn_c_input_mixer_sync_matrix_pre_switches);
+    auto syncMatrixGains = (fn_SyncMatrixGains)RESOLVE(g_binaryLayout->fn_c_input_mixer_sync_matrix_gains);
+    auto wrapperSyncImageControl1 = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_image_control1);
+    auto wrapperSyncImageControl2 = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_image_control2);
+    auto wrapperSyncAuxPans = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_aux_pans);
+    auto wrapperSyncMatrixPans = (fn_WrapperSyncChannelCopy)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_matrix_pans);
+    auto setDCAGroupAssign = (fn_SetDCAGroupAssign)RESOLVE(g_binaryLayout->fn_c_mixer_module_set_dcagroup_assign);
+    auto informInDCAGroupSetting = (fn_InformObjectsOfNewInDCAGroupSetting)RESOLVE(g_binaryLayout->fn_c_mixer_module_inform_objects_of_new_in_dcagroup_setting);
+    auto wrapperSetDCAGroupAssign = (fn_WrapperMIDISetDCAGroupAssign)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_midiset_dcagroup_assign);
 
     bool wantMainOn = false;
     bool wantMainMonoOn = false;
@@ -5560,7 +6201,7 @@ static void replayMixerStateForChannel(int ch,
         wrapperSetMainMute(g_inputMixerWrapper, (uint8_t)ch, wantMainMute, wantMainMute);
 
     int16_t mainGain = readMixerSWord(snap.mixerData, kMixerMainGainOffset);
-    auto syncMainGain = (fn_SyncMainGain)RESOLVE(0x1002927e0);
+    auto syncMainGain = (fn_SyncMainGain)RESOLVE(g_binaryLayout->fn_c_input_mixer_sync_main_gain);
     if (syncMainGain)
         syncMainGain(mixer, (uint8_t)chInGrp, mainGain);
 
@@ -5570,7 +6211,7 @@ static void replayMixerStateForChannel(int ch,
     }
 
     if (usingAuxOnSync) {
-        auto gainToUWORD = (uint16_t(*)(int16_t))RESOLVE(0x100105fa0);
+        auto gainToUWORD = (uint16_t(*)(int16_t))RESOLVE(g_binaryLayout->fn_gain_to_uword);
         for (int aux = 0; aux < kMixerNumAuxes; aux++) {
             bool wantOn = snap.mixerData[kMixerAuxOnOffset + aux] != 0;
             wrapperSetInputAuxOn(g_inputMixerWrapper,
@@ -5638,15 +6279,15 @@ static void replayInsertRouting(const MovePlan& plan,
     if (!g_channelManager || !g_audioSRPManager) return;
 
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
     typedef void (*fn_PerformTasks)(void* audioSRPMgr, void* taskList);
-    auto performTasks = (fn_PerformTasks)RESOLVE(0x1006d19c0);
+    auto performTasks = (fn_PerformTasks)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_perform_tasks);
     typedef void* (*fn_CreateSendTargetTask)(void* ret, void* channel, void* fxRecvPt, int ip, int enable);
-    auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(0x1006da210);
+    auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(g_binaryLayout->fn_c_channel_create_set_insert_send_target_task);
     typedef void* (*fn_CreateReturnSourceTask)(void* ret, void* channel, void* fxSendPt, int ip);
-    auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(0x1006da450);
+    auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(g_binaryLayout->fn_c_channel_create_set_insert_return_source_task);
     typedef void (*fn_MergeTaskLists)(void* dst, void* src);
-    auto mergeTaskLists = (fn_MergeTaskLists)RESOLVE(0x10069cd60);
+    auto mergeTaskLists = (fn_MergeTaskLists)RESOLVE(g_binaryLayout->fn_hidden_merge_task_lists);
     bool traceDyn8Route = false;
     if (const char* traceEnv = getenv("MC_TRACE_DYN8_ROUTE")) {
         traceDyn8Route = (atoi(traceEnv) != 0);
@@ -5821,7 +6462,7 @@ static bool assignDyn8InsertWithSetInserts(int ch, int unitIdx, int ip, int vari
     if (!g_channelManager) return false;
 
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
     struct InsertPts {
         void* recvA;
         void* recvB;
@@ -5829,7 +6470,7 @@ static bool assignDyn8InsertWithSetInserts(int ch, int unitIdx, int ip, int vari
         void* sendB;
     };
     typedef void (*fn_SetInserts)(void* channel, InsertPts insertPts, int insertPoint);
-    auto setInserts = (fn_SetInserts)RESOLVE(0x1006d9920);
+    auto setInserts = (fn_SetInserts)RESOLVE(g_binaryLayout->fn_c_channel_set_inserts);
 
     void* cChannel = getChannel(g_channelManager, 1, (uint8_t)ch);
     void* recvPt = getDyn8RecvPointFromManager(unitIdx);
@@ -5880,8 +6521,8 @@ static void setInputChannelInsertFlags(int ch, int ip, bool assigned, bool dynam
     }
 
     typedef void (*fn_AssignInsert)(void* inputCh, bool assigned, bool dynamics);
-    auto assignInsert1 = (fn_AssignInsert)RESOLVE(0x100290490);
-    auto assignInsert2 = (fn_AssignInsert)RESOLVE(0x1002905b0);
+    auto assignInsert1 = (fn_AssignInsert)RESOLVE(g_binaryLayout->fn_c_input_channel_assign_insert1);
+    auto assignInsert2 = (fn_AssignInsert)RESOLVE(g_binaryLayout->fn_c_input_channel_assign_insert2);
     auto fn = ip == 0 ? assignInsert1 : assignInsert2;
     fprintf(stderr,
             "[MC]   [%s] AssignInsert%c on ch %d assigned=%d dynamics=%d\n",
@@ -5900,8 +6541,8 @@ static void refreshDyn8InsertAssignment(int unitIdx, int tgtCh, const char* phas
 
     typedef void (*fn_InputConfigurationChanged)(void* duc);
     typedef void (*fn_ReceivePointUpdated)(void* duc);
-    auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(0x1005e8a00);
-    auto receivePointUpdated = (fn_ReceivePointUpdated)RESOLVE(0x1005e81b0);
+    auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(g_binaryLayout->fn_c_dynamics_unit_client_input_configuration_changed);
+    auto receivePointUpdated = (fn_ReceivePointUpdated)RESOLVE(g_binaryLayout->fn_c_dynamics_unit_client_receive_point_updated);
 
     fprintf(stderr,
             "[MC]   [%s] Dyn8 refresh unit %d / ch %d via InputConfigurationChanged + ReceivePointUpdated (duc=%p)\n",
@@ -5919,15 +6560,15 @@ static bool routeDyn8InsertForChannelSlot(int ch,
         return false;
 
     typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-    auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
     typedef void (*fn_PerformTasks)(void* audioSRPMgr, void* taskList);
-    auto performTasks = (fn_PerformTasks)RESOLVE(0x1006d19c0);
+    auto performTasks = (fn_PerformTasks)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_perform_tasks);
     typedef void* (*fn_CreateSendTargetTask)(void* ret, void* channel, void* fxRecvPt, int ip, int enable);
-    auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(0x1006da210);
+    auto createSendTargetTask = (fn_CreateSendTargetTask)RESOLVE(g_binaryLayout->fn_c_channel_create_set_insert_send_target_task);
     typedef void* (*fn_CreateReturnSourceTask)(void* ret, void* channel, void* fxSendPt, int ip);
-    auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(0x1006da450);
+    auto createReturnSourceTask = (fn_CreateReturnSourceTask)RESOLVE(g_binaryLayout->fn_c_channel_create_set_insert_return_source_task);
     typedef void (*fn_MergeTaskLists)(void* dst, void* src);
-    auto mergeTaskLists = (fn_MergeTaskLists)RESOLVE(0x10069cd60);
+    auto mergeTaskLists = (fn_MergeTaskLists)RESOLVE(g_binaryLayout->fn_hidden_merge_task_lists);
     if (!getChannel || !performTasks || !createSendTargetTask || !createReturnSourceTask || !mergeTaskLists)
         return false;
 
@@ -5976,15 +6617,15 @@ static bool replayDyn8DataToUnit(int unitIdx,
         return false;
 
     typedef void (*fn_setAllDataUI)(void* obj, void* sDynData);
-    auto setAllDataUI = (fn_setAllDataUI)RESOLVE(0x100239970);
+    auto setAllDataUI = (fn_setAllDataUI)RESOLVE(g_binaryLayout->fn_c_dynamics_net_object_set_all_data_and_update_ui);
     typedef void (*fn_setDynData)(void* system, void* key, void* data);
-    auto setDynData = (fn_setDynData)RESOLVE(0x100239240);
+    auto setDynData = (fn_setDynData)RESOLVE(g_binaryLayout->fn_c_dynamics_system_set_dynamics_data);
     typedef void (*fn_setFullSideChainData)(void* system, void* key, void* data);
-    auto setFullSideChainData = (fn_setFullSideChainData)RESOLVE(0x10023a4e0);
+    auto setFullSideChainData = (fn_setFullSideChainData)RESOLVE(g_binaryLayout->fn_c_dynamics_system_set_full_side_chain_data);
     typedef void (*fn_setDynObjSideChainSource)(void* obj, void* msg);
-    auto setDynObjSideChainSource = (fn_setDynObjSideChainSource)RESOLVE(0x10023a490);
+    auto setDynObjSideChainSource = (fn_setDynObjSideChainSource)RESOLVE(g_binaryLayout->fn_c_dynamics_net_object_set_side_chain_source);
     typedef void (*fn_fullDriverUpdate)(void* system);
-    auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(0x10023c6c0);
+    auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(g_binaryLayout->fn_c_dynamics_system_full_driver_update);
     typedef void (*fn_cAHNetMessage_ctor)(void* msg);
     typedef void (*fn_cAHNetMessage_dtor)(void* msg);
     typedef void (*fn_SetLength)(void* msg, uint32_t len);
@@ -5993,21 +6634,21 @@ static bool replayDyn8DataToUnit(int unitIdx,
     typedef void (*fn_PackSideChain)(void* msg, void* data, int param);
     typedef void (*fn_EntrypointMessage)(void* duc, void* msg);
 
-    auto msgCtor = (fn_cAHNetMessage_ctor)RESOLVE(0x1000e9790);
-    auto msgDtor = (fn_cAHNetMessage_dtor)RESOLVE(0x1000e9810);
-    auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
-    auto setUBYTE = (fn_SetDataBufferUBYTE)RESOLVE(0x1000ebde0);
-    auto packBands = (fn_PackBandsWide)RESOLVE(0x1000cded0);
-    auto packSC = (fn_PackSideChain)RESOLVE(0x1000cdfd0);
-    auto entrypoint = (fn_EntrypointMessage)RESOLVE(0x1005e9140);
+    auto msgCtor = (fn_cAHNetMessage_ctor)RESOLVE(g_binaryLayout->fn_c_ahnet_message_ctor);
+    auto msgDtor = (fn_cAHNetMessage_dtor)RESOLVE(g_binaryLayout->fn_c_ahnet_message_dtor);
+    auto setLen = (fn_SetLength)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_length);
+    auto setUBYTE = (fn_SetDataBufferUBYTE)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_ubyte);
+    auto packBands = (fn_PackBandsWide)RESOLVE(g_binaryLayout->fn_n_dynamics_data_net_pack_bands_wide_message);
+    auto packSC = (fn_PackSideChain)RESOLVE(g_binaryLayout->fn_n_dynamics_data_net_pack_side_chain_message);
+    auto entrypoint = (fn_EntrypointMessage)RESOLVE(g_binaryLayout->fn_c_dynamics_unit_client_entrypoint_message);
     if (!setAllDataUI || !setDynData || !fullDriverUpdate || !msgCtor || !msgDtor ||
         !setLen || !setUBYTE || !packBands || !packSC || !entrypoint)
         return false;
 
     void* dynSystem = nullptr;
-    safeRead((uint8_t*)tgtDynObj + 0x90, &dynSystem, sizeof(dynSystem));
+    safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_system, &dynSystem, sizeof(dynSystem));
     uint8_t dynKey[8] = {};
-    safeRead((uint8_t*)tgtDynObj + 0x88, dynKey, sizeof(dynKey));
+    safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_key, dynKey, sizeof(dynKey));
 
     fprintf(stderr,
             "[MC]   [%s] Copy-paste Dyn8 data to ch %d Insert%c unit %d key={%u,%u}\n",
@@ -6020,7 +6661,7 @@ static bool replayDyn8DataToUnit(int unitIdx,
         if (setFullSideChainData)
             setFullSideChainData(dynSystem, dynKey, (void*)dyn8Data);
         uint8_t one = 1;
-        safeWrite((uint8_t*)dynSystem + 0xca9, &one, 1);
+        safeWrite((uint8_t*)dynSystem + g_binaryLayout->off_dyn_system_dirty_flag, &one, 1);
         fullDriverUpdate(dynSystem);
     }
 
@@ -6037,7 +6678,7 @@ static bool replayDyn8DataToUnit(int unitIdx,
     void* duc = getDynUnitClient(unitIdx);
     if (duc) {
         uint32_t ducKey = 0;
-        safeRead((uint8_t*)duc + 0x68, &ducKey, 4);
+        safeRead((uint8_t*)duc + g_binaryLayout->off_dyn_unit_client_key, &ducKey, 4);
         uint8_t msgBuf[64];
 
         memset(msgBuf, 0, sizeof(msgBuf));
@@ -6097,10 +6738,10 @@ static bool writeProcOrderForChannel(int ch, const ChannelSnapshot& snap) {
     typedef void (*fn_SetStatus)(void* obj, void* msg);
     typedef void (*fn_SetLength)(void*, uint32_t);
     typedef void (*fn_SetUBYTE)(void*, uint8_t, uint32_t);
-    auto setPEQComp = (fn_SetPEQComp)RESOLVE(0x1002d8730);
-    auto setStatus = (fn_SetStatus)RESOLVE(0x1002d87e0);
-    auto setLen = (fn_SetLength)RESOLVE(0x1000e9ee0);
-    auto setUByte = (fn_SetUBYTE)RESOLVE(0x1000ebde0);
+    auto setPEQComp = (fn_SetPEQComp)RESOLVE(g_binaryLayout->fn_c_processing_ordering_select_set_peqcomp);
+    auto setStatus = (fn_SetStatus)RESOLVE(g_binaryLayout->fn_c_processing_ordering_select_set_status);
+    auto setLen = (fn_SetLength)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_length);
+    auto setUByte = (fn_SetUBYTE)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_ubyte);
 
     for (int attempt = 0; attempt < attempts; attempt++) {
         void* inputCh = getInputChannel(ch);
@@ -6254,7 +6895,10 @@ static bool compareSnapshotsForMove(const ChannelSnapshot& expected, const Chann
             fprintf(stderr, "[MC][VERIFY] ch %d mixer presence mismatch\n", ch+1);
             ok = false;
         } else if (expected.validMixer && expected.mixerData && actual.mixerData &&
-                   memcmp(expected.mixerData, actual.mixerData, SINPUTATTRS_SIZE) != 0) {
+                   !sameRelevantMixerData(expected.mixerData,
+                                          actual.mixerData,
+                                          ch,
+                                          "[MC][VERIFY] ")) {
             fprintf(stderr, "[MC][VERIFY] ch %d mixer payload mismatch\n", ch+1);
             ok = false;
         }
@@ -6325,43 +6969,45 @@ static bool compareSnapshotsForMove(const ChannelSnapshot& expected, const Chann
                 actual.abcdEnabled ? 1 : 0, actual.activeInputSource);
         ok = false;
     }
-    for (int i = 0; i < 4; i++) {
-        const auto& exp = expected.activeInputData[i];
-        const auto& act = actual.activeInputData[i];
-        if (exp.assigned != act.assigned) {
-            fprintf(stderr,
-                    "[MC][VERIFY] ch %d ABCD source %c assigned mismatch exp=%d got=%d\n",
-                    ch + 1, 'A' + i, exp.assigned ? 1 : 0, act.assigned ? 1 : 0);
-            ok = false;
-            continue;
-        }
-        if (!exp.assigned) continue;
-        if (memcmp(&exp.source, &act.source, sizeof(sAudioSource)) != 0) {
-            fprintf(stderr,
-                    "[MC][VERIFY] ch %d ABCD source %c mismatch exp={type=%u num=%u} got={type=%u num=%u}\n",
-                    ch + 1, 'A' + i,
-                    exp.source.type, exp.source.number,
-                    act.source.type, act.source.number);
-            ok = false;
-        }
-        if (exp.validPreamp != act.validPreamp) {
-            fprintf(stderr,
-                    "[MC][VERIFY] ch %d ABCD source %c preamp presence mismatch\n",
-                    ch + 1, 'A' + i);
-            ok = false;
-            continue;
-        }
-        if (exp.validPreamp && !samePreampDataForSource(exp.source, exp.preampData, act.preampData)) {
-            fprintf(stderr,
-                    "[MC][VERIFY] ch %d ABCD source %c preamp mismatch exp={gain=%d pad=%d phantom=%d} got={gain=%d pad=%d phantom=%d}\n",
-                    ch + 1, 'A' + i,
-                    normalizedPreampDataForSource(exp.source, exp.preampData).gain,
-                    normalizedPreampDataForSource(exp.source, exp.preampData).pad,
-                    normalizedPreampDataForSource(exp.source, exp.preampData).phantom,
-                    normalizedPreampDataForSource(exp.source, act.preampData).gain,
-                    normalizedPreampDataForSource(exp.source, act.preampData).pad,
-                    normalizedPreampDataForSource(exp.source, act.preampData).phantom);
-            ok = false;
+    if (expected.abcdEnabled && actual.abcdEnabled) {
+        for (int i = 0; i < 4; i++) {
+            const auto& exp = expected.activeInputData[i];
+            const auto& act = actual.activeInputData[i];
+            if (exp.assigned != act.assigned) {
+                fprintf(stderr,
+                        "[MC][VERIFY] ch %d ABCD source %c assigned mismatch exp=%d got=%d\n",
+                        ch + 1, 'A' + i, exp.assigned ? 1 : 0, act.assigned ? 1 : 0);
+                ok = false;
+                continue;
+            }
+            if (!exp.assigned) continue;
+            if (memcmp(&exp.source, &act.source, sizeof(sAudioSource)) != 0) {
+                fprintf(stderr,
+                        "[MC][VERIFY] ch %d ABCD source %c mismatch exp={type=%u num=%u} got={type=%u num=%u}\n",
+                        ch + 1, 'A' + i,
+                        exp.source.type, exp.source.number,
+                        act.source.type, act.source.number);
+                ok = false;
+            }
+            if (exp.validPreamp != act.validPreamp) {
+                fprintf(stderr,
+                        "[MC][VERIFY] ch %d ABCD source %c preamp presence mismatch\n",
+                        ch + 1, 'A' + i);
+                ok = false;
+                continue;
+            }
+            if (exp.validPreamp && !samePreampDataForSource(exp.source, exp.preampData, act.preampData)) {
+                fprintf(stderr,
+                        "[MC][VERIFY] ch %d ABCD source %c preamp mismatch exp={gain=%d pad=%d phantom=%d} got={gain=%d pad=%d phantom=%d}\n",
+                        ch + 1, 'A' + i,
+                        normalizedPreampDataForSource(exp.source, exp.preampData).gain,
+                        normalizedPreampDataForSource(exp.source, exp.preampData).pad,
+                        normalizedPreampDataForSource(exp.source, exp.preampData).phantom,
+                        normalizedPreampDataForSource(exp.source, act.preampData).gain,
+                        normalizedPreampDataForSource(exp.source, act.preampData).pad,
+                        normalizedPreampDataForSource(exp.source, act.preampData).phantom);
+                ok = false;
+            }
         }
     }
 
@@ -6468,7 +7114,10 @@ static bool compareSnapshotsForCopyPaste(const ChannelSnapshot& expected,
             fprintf(stderr, "[MC][COPY-VERIFY] ch %d mixer presence mismatch\n", ch + 1);
             ok = false;
         } else if (expected.validMixer && expected.mixerData && actual.mixerData &&
-                   memcmp(expected.mixerData, actual.mixerData, SINPUTATTRS_SIZE) != 0) {
+                   !sameRelevantMixerData(expected.mixerData,
+                                          actual.mixerData,
+                                          ch,
+                                          "[MC][COPY-VERIFY] ")) {
             fprintf(stderr, "[MC][COPY-VERIFY] ch %d mixer payload mismatch\n", ch + 1);
             ok = false;
         }
@@ -6651,7 +7300,7 @@ static bool prepareAutotestGang(const MovePlan& plan, GangSnapshot& snap) {
     }
 
     typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
-    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(g_binaryLayout->fn_c_ganging_manager_get_gang_driver_unsigned_char_const);
     if (!getGangDriver) return false;
 
     uint8_t gangNum = 0;
@@ -7402,19 +8051,19 @@ static bool readGangSnapshot(uint8_t gangNum, GangSnapshot& snap) {
     if (!g_gangingManager) return false;
 
     typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
-    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(g_binaryLayout->fn_c_ganging_manager_get_gang_driver_unsigned_char_const);
     if (!getGangDriver) return false;
 
     void* driver = getGangDriver(g_gangingManager, gangNum);
     if (!driver) return false;
 
     snap.valid = true;
-    safeRead((uint8_t*)driver + 0x94, &snap.stripType, sizeof(snap.stripType));
-    safeRead((uint8_t*)driver + 0xA8, &snap.attrs, sizeof(snap.attrs));
+    safeRead((uint8_t*)driver + g_binaryLayout->off_gang_driver_strip_type, &snap.stripType, sizeof(snap.stripType));
+    safeRead((uint8_t*)driver + g_binaryLayout->off_gang_driver_attrs, &snap.attrs, sizeof(snap.attrs));
 
     uint8_t members[16];
     memset(members, 0xFF, sizeof(members));
-    safeRead((uint8_t*)driver + 0x98, members, sizeof(members));
+    safeRead((uint8_t*)driver + g_binaryLayout->off_gang_driver_members, members, sizeof(members));
     for (uint8_t member : members) {
         if (member == 0xFF) continue;
         snap.memberChannels.push_back(member);
@@ -7445,7 +8094,7 @@ static QList<GangStripKey> buildGangMemberList(const GangSnapshot& snap, const M
 
 static void syncGangStateToLive(const char* phaseTag, uint8_t gangNum) {
     typedef void (*fn_SyncGangs)(void* wrapper);
-    auto syncGangs = (fn_SyncGangs)RESOLVE(0x10029f220);
+    auto syncGangs = (fn_SyncGangs)RESOLVE(g_binaryLayout->fn_c_input_mixer_wrapper_sync_gangs);
     if (!g_inputMixerWrapper || !syncGangs) return;
     syncGangs(g_inputMixerWrapper);
     fprintf(stderr,
@@ -7462,8 +8111,8 @@ static void applyGangMembershipHighLevel(void* driver,
     typedef void (*fn_SetGangMembersAndInform)(void* driver, const QList<GangStripKey>& members);
     typedef void (*fn_FlushSettingsToNetwork)(void* driver);
 
-    auto setGangMembersAndInform = (fn_SetGangMembersAndInform)RESOLVE(0x1008f97f0);
-    auto flushSettingsToNetwork = (fn_FlushSettingsToNetwork)RESOLVE(0x1008f9aa0);
+    auto setGangMembersAndInform = (fn_SetGangMembersAndInform)RESOLVE(g_binaryLayout->fn_c_gang_driver_qobject_set_gang_members_and_inform);
+    auto flushSettingsToNetwork = (fn_FlushSettingsToNetwork)RESOLVE(g_binaryLayout->fn_c_gang_driver_qobject_flush_settings_to_network);
 
     if (!setGangMembersAndInform) {
         fprintf(stderr,
@@ -7490,7 +8139,7 @@ static void clearGangMembershipHighLevel(const GangSnapshot& snap, const char* p
     if (!snap.valid || snap.memberChannels.empty() || !g_gangingManager) return;
 
     typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
-    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(g_binaryLayout->fn_c_ganging_manager_get_gang_driver_unsigned_char_const);
     if (!getGangDriver) return;
 
     void* driver = getGangDriver(g_gangingManager, snap.gangNum);
@@ -7508,7 +8157,7 @@ static void restoreGangMembershipHighLevel(const GangSnapshot& snap, const MoveP
     if (!snap.valid || !g_gangingManager) return;
 
     typedef void* (*fn_GetGangDriver)(void* mgr, uint8_t gangNum);
-    auto getGangDriver = (fn_GetGangDriver)RESOLVE(0x100e95a30);
+    auto getGangDriver = (fn_GetGangDriver)RESOLVE(g_binaryLayout->fn_c_ganging_manager_get_gang_driver_unsigned_char_const);
     if (!getGangDriver) return;
 
     void* driver = getGangDriver(g_gangingManager, snap.gangNum);
@@ -7799,8 +8448,8 @@ static bool applyMovePlan(const MovePlan& inputPlan,
 
             typedef bool (*fn_HasActiveInputSourceAssigned)(void* channel, int activeInputSource);
             typedef void* (*fn_GetInputChannelSource)(void* channel, int activeInputSource);
-            auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(0x1006df840);
-            auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(0x1006d81e0);
+            auto hasActiveInputSourceAssigned = (fn_HasActiveInputSourceAssigned)RESOLVE(g_binaryLayout->fn_c_channel_has_active_input_source_assigned_e_active_input_source_const);
+            auto getInputChannelSource = (fn_GetInputChannelSource)RESOLVE(g_binaryLayout->fn_c_channel_get_input_channel_source_e_active_input_source_const);
             if (!hasActiveInputSourceAssigned || !getInputChannelSource)
                 return;
 
@@ -7953,7 +8602,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     xfer.validData = false;
                     void* dynNetObj = getDynNetObj(dynIdx);
                     if (dynNetObj) {
-                        safeRead((uint8_t*)dynNetObj + 0x98, xfer.dyn8Data, sizeof(xfer.dyn8Data));
+                        safeRead((uint8_t*)dynNetObj + g_binaryLayout->off_dyn_obj_data, xfer.dyn8Data, sizeof(xfer.dyn8Data));
                         remapDyn8SideChainRef(xfer.dyn8Data,
                                               sizeof(xfer.dyn8Data),
                                               plan,
@@ -7993,7 +8642,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     auto refreshStereoDyn8Assignments = [&](const char* phaseTag) {
         if (g_dynRack) {
             typedef void (*fn_InputConfigurationChanged)(void* rack);
-            auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(0x1005ce2f0);
+            auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(g_binaryLayout->fn_c_dynamics_rack_input_configuration_changed);
             fprintf(stderr,
                     "[MC]   [%s] DynamicsRack InputConfigurationChanged (rack=%p)\n",
                     phaseTag, g_dynRack);
@@ -8152,14 +8801,14 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         // Use CSV import path: cChannel::SetInputChannelSource via task system
         // This is what Import CSV uses — full update + UI refresh
         typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-        auto getChannel = (fn_GetChannel)RESOLVE(0x1006e3f90);
+        auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
 
         typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-        auto getSendPoint = (fn_GetSendPoint)RESOLVE(0x1006ce8e0);
+        auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
 
         typedef void (*fn_SetInputChannelSource)(void* channel, int activeInputSource,
                                                   void* sendPt, void* sendPt2);
-        auto setInputSource = (fn_SetInputChannelSource)RESOLVE(0x1006d8410);
+        auto setInputSource = (fn_SetInputChannelSource)RESOLVE(g_binaryLayout->fn_c_channel_set_input_channel_source);
 
         for (auto& [tgtCh, si] : plan.targetMap) {
             if (!snaps[si].validPatch) continue;
@@ -8292,14 +8941,14 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     // (no resets, no glitches), but the selector refresh still runs.
     if (!envFlagEnabled("MC_DISABLE_NEW_STEREO_CFG")) {
         typedef void* (*fn_AppInstance3)();
-        auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
+        auto appInst3 = (fn_AppInstance3)RESOLVE(g_binaryLayout->fn_c_application_instance);
         void* audioCoreDM = nullptr;
         if (appInst3) {
             void* app3 = appInst3();
             if (app3) {
-                void* drbox3 = *reinterpret_cast<void**>((uint8_t*)app3 + 0xb8);
+                void* drbox3 = *reinterpret_cast<void**>((uint8_t*)app3 + g_binaryLayout->off_app_drbox);
                 if (drbox3) {
-                    audioCoreDM = *reinterpret_cast<void**>((uint8_t*)drbox3 + 0x48);
+                    audioCoreDM = *reinterpret_cast<void**>((uint8_t*)drbox3 + g_binaryLayout->off_drbox_audio_core);
                 }
             }
         }
@@ -8312,7 +8961,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             fprintf(stderr, "[MC]   Calling cAudioCoreDM::NewInputStereoConfiguration(audioCoreDM=%p, cfg=%p)\n",
                     audioCoreDM, cfg);
             typedef void (*fn_NewStereoCfg)(void* self, const uint8_t* cfg);
-            auto newStereoCfg = (fn_NewStereoCfg)RESOLVE(0x1001a0f10);
+            auto newStereoCfg = (fn_NewStereoCfg)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_new_input_stereo_configuration);
             newStereoCfg(audioCoreDM, cfg);
             fprintf(stderr, "[MC]   cAudioCoreDM::NewInputStereoConfiguration returned\n");
             QApplication::processEvents();
@@ -8326,18 +8975,19 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     // the ChannelMapper parameter-link table maintained via DoGainSharingLinking.
     if (!envFlagEnabled("MC_DISABLE_REBUILD_PATCHBAY")) {
         typedef void* (*fn_AppInstance)();
-        auto appInstance = (fn_AppInstance)RESOLVE(0x100d5a120);
+        auto appInstance = (fn_AppInstance)RESOLVE(g_binaryLayout->fn_c_application_instance);
         void* mapper = nullptr;
         if (appInstance) {
             void* app = appInstance();
             if (app) {
-                void* drbox = *reinterpret_cast<void**>((uint8_t*)app + 0xb8);
+                void* drbox = *reinterpret_cast<void**>((uint8_t*)app + g_binaryLayout->off_app_drbox);
                 if (drbox) {
-                    void* audioCore = *reinterpret_cast<void**>((uint8_t*)drbox + 0x48);
+                    void* audioCore = *reinterpret_cast<void**>((uint8_t*)drbox + g_binaryLayout->off_drbox_audio_core);
                     if (audioCore) {
-                        void* wrapper = *reinterpret_cast<void**>((uint8_t*)audioCore + 0xa8);
+                        void* wrapper = *reinterpret_cast<void**>(
+                            (uint8_t*)audioCore + g_binaryLayout->off_audio_core_input_mixer_wrapper);
                         if (wrapper) {
-                            mapper = *reinterpret_cast<void**>((uint8_t*)wrapper + 0x20);
+                            mapper = *reinterpret_cast<void**>((uint8_t*)wrapper + g_binaryLayout->off_channel_mapper_usbdriver_mapper);
                         }
                     }
                 }
@@ -8345,9 +8995,9 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         }
         if (mapper) {
             typedef void (*fn_ConfigureIOModuleOutputPatchBay)(void* mapper);
-            auto cfg1 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b4cc0);
-            auto cfg2 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b4e70);
-            auto cfg3 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(0x1001b5020);
+            auto cfg1 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(g_binaryLayout->fn_c_channel_mapper_configure_iomodule1_output_patch_bay);
+            auto cfg2 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(g_binaryLayout->fn_c_channel_mapper_configure_iomodule2_output_patch_bay);
+            auto cfg3 = (fn_ConfigureIOModuleOutputPatchBay)RESOLVE(g_binaryLayout->fn_c_channel_mapper_configure_iomodule3_output_patch_bay);
             fprintf(stderr, "[MC]   Rebuilding ChannelMapper IOModule patch bays (mapper=%p)\n", mapper);
             if (cfg1) cfg1(mapper);
             if (cfg2) cfg2(mapper);
@@ -8401,11 +9051,9 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     tgtCh + 1, (unsigned)socketNum);
         }
     }
-    refreshVisiblePreampUI("[MC] post-main-preamp: ");
-
     phase("Phase: restore ABCD source setup");
     typedef void (*fn_SetActiveInputChannel)(void* channel, uint8_t activeInputSource);
-    auto setActiveInputChannel = (fn_SetActiveInputChannel)RESOLVE(0x1006d7fe0);
+    auto setActiveInputChannel = (fn_SetActiveInputChannel)RESOLVE(g_binaryLayout->fn_c_channel_set_active_input_channel);
     for (auto& [tgtCh, si] : plan.targetMap) {
         if (!snaps[si].abcdEnabled) {
             fprintf(stderr,
@@ -8560,8 +9208,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             }
         }
     }
-    refreshVisiblePreampUI("[MC] post-abcd-preamp: ");
-
     phase("Phase: restore ABCD selection");
     for (auto& [tgtCh, si] : plan.targetMap) {
         void* ch = getChannel ? getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh) : nullptr;
@@ -8579,15 +9225,15 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         fprintf(stderr, "[MC] Dyn8 system-level transfer phase '%s' (%zu entries)...\n",
                 phaseTag, dyn8Transfers.size());
         typedef void (*fn_setAllDataUI)(void* obj, void* sDynData);
-        auto setAllDataUI = (fn_setAllDataUI)RESOLVE(0x100239970);
+        auto setAllDataUI = (fn_setAllDataUI)RESOLVE(g_binaryLayout->fn_c_dynamics_net_object_set_all_data_and_update_ui);
         typedef void (*fn_setDynData)(void* system, void* key, void* data);
-        auto setDynData = (fn_setDynData)RESOLVE(0x100239240);
+        auto setDynData = (fn_setDynData)RESOLVE(g_binaryLayout->fn_c_dynamics_system_set_dynamics_data);
         typedef void (*fn_setFullSideChainData)(void* system, void* key, void* data);
-        auto setFullSideChainData = (fn_setFullSideChainData)RESOLVE(0x10023a4e0);
+        auto setFullSideChainData = (fn_setFullSideChainData)RESOLVE(g_binaryLayout->fn_c_dynamics_system_set_full_side_chain_data);
         typedef void (*fn_setDynObjSideChainSource)(void* obj, void* msg);
-        auto setDynObjSideChainSource = (fn_setDynObjSideChainSource)RESOLVE(0x10023a490);
+        auto setDynObjSideChainSource = (fn_setDynObjSideChainSource)RESOLVE(g_binaryLayout->fn_c_dynamics_net_object_set_side_chain_source);
         typedef void (*fn_fullDriverUpdate)(void* system);
-        auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(0x10023c6c0);
+        auto fullDriverUpdate = (fn_fullDriverUpdate)RESOLVE(g_binaryLayout->fn_c_dynamics_system_full_driver_update);
         typedef void (*fn_cAHNetMessage_ctor)(void* msg);
         typedef void (*fn_cAHNetMessage_dtor)(void* msg);
         typedef void (*fn_SetLength)(void* msg, uint32_t len);
@@ -8596,13 +9242,13 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         typedef void (*fn_PackSideChain)(void* msg, void* data, int param);
         typedef void (*fn_EntrypointMessage)(void* duc, void* msg);
 
-        auto msgCtor     = (fn_cAHNetMessage_ctor)RESOLVE(0x1000e9790);
-        auto msgDtor     = (fn_cAHNetMessage_dtor)RESOLVE(0x1000e9810);
-        auto setLen      = (fn_SetLength)RESOLVE(0x1000e9ee0);
-        auto setUBYTE    = (fn_SetDataBufferUBYTE)RESOLVE(0x1000ebde0);
-        auto packBands   = (fn_PackBandsWide)RESOLVE(0x1000cded0);
-        auto packSC      = (fn_PackSideChain)RESOLVE(0x1000cdfd0);
-        auto entrypoint  = (fn_EntrypointMessage)RESOLVE(0x1005e9140);
+        auto msgCtor     = (fn_cAHNetMessage_ctor)RESOLVE(g_binaryLayout->fn_c_ahnet_message_ctor);
+        auto msgDtor     = (fn_cAHNetMessage_dtor)RESOLVE(g_binaryLayout->fn_c_ahnet_message_dtor);
+        auto setLen      = (fn_SetLength)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_length);
+        auto setUBYTE    = (fn_SetDataBufferUBYTE)RESOLVE(g_binaryLayout->fn_c_ahnet_message_set_data_buffer_ubyte);
+        auto packBands   = (fn_PackBandsWide)RESOLVE(g_binaryLayout->fn_n_dynamics_data_net_pack_bands_wide_message);
+        auto packSC      = (fn_PackSideChain)RESOLVE(g_binaryLayout->fn_n_dynamics_data_net_pack_side_chain_message);
+        auto entrypoint  = (fn_EntrypointMessage)RESOLVE(g_binaryLayout->fn_c_dynamics_unit_client_entrypoint_message);
 
         for (auto& xfer : dyn8Transfers) {
             void* tgtDynObj = getDynNetObj(xfer.tgtUnitIdx);
@@ -8618,9 +9264,9 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             }
 
             void* dynSystem = nullptr;
-            safeRead((uint8_t*)tgtDynObj + 0x90, &dynSystem, sizeof(dynSystem));
+            safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_system, &dynSystem, sizeof(dynSystem));
             uint8_t dynKey[8] = {};
-            safeRead((uint8_t*)tgtDynObj + 0x88, dynKey, 8);
+            safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_key, dynKey, 8);
 
             fprintf(stderr, "[MC]   [%s] Dyn8 unit %d: obj=%p system=%p key={%u,%u} type=%u\n",
                     phaseTag, xfer.tgtUnitIdx, tgtDynObj, dynSystem,
@@ -8636,7 +9282,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     fprintf(stderr, "[MC]   [%s] SetFullSideChainData done\n", phaseTag);
                 }
                 uint8_t one = 1;
-                safeWrite((uint8_t*)dynSystem + 0xca9, &one, 1);
+                safeWrite((uint8_t*)dynSystem + g_binaryLayout->off_dyn_system_dirty_flag, &one, 1);
                 fullDriverUpdate(dynSystem);
                 fprintf(stderr, "[MC]   [%s] SetDynamicsData + FullDriverUpdate done\n", phaseTag);
             } else {
@@ -8658,7 +9304,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             void* duc = getDynUnitClient(xfer.tgtUnitIdx);
             if (duc) {
                 uint32_t ducKey = 0;
-                safeRead((uint8_t*)duc + 0x68, &ducKey, 4);
+                safeRead((uint8_t*)duc + g_binaryLayout->off_dyn_unit_client_key, &ducKey, 4);
                 bool sendInsertIn = false;
                 if (const char* env = getenv("MC_DYN8_INSERTIN")) {
                     sendInsertIn = (atoi(env) != 0);
@@ -8668,7 +9314,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     callCreateInsertIn = (atoi(env) != 0);
                 }
                 typedef void (*fn_CreateInsertInAssignment)(void* duc);
-                auto createInsertInAssignment = (fn_CreateInsertInAssignment)RESOLVE(0x1005e8330);
+                auto createInsertInAssignment = (fn_CreateInsertInAssignment)RESOLVE(g_binaryLayout->fn_c_dynamics_unit_client_create_insert_in_assignment);
 
                 uint8_t msgBuf[64];
 
@@ -8733,7 +9379,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             }
 
             uint8_t afterRecall[0x94] = {0};
-            safeRead((uint8_t*)tgtDynObj + 0x98, afterRecall, 0x94);
+            safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_data, afterRecall, 0x94);
             int match = 0;
             for (int b = 0; b < 0x94; b++) {
                 if (afterRecall[b] == xfer.dyn8Data[b]) match++;
@@ -8901,7 +9547,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             uint8_t before[0x94] = {};
             void* tgtDynObj = getDynNetObj(recall.tgtUnitIdx);
             if (tgtDynObj)
-                safeRead((uint8_t*)tgtDynObj + 0x98, before, sizeof(before));
+                safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_data, before, sizeof(before));
 
             fprintf(stderr,
                     "[MC] Dyn8 library experiment: recalling '%s' (obj '%s') onto ch %d / unit %d\n",
@@ -8912,7 +9558,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             uint8_t after[0x94] = {};
             int changed = 0;
             if (tgtDynObj)
-                safeRead((uint8_t*)tgtDynObj + 0x98, after, sizeof(after));
+                safeRead((uint8_t*)tgtDynObj + g_binaryLayout->off_dyn_obj_data, after, sizeof(after));
             for (size_t i = 0; i < sizeof(after); i++) {
                 if (before[i] != after[i]) changed++;
             }
@@ -9044,7 +9690,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         int16_t trimVal = 0;
         if (dtObj) {
             void* gp = nullptr;
-            safeRead((uint8_t*)dtObj + 0x98, &gp, sizeof(gp));
+            safeRead((uint8_t*)dtObj + g_binaryLayout->off_digital_trim_gain_ptr, &gp, sizeof(gp));
             if (gp && (uintptr_t)gp > 0x100000000ULL)
                 safeRead(gp, &trimVal, 2);
         }
@@ -9053,8 +9699,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         fprintf(stderr, "[MC] Pos %d: '%s' trim=%.1f dB (%d)\n", i+1, name ? name : "", trimDb, trimVal);
         logFinalPreampStateForChannel(i);
     }
-    refreshVisiblePreampUI("[MC] final-preamp: ");
-
     if (autotestEnvEnabled("MC_EXPERIMENT_RECALL_CURRENT_SETTINGS")) {
         phase("Phase: scene refresh experiment");
         fprintf(stderr,
@@ -9065,7 +9709,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         for (int i = lo; i <= hi; i++) {
             logFinalPreampStateForChannel(i);
         }
-        refreshVisiblePreampUI("[MC] post-scene-refresh: ");
     }
 
     if (autotestEnvEnabled("MC_EXPERIMENT_SCENE_UI_SIGNAL")) {
@@ -9080,7 +9723,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         for (int i = lo; i <= hi; i++) {
             logFinalPreampStateForChannel(i);
         }
-        refreshVisiblePreampUI("[MC] post-scene-ui-signal: ");
     }
 
     // Experimental: per-strip CreatePreAmpAssignments rebuild (no effect on West UI leak).
@@ -9544,7 +10186,7 @@ static QString buildAudioSourceDescriptionRaw(const sAudioSource& source) {
         return "Unassigned";
 
     typedef QString (*fn_BuildAudioSourceDesc)(sAudioSource);
-    auto buildDesc = (fn_BuildAudioSourceDesc)RESOLVE(0x100eb1840);
+    auto buildDesc = (fn_BuildAudioSourceDesc)RESOLVE(g_binaryLayout->fn_c_external_rfdevice_list_item_base_build_audio_source_desc);
     if (buildDesc) {
         QString desc;
         {
@@ -9652,7 +10294,7 @@ static bool createShowViaShowManagerClient(const QString& showName) {
     }
 
     typedef void (*fn_CreateShow)(void*, const MCShowKey*);
-    auto createShow = (fn_CreateShow)RESOLVE(0x1007240f0);
+    auto createShow = (fn_CreateShow)RESOLVE(g_binaryLayout->fn_c_show_manager_client_base_create_show);
     if (!createShow) {
         fprintf(stderr,
                 "[MC][SHOWSAVE] cShowManagerClientBase::CreateShow not available\n");
@@ -9711,184 +10353,6 @@ static bool runArchiveCurrentShowExperiment() {
     return true;
 }
 
-static bool objectLooksLikePreampUI(QObject* obj) {
-    if (!obj)
-        return false;
-    if (classNameContains(obj, "Preamp"))
-        return true;
-    const QString name = obj->objectName();
-    if (name.contains("Preamp", Qt::CaseInsensitive))
-        return true;
-    return false;
-}
-
-static QList<QWidget*> candidatePreampRefreshWindows() {
-    QList<QWidget*> windows;
-    auto addWindow = [&](QWidget* w) {
-        if (!w || !w->isVisible())
-            return;
-        if (!windows.contains(w))
-            windows.push_back(w);
-    };
-
-    addWindow(QApplication::activeWindow());
-    if (QWidget* focus = QApplication::focusWidget())
-        addWindow(focus->window());
-
-    const QList<QWidget*> topLevels = QApplication::topLevelWidgets();
-    for (QWidget* top : topLevels)
-        addWindow(top);
-    return windows;
-}
-
-static QList<QObject*> collectPreampRefreshTargets() {
-    QList<QObject*> targets;
-    auto addTarget = [&](QObject* obj) {
-        if (!obj || targets.contains(obj))
-            return;
-        targets.push_back(obj);
-    };
-
-    auto maybeAdd = [&](QObject* obj) {
-        if (!obj)
-            return;
-        if (classNameContains(obj, "InputChannelPreampForm") ||
-            classNameContains(obj, "PreampOverviewForm") ||
-            classNameContains(obj, "InputSourceAssignPanel")) {
-            addTarget(obj);
-        }
-    };
-
-    if (qApp) {
-        maybeAdd(qApp);
-        const QList<QObject*> appObjects = qApp->findChildren<QObject*>();
-        for (QObject* obj : appObjects)
-            maybeAdd(obj);
-    }
-
-    const QList<QWidget*> allWidgets = QApplication::allWidgets();
-    for (QWidget* widget : allWidgets) {
-        maybeAdd(widget);
-        const QList<QObject*> children = widget->findChildren<QObject*>();
-        for (QObject* obj : children)
-            maybeAdd(obj);
-    }
-
-    return targets;
-}
-
-static void refreshVisiblePreampUIOnTargets(const QList<QObject*>& targets,
-                                            const char* phaseTag) {
-    if (!qApp)
-        return;
-
-    typedef void (*fn_PreampFormChangeChannel)(void*, void*);
-    typedef void (*fn_PreampFormReceivePointUpdated)(void*, void*);
-    typedef void (*fn_PreampFormInputChannelStartReceivePointUpdated)(void*, int, void*);
-    typedef void (*fn_PreampFormUpdateToReceivePoint)(void*);
-    typedef void (*fn_PreampFormUpdatePreampPanel)(void*);
-    typedef void (*fn_SourceAssignPanelChangeChannel)(void*, void*);
-    typedef void (*fn_SourceAssignPanelUpdateToReceivePoint)(void*);
-    typedef void (*fn_PreampOverviewReceivePointUpdated)(void*, void*);
-    typedef void (*fn_PreampOverviewUpdatePreamp)(void*);
-
-    auto preampChangeChannel =
-        (fn_PreampFormChangeChannel)RESOLVE(0x100a0c080);
-    auto preampReceivePointUpdated =
-        (fn_PreampFormReceivePointUpdated)RESOLVE(0x100a0f1e0);
-    auto preampInputChannelStartReceivePointUpdated =
-        (fn_PreampFormInputChannelStartReceivePointUpdated)RESOLVE(0x100a0d460);
-    auto preampUpdateToReceivePoint =
-        (fn_PreampFormUpdateToReceivePoint)RESOLVE(0x100a0fde0);
-    auto preampUpdatePreampPanel =
-        (fn_PreampFormUpdatePreampPanel)RESOLVE(0x100a10440);
-    auto sourceAssignChangeChannel =
-        (fn_SourceAssignPanelChangeChannel)RESOLVE(0x100a167a0);
-    auto sourceAssignUpdateToReceivePoint =
-        (fn_SourceAssignPanelUpdateToReceivePoint)RESOLVE(0x100a175a0);
-    auto preampOverviewReceivePointUpdated =
-        (fn_PreampOverviewReceivePointUpdated)RESOLVE(0x100a79170);
-    auto preampOverviewUpdatePreamp =
-        (fn_PreampOverviewUpdatePreamp)RESOLVE(0x100a79300);
-
-    int selectedInputCh = getSelectedInputChannel(false);
-    void* selectedChannelObj =
-        (selectedInputCh >= 0) ? getInputChannel(selectedInputCh) : nullptr;
-    int preampForms = 0;
-    int sourceAssignPanels = 0;
-    int overviewForms = 0;
-    int actions = 0;
-    for (QObject* obj : targets) {
-        if (!obj)
-            continue;
-
-        if (classNameContains(obj, "InputChannelPreampForm")) {
-            preampForms++;
-            void* raw = obj;
-            if (selectedChannelObj && preampChangeChannel) {
-                preampChangeChannel(raw, selectedChannelObj);
-                actions++;
-            }
-            if (selectedChannelObj && preampReceivePointUpdated) {
-                preampReceivePointUpdated(raw, selectedChannelObj);
-                actions++;
-            }
-            if (selectedChannelObj && preampInputChannelStartReceivePointUpdated) {
-                for (int activeInput = 1; activeInput <= 4; ++activeInput) {
-                    preampInputChannelStartReceivePointUpdated(raw, activeInput,
-                                                               selectedChannelObj);
-                    actions++;
-                }
-            }
-            if (preampUpdateToReceivePoint) {
-                preampUpdateToReceivePoint(raw);
-                actions++;
-            }
-            if (preampUpdatePreampPanel) {
-                preampUpdatePreampPanel(raw);
-                actions++;
-            }
-            continue;
-        }
-
-        if (classNameContains(obj, "InputSourceAssignPanel")) {
-            sourceAssignPanels++;
-            void* raw = obj;
-            if (selectedChannelObj && sourceAssignChangeChannel) {
-                sourceAssignChangeChannel(raw, selectedChannelObj);
-                actions++;
-            }
-            if (sourceAssignUpdateToReceivePoint) {
-                sourceAssignUpdateToReceivePoint(raw);
-                actions++;
-            }
-            continue;
-        }
-
-        if (classNameContains(obj, "PreampOverviewForm")) {
-            overviewForms++;
-            void* raw = obj;
-            if (selectedChannelObj && preampOverviewReceivePointUpdated) {
-                preampOverviewReceivePointUpdated(raw, selectedChannelObj);
-                actions++;
-            }
-            if (preampOverviewUpdatePreamp) {
-                preampOverviewUpdatePreamp(raw);
-                actions++;
-            }
-        }
-    }
-
-    fprintf(stderr,
-            "[MC] %srefresh preamp via forms: selectedCh=%d channelObj=%p candidates=%d preampForms=%d sourcePanels=%d overviewForms=%d actions=%d\n",
-            phaseTag ? phaseTag : "",
-            selectedInputCh >= 0 ? selectedInputCh + 1 : -1,
-            selectedChannelObj,
-            targets.size(), preampForms, sourceAssignPanels, overviewForms,
-            actions);
-    QApplication::processEvents();
-}
-
 // Force-rebuild the preamp parameter linking for every input strip, bypassing
 // cChannelSelectorLite's "only-selected-strip" gating that leaves non-selected
 // West-form wrappers pointing at stale cAnalogueInput objects after a stereo
@@ -9903,8 +10367,8 @@ static void refreshAllStripPreampBindings(const char* phaseTag) {
     }
     if (!g_surfaceChannels) {
         // Same deep discovery used by runSelectorLitePreampExperiment
-        const uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
-        const uintptr_t surfaceChannelsVt = (uintptr_t)0x106ce5900 + g_slide + 0x10;
+        const uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+        const uintptr_t surfaceChannelsVt = (uintptr_t)g_binaryLayout->vt_surface_channels + g_slide + 0x10;
         void* app = g_AppInstance ? g_AppInstance() : nullptr;
         void* selectorContainer = nullptr;
         void* selectorObj = nullptr;
@@ -9930,7 +10394,7 @@ static void refreshAllStripPreampBindings(const char* phaseTag) {
         return;
     }
     typedef void (*fn_LinkInputPreAmp)(void* sc, uint8_t strip, int conn, uint8_t source);
-    auto linkInputPreAmp = (fn_LinkInputPreAmp)RESOLVE(0x10040d290);
+    auto linkInputPreAmp = (fn_LinkInputPreAmp)RESOLVE(g_binaryLayout->fn_c_surface_channels_link_input_pre_amp);
     if (!linkInputPreAmp) {
         fprintf(stderr,
                 "[MC] %srefresh-all-strip-preamp: cSurfaceChannels::LinkInputPreAmp not resolved\n",
@@ -9964,9 +10428,9 @@ static void refreshAllWestForms(const char* phaseTag) {
     if (!envFlagEnabled("MC_REFRESH_WEST_FORMS")) {
         return;
     }
-    const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
+    const uintptr_t westVt = (uintptr_t)g_binaryLayout->vt_west_processing_form + g_slide + 0x10;
     typedef void (*fn_ChangeChannel)(void* form, void* channel);
-    auto changeChannel = (fn_ChangeChannel)RESOLVE(0x100d69350);
+    auto changeChannel = (fn_ChangeChannel)RESOLVE(g_binaryLayout->fn_c_west_processing_form_change_channel);
     if (!changeChannel) {
         fprintf(stderr,
                 "[MC] %srefresh-west-forms: ChangeChannel not resolved\n",
@@ -9980,7 +10444,7 @@ static void refreshAllWestForms(const char* phaseTag) {
         uintptr_t vt = *reinterpret_cast<uintptr_t*>(w);
         if (vt != westVt) continue;
         nMatched++;
-        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(w) + 0x200);
+        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(w) + g_binaryLayout->off_west_form_current_channel);
         if (!chan) { nSkipped++; continue; }
         changeChannel(w, chan);
         nRebound++;
@@ -10070,25 +10534,6 @@ static void dumpChannelSourceFields(const char* phaseTag) {
     }
 }
 
-static void refreshVisiblePreampUI(const char* phaseTag) {
-    QList<QObject*> targets = collectPreampRefreshTargets();
-    refreshVisiblePreampUIOnTargets(targets, phaseTag);
-
-    const QString delayedTag = QString::fromUtf8(phaseTag ? phaseTag : "");
-    const int delaysMs[] = {250, 1000, 2500};
-    for (int delayMs : delaysMs) {
-        QTimer::singleShot(delayMs, qApp, [delayedTag, delayMs]() {
-            QList<QObject*> delayedTargets = collectPreampRefreshTargets();
-            QByteArray tagUtf8 =
-                QString("%1(delayed %2ms) ")
-                    .arg(delayedTag)
-                    .arg(delayMs)
-                    .toUtf8();
-            refreshVisiblePreampUIOnTargets(delayedTargets, tagUtf8.constData());
-        });
-    }
-}
-
 static bool isMeaningfulAudioSourceDesc(const QString& desc) {
     QString t = desc.trimmed();
     if (t.isEmpty() || t == "-" || t == "--")
@@ -10140,7 +10585,7 @@ static QString buildAudioSourceBankLabel(uint32_t sourceType) {
     }
 
     typedef QString (*fn_AudioSourceToSourceString)(uint32_t sourceType, uint32_t& sourceNumber);
-    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(0x100f59db0);
+    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(g_binaryLayout->fn_csvimport_utilities_audio_source_to_source_string);
     if (audioSourceToSourceString) {
         uint32_t sourceNumber = 0;
         QString label = audioSourceToSourceString(sourceType, sourceNumber).trimmed();
@@ -10163,7 +10608,7 @@ static QString buildPatchMenuBankLabel(uint32_t sourceType, uint32_t sourceNumbe
     }
 
     typedef QString (*fn_AudioSourceToSourceString)(uint32_t sourceType, uint32_t& sourceNumber);
-    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(0x100f59db0);
+    auto audioSourceToSourceString = (fn_AudioSourceToSourceString)RESOLVE(g_binaryLayout->fn_csvimport_utilities_audio_source_to_source_string);
     if (audioSourceToSourceString) {
         uint32_t probeNumber = sourceNumber;
         QString label = audioSourceToSourceString(sourceType, probeNumber).trimmed();
@@ -11223,7 +11668,7 @@ static void dumpRegionWidgetsRecursive(QWidget* widget,
                                                                         Qt::CaseInsensitive)) {
         typedef QString (*fn_ValueWidgetBaseGetText)(const void*);
         static auto valueWidgetGetText =
-            (fn_ValueWidgetBaseGetText)RESOLVE(0x1001875e0);
+            (fn_ValueWidgetBaseGetText)RESOLVE(g_binaryLayout->fn_c_value_widget_base_get_text_const);
         if (valueWidgetGetText) {
             valueText = normalizedToolbarText(valueWidgetGetText(widget));
         }
@@ -11403,16 +11848,16 @@ static void dumpWestBindingForSelectedChannel(const char* phaseTag) {
     int formsTouched = 0;
     for (QObject* obj : forms) {
         char* raw = (char*)obj;
-        void* gainRotary = *(void**)(raw + 0xc8);
-        void* gainText = *(void**)(raw + 0xd0);
-        void* padExponent = *(void**)(raw + 0xe8);
-        void* trimRotary = *(void**)(raw + 0xf8);
-        void* trimText = *(void**)(raw + 0x100);
-        void* dynamicAssign = *(void**)(raw + 0x128);
-        void* preampModelWatcher = *(void**)(raw + 0x140);
-        void* socketStatusWatcher = *(void**)(raw + 0x160);
-        void* onSurfaceWatcher = *(void**)(raw + 0x190);
-        void* currentChannelObj = *(void**)(raw + 0x200);
+        void* gainRotary = *(void**)(raw + g_binaryLayout->off_west_form_gain_rotary);
+        void* gainText = *(void**)(raw + g_binaryLayout->off_west_form_gain_text);
+        void* padExponent = *(void**)(raw + g_binaryLayout->off_west_form_pad_exponent);
+        void* trimRotary = *(void**)(raw + g_binaryLayout->off_west_form_trim_rotary);
+        void* trimText = *(void**)(raw + g_binaryLayout->off_west_form_trim_text);
+        void* dynamicAssign = *(void**)(raw + g_binaryLayout->off_west_form_dynamic_assign);
+        void* preampModelWatcher = *(void**)(raw + g_binaryLayout->off_west_form_preamp_model_watcher);
+        void* socketStatusWatcher = *(void**)(raw + g_binaryLayout->off_west_form_socket_status_watcher);
+        void* onSurfaceWatcher = *(void**)(raw + g_binaryLayout->off_west_form_on_surface_watcher);
+        void* currentChannelObj = *(void**)(raw + g_binaryLayout->off_west_form_current_channel);
         formsTouched++;
 
         fprintf(stderr,
@@ -11433,7 +11878,7 @@ static void dumpWestBindingForSelectedChannel(const char* phaseTag) {
         auto dumpWrapper = [&](const char* label, void* wrapper) {
             if (!wrapper)
                 return;
-            void* wrapperVt = nullptr;
+            void* paramWrapperVt = nullptr;
             uint32_t kind = 0;
             void* ptr18 = nullptr;
             void* ptr20 = nullptr;
@@ -11448,21 +11893,21 @@ static void dumpWestBindingForSelectedChannel(const char* phaseTag) {
             void* controllerNamePtr = nullptr;
             char controllerName[96] = {};
 
-            safeRead(wrapper, &wrapperVt, sizeof(wrapperVt));
-            safeRead((char*)wrapper + 0x10, &kind, sizeof(kind));
-            safeRead((char*)wrapper + 0x18, &ptr18, sizeof(ptr18));
-            safeRead((char*)wrapper + 0x20, &ptr20, sizeof(ptr20));
+            safeRead(wrapper, &paramWrapperVt, sizeof(paramWrapperVt));
+            safeRead((char*)wrapper + g_binaryLayout->off_wrapper_kind, &kind, sizeof(kind));
+            safeRead((char*)wrapper + g_binaryLayout->off_wrapper_ptr18, &ptr18, sizeof(ptr18));
+            safeRead((char*)wrapper + g_binaryLayout->off_wrapper_ptr20, &ptr20, sizeof(ptr20));
             chosen = (kind == 2) ? ptr20 : ptr18;
             if (chosen && (uintptr_t)chosen >= 0x100000000ULL) {
                 safeRead(chosen, &linkedVt, sizeof(linkedVt));
-                safeRead((char*)chosen + 0x8, &linkedAudioObj, sizeof(linkedAudioObj));
-                safeRead((char*)chosen + 0x10, &lower, sizeof(lower));
-                safeRead((char*)chosen + 0x12, &upper, sizeof(upper));
+                safeRead((char*)chosen + g_binaryLayout->off_wrapper_linked_audio_obj, &linkedAudioObj, sizeof(linkedAudioObj));
+                safeRead((char*)chosen + g_binaryLayout->off_wrapper_range_lower, &lower, sizeof(lower));
+                safeRead((char*)chosen + g_binaryLayout->off_wrapper_range_upper, &upper, sizeof(upper));
                 if (linkedAudioObj && (uintptr_t)linkedAudioObj >= 0x100000000ULL) {
-                    safeRead((char*)linkedAudioObj + 0x80, &controllerValue, sizeof(controllerValue));
-                    safeRead((char*)linkedAudioObj + 0x82, &controllerTouched, sizeof(controllerTouched));
-                    safeRead((char*)linkedAudioObj + 0x88, &controllerDriver, sizeof(controllerDriver));
-                    safeRead((char*)linkedAudioObj + 0x8, &controllerNamePtr, sizeof(controllerNamePtr));
+                    safeRead((char*)linkedAudioObj + g_binaryLayout->off_linked_audio_controller_value, &controllerValue, sizeof(controllerValue));
+                    safeRead((char*)linkedAudioObj + g_binaryLayout->off_linked_audio_controller_touched, &controllerTouched, sizeof(controllerTouched));
+                    safeRead((char*)linkedAudioObj + g_binaryLayout->off_linked_audio_controller_driver, &controllerDriver, sizeof(controllerDriver));
+                    safeRead((char*)linkedAudioObj + g_binaryLayout->off_linked_audio_controller_name_ptr, &controllerNamePtr, sizeof(controllerNamePtr));
                     readAsciiPreview(controllerNamePtr, controllerName, sizeof(controllerName));
                 }
             }
@@ -11472,7 +11917,7 @@ static void dumpWestBindingForSelectedChannel(const char* phaseTag) {
                     obj,
                     label,
                     wrapper,
-                    wrapperVt,
+                    paramWrapperVt,
                     (unsigned)kind,
                     ptr18,
                     ptr20,
@@ -11552,10 +11997,10 @@ static void relinkWestPreampControlWrappers(const char* phaseTag) {
     typedef void (*fn_UserControlDriverWrapperLink)(void*, const char*, unsigned int, unsigned char, bool);
     typedef void (*fn_AHCCExponentSwitcherLink)(void*, const char*, unsigned short, unsigned char);
 
-    auto surfaceDiscoveryInstance = (fn_SurfaceDiscoveryInstance)RESOLVE(0x1006ab790);
-    auto getSurfaceDiscoveryObject = (fn_GetSurfaceDiscoveryObject)RESOLVE(0x1006ab820);
-    auto wrapperLink = (fn_UserControlDriverWrapperLink)RESOLVE(0x10013a3d0);
-    auto exponentLink = (fn_AHCCExponentSwitcherLink)RESOLVE(0x100122400);
+    auto surfaceDiscoveryInstance = (fn_SurfaceDiscoveryInstance)RESOLVE(g_binaryLayout->fn_c_surface_discovery_instance);
+    auto getSurfaceDiscoveryObject = (fn_GetSurfaceDiscoveryObject)RESOLVE(g_binaryLayout->fn_c_surface_discovery_get_surface_discovery_object);
+    auto wrapperLink = (fn_UserControlDriverWrapperLink)RESOLVE(g_binaryLayout->fn_c_user_control_driver_wrapper_link);
+    auto exponentLink = (fn_AHCCExponentSwitcherLink)RESOLVE(g_binaryLayout->fn_c_ahccexponent_switcher_link);
 
     if (!surfaceDiscoveryInstance || !getSurfaceDiscoveryObject || !wrapperLink)
         return;
@@ -11571,7 +12016,7 @@ static void relinkWestPreampControlWrappers(const char* phaseTag) {
     snprintf(selectorLitePath,
              sizeof(selectorLitePath),
              "%s%s",
-             surfaceObj + 0x99,
+             surfaceObj + g_binaryLayout->off_stagebox_surface_name,
              "Control Surface Channel Selector Lite");
 
     QList<QObject*> forms = collectWestProcessingForms();
@@ -11581,11 +12026,11 @@ static void relinkWestPreampControlWrappers(const char* phaseTag) {
         char* raw = (char*)obj;
         formsTouched++;
 
-        void* gainRotary = *(void**)(raw + 0xc8);
-        void* gainText = *(void**)(raw + 0xd0);
-        void* padExponent = *(void**)(raw + 0xe8);
-        void* trimRotary = *(void**)(raw + 0xf8);
-        void* trimText = *(void**)(raw + 0x100);
+        void* gainRotary = *(void**)(raw + g_binaryLayout->off_west_form_gain_rotary);
+        void* gainText = *(void**)(raw + g_binaryLayout->off_west_form_gain_text);
+        void* padExponent = *(void**)(raw + g_binaryLayout->off_west_form_pad_exponent);
+        void* trimRotary = *(void**)(raw + g_binaryLayout->off_west_form_trim_rotary);
+        void* trimText = *(void**)(raw + g_binaryLayout->off_west_form_trim_text);
 
         if (gainRotary) {
             wrapperLink(gainRotary, selectorLitePath, 0x1008, 0, true);
@@ -11626,15 +12071,15 @@ static void runWestProcessingRefreshExperiment(const char* phaseTag) {
     typedef void (*fn_WestProcessingFormSetActiveInputText)(void*, unsigned char);
 
     auto changeChannel =
-        (fn_WestProcessingFormChangeChannel)RESOLVE(0x100d69350);
+        (fn_WestProcessingFormChangeChannel)RESOLVE(g_binaryLayout->fn_c_west_processing_form_change_channel);
     auto receivePointUpdated =
-        (fn_WestProcessingFormReceivePointUpdated)RESOLVE(0x100d6a920);
+        (fn_WestProcessingFormReceivePointUpdated)RESOLVE(g_binaryLayout->fn_c_west_processing_form_receive_point_updated);
     auto socketStatusUpdated =
-        (fn_WestProcessingFormSocketStatusUpdated)RESOLVE(0x100d6a810);
+        (fn_WestProcessingFormSocketStatusUpdated)RESOLVE(g_binaryLayout->fn_c_west_processing_form_socket_status_updated);
     auto preampOnSurfaceChanged =
-        (fn_WestProcessingFormPreampOnSurfaceChanged)RESOLVE(0x100d6a940);
+        (fn_WestProcessingFormPreampOnSurfaceChanged)RESOLVE(g_binaryLayout->fn_c_west_processing_form_preamp_on_surface_changed);
     auto setActiveInputText =
-        (fn_WestProcessingFormSetActiveInputText)RESOLVE(0x100d69f80);
+        (fn_WestProcessingFormSetActiveInputText)RESOLVE(g_binaryLayout->fn_c_west_processing_form_set_active_input_text);
 
     int selectedInputCh = getSelectedInputChannel(false);
     void* selectedChannelObj =
@@ -11724,19 +12169,19 @@ static void runSelectorLitePreampExperiment(const char* phaseTag) {
     typedef void (*fn_SurfaceChannelsUpdateInputPreAmps)(void*);
 
     auto updateInputPreAmp =
-        (fn_ChannelSelectorLiteUpdateInputPreAmp)RESOLVE(0x10032e690);
+        (fn_ChannelSelectorLiteUpdateInputPreAmp)RESOLVE(g_binaryLayout->fn_c_channel_selector_lite_update_input_pre_amp_2);
     auto updateInputPreAmpSingle =
-        (fn_ChannelSelectorLiteUpdateInputPreAmpSingle)RESOLVE(0x10032d390);
+        (fn_ChannelSelectorLiteUpdateInputPreAmpSingle)RESOLVE(g_binaryLayout->fn_c_channel_selector_lite_update_input_pre_amp);
     auto updateSurfaceControls =
-        (fn_ChannelSelectorLiteUpdateDL5000ControlSurfaceControls)RESOLVE(0x10032d260);
+        (fn_ChannelSelectorLiteUpdateDL5000ControlSurfaceControls)RESOLVE(g_binaryLayout->fn_c_channel_selector_lite_update_dl5000_control_surface_controls);
     auto informPreampControls =
-        (fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)RESOLVE(0x1001ddcd0);
+        (fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)RESOLVE(g_binaryLayout->fn_c_channel_selector_inform_dl5000_control_surface_pre_amp_controls);
     auto linkSurfacePreAmp =
-        (fn_ChannelSelectorLiteLinkSurfacePreAmp)RESOLVE(0x10032d2f0);
+        (fn_ChannelSelectorLiteLinkSurfacePreAmp)RESOLVE(g_binaryLayout->fn_c_channel_selector_lite_link_input_pre_amp);
     auto surfaceUpdateInputPreAmp =
-        (fn_SurfaceChannelsUpdateInputPreAmp)RESOLVE(0x10040d7c0);
+        (fn_SurfaceChannelsUpdateInputPreAmp)RESOLVE(g_binaryLayout->fn_c_surface_channels_update_input_pre_amp);
     auto surfaceUpdateInputPreAmps =
-        (fn_SurfaceChannelsUpdateInputPreAmps)RESOLVE(0x10040d730);
+        (fn_SurfaceChannelsUpdateInputPreAmps)RESOLVE(g_binaryLayout->fn_c_surface_channels_update_input_pre_amps);
 
     bool doInputPreamp = true;
     bool doSurfaceControls = true;
@@ -11772,7 +12217,7 @@ static void runSelectorLitePreampExperiment(const char* phaseTag) {
         }
     }
     if (!g_channelSelectorLite) {
-        uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
+        uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
         std::array<std::pair<const char*, void*>, 3> roots = {{
             {"AppInstance", g_AppInstance ? g_AppInstance() : nullptr},
             {"UIManagerHolder", g_uiManagerHolder},
@@ -11793,8 +12238,8 @@ static void runSelectorLitePreampExperiment(const char* phaseTag) {
         }
     }
     if (!g_surfaceChannels) {
-        const uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
-        const uintptr_t surfaceChannelsVt = (uintptr_t)0x106ce5900 + g_slide + 0x10;
+        const uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+        const uintptr_t surfaceChannelsVt = (uintptr_t)g_binaryLayout->vt_surface_channels + g_slide + 0x10;
         void* app = g_AppInstance ? g_AppInstance() : nullptr;
         void* selectorContainer = nullptr;
         void* selectorObj = nullptr;
@@ -12004,13 +12449,13 @@ static void runSelectorSurfacePreampExperiment(int ch, const char* phaseTag) {
     typedef void (*fn_ChannelSelectorManagerLinkInputMicPre)(void*, unsigned char, unsigned char);
 
     auto preampGainRotary =
-        (fn_ChannelSelectorDL5000PreampGainRotary)RESOLVE(0x1001e3360);
+        (fn_ChannelSelectorDL5000PreampGainRotary)RESOLVE(g_binaryLayout->fn_c_channel_selector_dl5000_preamp_gain_rotary);
     auto informPreampControls =
-        (fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)RESOLVE(0x1001ddcd0);
+        (fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)RESOLVE(g_binaryLayout->fn_c_channel_selector_inform_dl5000_control_surface_pre_amp_controls);
     auto updateInputPreAmp =
-        (fn_SurfaceChannelsUpdateInputPreAmp)RESOLVE(0x10040d7c0);
+        (fn_SurfaceChannelsUpdateInputPreAmp)RESOLVE(g_binaryLayout->fn_c_surface_channels_update_input_pre_amp);
     auto linkInputMicPre =
-        (fn_ChannelSelectorManagerLinkInputMicPre)RESOLVE(0x1001b9fc0);
+        (fn_ChannelSelectorManagerLinkInputMicPre)RESOLVE(g_binaryLayout->fn_c_channel_selector_manager_link_input_mic_pre);
 
     if (ch < 0 || ch >= 128)
         ch = getSelectedInputChannel(false);
@@ -12021,10 +12466,10 @@ static void runSelectorSurfacePreampExperiment(int ch, const char* phaseTag) {
         return;
     }
 
-    uintptr_t selectorVt = (uintptr_t)0x106c77c58 + g_slide + 0x10;
-    uintptr_t selectorMgrVt = (uintptr_t)0x106c77ca0 + g_slide + 0x10;
-    uintptr_t selectorLiteVt = (uintptr_t)0x106c7c098 + g_slide + 0x10;
-    uintptr_t surfaceChannelsVt = (uintptr_t)0x106ce5900 + g_slide + 0x10;
+    uintptr_t selectorVt = (uintptr_t)g_binaryLayout->vt_channel_selector + g_slide + 0x10;
+    uintptr_t selectorMgrVt = (uintptr_t)g_binaryLayout->vt_channel_selector_manager + g_slide + 0x10;
+    uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+    uintptr_t surfaceChannelsVt = (uintptr_t)g_binaryLayout->vt_surface_channels + g_slide + 0x10;
     if (!g_channelSelectorManager) {
         discoverSelectorManagerFromChannelMapper(phaseTag);
     }
@@ -12418,13 +12863,13 @@ static void showMoveDialog() {
         // Find the single cWestProcessingForm, read form->0x200 (cChannel*),
         // call cChannel::GetInputSource, cAudioSendPoint::GetParentType, and
         // cSocketProxyManager::GetProxy to see what pointer chain is live.
-        const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
+        const uintptr_t westVt = (uintptr_t)g_binaryLayout->vt_west_processing_form + g_slide + 0x10;
         typedef void* (*fn_GetInputSource)(void* ch);
         typedef int   (*fn_GetParentType)(void* sendPoint);
         typedef void* (*fn_GetProxy)(void* mgr, void* parent);
-        auto getInputSource = (fn_GetInputSource)RESOLVE(0x1006d8130);
-        auto getParentType  = (fn_GetParentType) RESOLVE(0x10040d2f0); // placeholder, resolved below
-        auto getProxy       = (fn_GetProxy)      RESOLVE(0x100738720);
+        auto getInputSource = (fn_GetInputSource)RESOLVE(g_binaryLayout->fn_c_channel_get_input_source_const);
+        auto getParentType  = (fn_GetParentType) RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_parent_type);
+        auto getProxy       = (fn_GetProxy)      RESOLVE(g_binaryLayout->fn_c_socket_proxy_manager_get_proxy);
         // Resolve cAudioSendPoint::GetParentType by symbol-search via nm at build time is unavailable;
         // fall back: many builds keep it at a fixed offset. We'll just log the raw send-point ptr
         // and its first 8 bytes (vtable), plus a few fields, and let user decode offline.
@@ -12440,7 +12885,7 @@ static void showMoveDialog() {
             statusLabel->setText("Probe: West form not found");
             return;
         }
-        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(westForm) + 0x200);
+        void* chan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(westForm) + g_binaryLayout->off_west_form_current_channel);
         fprintf(stderr, "[MC] probe: westForm=%p chan=%p\n", westForm, chan);
         if (!chan) {
             statusLabel->setText("Probe: no channel selected on West form");
@@ -12472,11 +12917,11 @@ static void showMoveDialog() {
                 fprintf(stderr, " [%d]=%p", i, *reinterpret_cast<void**>(sb + i*8));
             }
             fprintf(stderr, "\n");
-            void* parent = *reinterpret_cast<void**>(sb + 0x30); // from ShowWidgets disasm
+            void* parent = *reinterpret_cast<void**>(sb + g_binaryLayout->off_send_point_parent); // from ShowWidgets disasm
             fprintf(stderr, "[MC] probe: sendPoint->0x30 (parent?)=%p\n", parent);
             if (getProxy && parent) {
                 void* mgrHolder = g_uiManagerHolder;
-                void* mgr = mgrHolder ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mgrHolder) + 0x118) : nullptr;
+                void* mgr = mgrHolder ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mgrHolder) + g_binaryLayout->off_uiholder_socket_proxy_manager) : nullptr;
                 fprintf(stderr, "[MC] probe: uiMgrHolder=%p socketProxyMgr=%p\n", mgrHolder, mgr);
                 if (mgr) {
                     void* proxy = getProxy(mgr, parent);
@@ -13205,7 +13650,7 @@ static void rememberSelectedInputChannel(int ch) {
 static SelectedStripInfo getSelectedStripInfo(bool verbose = false) {
     SelectedStripInfo out;
     if (!g_uiManagerHolder) return out;
-    if (!safeRead((uint8_t*)g_uiManagerHolder + 0x50, &out.channelPtr, sizeof(out.channelPtr)) ||
+    if (!safeRead((uint8_t*)g_uiManagerHolder + g_binaryLayout->off_uiholder_selected_channel_ptr, &out.channelPtr, sizeof(out.channelPtr)) ||
         !out.channelPtr || (uintptr_t)out.channelPtr < 0x100000000ULL) {
         if (verbose) fprintf(stderr, "[MC] UIHolderSelectedChannel: no selected cChannel pointer.\n");
         if (canUseRecentSelectionCache(g_lastSelectedStripMs)) {
@@ -13224,7 +13669,7 @@ static SelectedStripInfo getSelectedStripInfo(bool verbose = false) {
     }
 
     typedef void* (*fn_GetManagedChannel)(const void* mgr, uint64_t stripKey);
-    auto getManagedChannel = (fn_GetManagedChannel)RESOLVE(0x1006aa580);
+    auto getManagedChannel = (fn_GetManagedChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_s_channel_strip_key_const);
     if (g_channelManager && getManagedChannel) {
         struct StripProbeRange { uint32_t type; int maxChannels; const char* label; };
         const StripProbeRange ranges[] = {
@@ -13255,8 +13700,8 @@ static SelectedStripInfo getSelectedStripInfo(bool verbose = false) {
 
     uint32_t chNum = 0xffffffffu;
     uint8_t stripType = 0xff;
-    safeRead((uint8_t*)out.channelPtr + 0x100, &chNum, sizeof(chNum));
-    safeRead((uint8_t*)out.channelPtr + 0x104, &stripType, sizeof(stripType));
+    safeRead((uint8_t*)out.channelPtr + g_binaryLayout->off_channel_channel_number, &chNum, sizeof(chNum));
+    safeRead((uint8_t*)out.channelPtr + g_binaryLayout->off_channel_strip_type, &stripType, sizeof(stripType));
     if (verbose) {
         fprintf(stderr, "[MC] UIHolderSelectedChannel: ptr=%p stripType=%u channel=%u\n",
                 out.channelPtr, (unsigned)stripType, (unsigned)chNum);
@@ -13272,8 +13717,11 @@ static SelectedStripInfo getSelectedStripInfo(bool verbose = false) {
 
 static int getSelectedInputChannel(bool verbose = false) {
     typedef uint64_t (*fn_GetSelectedChannelPacked)(const void* mgr, int selectorIdx);
-    auto getSelectorSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(0x1001ed500);
-    auto getMultiSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(0x1001098470);
+    auto getSelectorSelectedChannel = (fn_GetSelectedChannelPacked)RESOLVE(g_binaryLayout->fn_c_channel_selector_manager_get_selected_channel_int_const);
+    auto getMultiSelectedChannel =
+        (fn_GetSelectedChannelPacked)RESOLVE(g_binaryLayout->fn_c_multifunction_channel_interface_get_selected_channel_int_const);
+    bool avoidSelectorManagerPackedProbe =
+        (g_binaryLayout && g_binaryLayout->version == DirectorVersion::V212);
 
     auto probePacked = [&](const char* tag, void* obj, fn_GetSelectedChannelPacked fn) -> int {
         if (!obj || !fn) return -1;
@@ -13298,16 +13746,34 @@ static int getSelectedInputChannel(bool verbose = false) {
                                              selectedStrip.channel,
                                              verbose);
 
-    int selected = probePacked("SelectedChannel", g_channelSelectorManager, getSelectorSelectedChannel);
-    if (selected >= 0) {
-        if (verbose && selectedStrip.valid && selectedStrip.stripType == 1 &&
-            selectedStrip.channel != selected) {
+    if (selectedStrip.valid && selectedStrip.stripType == 1) {
+        if (verbose && avoidSelectorManagerPackedProbe) {
             fprintf(stderr,
-                    "[MC] getSelectedInputChannel: selector manager channel %d overrides UIHolder channel %d.\n",
-                    selected + 1, selectedStrip.channel + 1);
+                    "[MC] getSelectedInputChannel: using UIHolder-selected input channel %d first on %s.\n",
+                    selectedStrip.channel + 1,
+                    directorVersionToString(g_binaryLayout->version));
         }
-        rememberSelectedInputChannel(selected);
-        return selected;
+        rememberSelectedInputChannel(selectedStrip.channel);
+        return selectedStrip.channel;
+    }
+
+    int selected = -1;
+    if (!avoidSelectorManagerPackedProbe) {
+        selected = probePacked("SelectedChannel", g_channelSelectorManager, getSelectorSelectedChannel);
+        if (selected >= 0) {
+            if (verbose && selectedStrip.valid && selectedStrip.stripType == 1 &&
+                selectedStrip.channel != selected) {
+                fprintf(stderr,
+                        "[MC] getSelectedInputChannel: selector manager channel %d overrides UIHolder channel %d.\n",
+                        selected + 1, selectedStrip.channel + 1);
+            }
+            rememberSelectedInputChannel(selected);
+            return selected;
+        }
+    } else if (verbose && g_channelSelectorManager && getSelectorSelectedChannel) {
+        fprintf(stderr,
+                "[MC] getSelectedInputChannel: skipping selector-manager packed probe on %s until layout is revalidated.\n",
+                directorVersionToString(g_binaryLayout->version));
     }
 
     selected = probePacked("MultifunctionSelectedChannel", g_multifunctionChannelInterface, getMultiSelectedChannel);
@@ -13320,11 +13786,6 @@ static int getSelectedInputChannel(bool verbose = false) {
         }
         rememberSelectedInputChannel(selected);
         return selected;
-    }
-
-    if (selectedStrip.valid && selectedStrip.stripType == 1) {
-        rememberSelectedInputChannel(selectedStrip.channel);
-        return selectedStrip.channel;
     }
 
     if (canUseRecentSelectionCache(g_lastSelectedInputChannelMs)) {
@@ -13361,8 +13822,16 @@ static void refreshSelectionCacheForShortcut() {
         rescanSelectionProvidersFromUIHolder((int)strip.stripType,
                                              strip.channel,
                                              false);
-    if (strip.valid)
+    if (strip.valid) {
         rememberSelectedStrip(strip);
+        if (strip.stripType == 1) {
+            int inputCh = getSelectedInputChannel(false);
+            if (inputCh >= 0)
+                rememberSelectedInputChannel(inputCh);
+        }
+        return;
+    }
+
     int inputCh = getSelectedInputChannel(false);
     if (inputCh >= 0)
         rememberSelectedInputChannel(inputCh);
@@ -13373,6 +13842,7 @@ static void runCopyPasteShortcutAction(bool isCopy, const char* origin) {
     bool shouldDelay =
         g_lastPointerSelectionEventMs != 0 &&
         (now - g_lastPointerSelectionEventMs) <= kPointerSelectionSettleWindowMs;
+    SelectedStripInfo previousStrip = getSelectedStripInfo(false);
     int previousSelection = g_lastSelectedInputChannel;
 
     auto action = [isCopy, origin]() {
@@ -13397,21 +13867,40 @@ static void runCopyPasteShortcutAction(bool isCopy, const char* origin) {
     auto poll = std::make_shared<std::function<void()>>();
     *poll = [=]() {
         refreshSelectionCacheForShortcut();
-        int currentSelection = getSelectedInputChannel(false);
-        bool changed = (currentSelection >= 0 &&
-                        previousSelection >= 0 &&
-                        currentSelection != previousSelection);
-        bool usable = (currentSelection >= 0) && (previousSelection < 0 || changed);
+        SelectedStripInfo currentStrip = getSelectedStripInfo(false);
+        int currentSelection = -1;
+        bool usable = false;
+
+        if (currentStrip.valid) {
+            bool changed = (!previousStrip.valid) ||
+                           currentStrip.stripType != previousStrip.stripType ||
+                           currentStrip.channel != previousStrip.channel;
+            usable = changed || !shouldDelay;
+        } else {
+            currentSelection = getSelectedInputChannel(false);
+            bool changed = (currentSelection >= 0 &&
+                            previousSelection >= 0 &&
+                            currentSelection != previousSelection);
+            usable = (currentSelection >= 0) && (previousSelection < 0 || changed);
+        }
+
         if (usable || *attempts >= kPointerSelectionSettlePollAttempts) {
-            if (currentSelection >= 0) {
+            if (currentStrip.valid) {
                 fprintf(stderr,
-                        "[MC] %s shortcut settle selected ch %d after %d poll(s).\n",
+                        "[MC] %s shortcut settle selected strip type=%u channel=%d after %d poll(s).\n",
+                        isCopy ? "Copy" : "Paste",
+                        currentStrip.stripType,
+                        currentStrip.channel + 1,
+                        *attempts + 1);
+            } else if (currentSelection >= 0) {
+                fprintf(stderr,
+                        "[MC] %s shortcut settle selected input ch %d after %d poll(s).\n",
                         isCopy ? "Copy" : "Paste",
                         currentSelection + 1,
                         *attempts + 1);
             } else {
                 fprintf(stderr,
-                        "[MC] %s shortcut settle timed out with no selected channel after %d poll(s).\n",
+                        "[MC] %s shortcut settle timed out with no selected strip after %d poll(s).\n",
                         isCopy ? "Copy" : "Paste",
                         *attempts + 1);
             }
@@ -13515,7 +14004,7 @@ static void refreshDyn8RackForCopyPaste(const std::vector<CopyPasteDyn8Op>& dyn8
         return;
 
     typedef void (*fn_InputConfigurationChanged)(void* rack);
-    auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(0x1005ce2f0);
+    auto inputConfigurationChanged = (fn_InputConfigurationChanged)RESOLVE(g_binaryLayout->fn_c_dynamics_rack_input_configuration_changed);
     if (!inputConfigurationChanged)
         return;
 
@@ -13854,7 +14343,7 @@ static bool sendBuiltInCopyPasteResetCommand(uint32_t task, uint32_t target, con
     uint64_t stripKey = MAKE_KEY(strip.stripType, (uint8_t)strip.channel);
     if (g_uiCopyPasteResetManager) {
         typedef void (*fn_PerformCommand)(void* obj, const UICopyPasteResetCommand& cmd);
-        auto performCommand = (fn_PerformCommand)RESOLVE(0x10076de90);
+        auto performCommand = (fn_PerformCommand)RESOLVE(g_binaryLayout->fn_c_uicopy_paste_reset_manager_perform_command);
         if (performCommand) {
             UICopyPasteResetCommand cmd = {};
             cmd.task = task;
@@ -13875,7 +14364,7 @@ static bool sendBuiltInCopyPasteResetCommand(uint32_t task, uint32_t target, con
         return false;
     }
     typedef void (*fn_SendCopyPasteResetCommand)(void* obj, uint32_t task, uint32_t target, uint64_t stripKey);
-    auto sendCommand = (fn_SendCopyPasteResetCommand)RESOLVE(0x10040a720);
+    auto sendCommand = (fn_SendCopyPasteResetCommand)RESOLVE(g_binaryLayout->fn_c_copy_paste_reset_switch_interpreter_send_copy_paste_reset_command);
     if (!sendCommand) {
         fprintf(stderr, "[MC] Built-in CPR command unavailable: switch interpreter symbol missing.\n");
         return false;
@@ -14222,6 +14711,9 @@ static void onLoad() {
         fprintf(stderr, "[MC] MC_AUTOTEST_RECALL_SHOW='%s'\n", recallShowEnv);
     }
     resolveSlide();
+    initializeBinaryLayout();
+    initializeProcessingDescriptors();
+    initializeProcessingDescriptorScanAnchors();
     maybePatchDirectorSingletonKey();
     resolveSymbols();
 
@@ -14408,7 +14900,7 @@ static void onLoad() {
                     void* dynObj = getDynNetObj(u);
                     if (!dynObj) { fprintf(stderr, "[MC]   Unit %d: NOT FOUND\n", u); continue; }
                     uint8_t raw[0x90];
-                    safeRead((uint8_t*)dynObj + 0xa0, raw, 0x90);
+                    safeRead((uint8_t*)dynObj + g_binaryLayout->off_dyn_obj_raw_block, raw, 0x90);
                     fprintf(stderr, "[MC]   Unit %d (first 48): ", u);
                     for (int b = 0; b < 48; b++) fprintf(stderr, "%02x ", raw[b]);
                     fprintf(stderr, "\n");
@@ -14424,7 +14916,7 @@ static void onLoad() {
                         void* dynObj = getDynNetObj(u);
                         if (!dynObj) { fprintf(stderr, "[MC]   Unit %d: NOT FOUND\n", u); continue; }
                         uint8_t raw[0x90];
-                        safeRead((uint8_t*)dynObj + 0xa0, raw, 0x90);
+                        safeRead((uint8_t*)dynObj + g_binaryLayout->off_dyn_obj_raw_block, raw, 0x90);
                         fprintf(stderr, "[MC]   Unit %d (first 48): ", u);
                         for (int b = 0; b < 48; b++) fprintf(stderr, "%02x ", raw[b]);
                         fprintf(stderr, "\n");

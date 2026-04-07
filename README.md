@@ -1,6 +1,6 @@
 # dLive Move Patch
 
-Unofficial community patch for `dLive Director V2.11` on macOS.
+Unofficial community beta patch for `dLive Director V2.11` and `dLive Director V2.12` on macOS.
 
 This project adds quality-of-life features to the dLive offline editor, with the main focus on moving channel data safely across mono and stereo layouts.
 
@@ -24,6 +24,7 @@ It also includes extra usability features:
 - `Reorder` in the top bar opens the Channel Reorder Panel
 - `Cmd+C` / `Cmd+V` copies and pastes input channel settings
 - `Cmd+C` / `Cmd+V` uses built-in `Copy Mix` / `Paste Mix` when an Aux is selected
+- If multiple supported Director versions are installed, the launcher lets you choose which one to start
 
 ## Important
 
@@ -44,7 +45,7 @@ For most users, use the packaged build in [`dist/`](./dist):
 5. If Director opens but the patch still does not load on that Mac, run:
    `Prepare Director For Patch.command`
 
-`Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder and re-signs the user's local `dLive Director V2.11.app` with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
+`Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder and re-signs the user's local `dLive Director` app with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
 
 The package is built by:
 
@@ -68,7 +69,7 @@ That script produces:
 ## Requirements
 
 - macOS
-- a user-installed copy of `dLive Director V2.11`
+- a user-installed copy of `dLive Director V2.11` or `dLive Director V2.12`
 - compatible `x86_64` runtime setup
 
 No LLDB is required for normal use.
