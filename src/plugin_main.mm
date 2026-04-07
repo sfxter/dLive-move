@@ -128,16 +128,9 @@ static void scanRootForVtableSlotCandidates(void* root,
                                             intptr_t tolerance = 0x40);
 static void dumpWestBindingForSelectedChannel(const char* phaseTag = nullptr);
 static void runWestProcessingRefreshExperiment(const char* phaseTag = nullptr);
-static void runWestUserControlDriverExperiment(const char* phaseTag = nullptr);
 static void runSelectorLitePreampExperiment(const char* phaseTag = nullptr);
 static void runSelectorSurfacePreampExperiment(int ch, const char* phaseTag = nullptr);
-static void refreshWestProcessingForChannel(int ch, const char* phaseTag = nullptr);
 static void relinkWestPreampControlWrappers(const char* phaseTag = nullptr);
-static void pushWestPreampGainValue(int ch, const char* phaseTag = nullptr);
-static void scheduleWestPreampGainPush(int ch, const char* phaseTag = nullptr);
-static void scheduleWestPreampGainPushForCurrentSelection(const char* phaseTag = nullptr);
-static void scheduleWestPreampGainPushAfterPointerSelection();
-static void syncWestPreampUiToSelectedChannel(bool force = false, const char* phaseTag = nullptr);
 static QList<QObject*> collectWestProcessingForms();
 static bool writePreampDataViaCsvImport(const sAudioSource& source,
                                         const PreampData& preamp,
@@ -3175,12 +3168,6 @@ static bool selectInputChannelForUI(int ch, const char* phaseTag = nullptr) {
             relinkWestPreampControlWrappers("[MC] (delayed 600ms) ");
         });
     }
-    scheduleWestPreampGainPush(ch, phaseTag);
-    if (autotestEnvEnabled("MC_AUTOTEST_WEST_REFRESH_AFTER_SELECT")) {
-        refreshWestProcessingForChannel(ch, phaseTag);
-        QTimer::singleShot(150, qApp, [ch]() { refreshWestProcessingForChannel(ch, "[MC] (delayed 150ms) "); });
-        QTimer::singleShot(600, qApp, [ch]() { refreshWestProcessingForChannel(ch, "[MC] (delayed 600ms) "); });
-    }
     return true;
 }
 
@@ -4296,6 +4283,9 @@ struct ChannelSnapshot {
         void*   fxReceivePt;  // FX input receive point (target of channel's send)
         int     parentType;   // GetParentType() result: 2=FXUnit, 6=AHFXUnit, -1=external/none
         bool    hasInsert;    // channel->HasInserts(insertPoint)
+        bool    inEnabled;    // insert+0x88: insert IN state
+        bool    bypass;       // insert+0x89: insert BYPASS state
+        bool    validInBypass;// true if inEnabled/bypass were captured
     } insertInfo[2];
 
     // Dyn8 pool dynamics settings — single cDynamicsNetObject per unit (64 total)
@@ -4681,6 +4671,17 @@ static void logMixerAssignmentSummary(const char* phaseTag, int ch, const uint8_
             groupList);
 }
 
+static void* getAudioCoreDM() {
+    typedef void* (*fn_AppInstance3)();
+    auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
+    if (!appInst3) return nullptr;
+    void* app = appInst3();
+    if (!app) return nullptr;
+    void* drbox = *reinterpret_cast<void**>((uint8_t*)app + 0xb8);
+    if (!drbox) return nullptr;
+    return *reinterpret_cast<void**>((uint8_t*)drbox + 0x48);
+}
+
 static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
     void* inputCh = getInputChannel(ch);
     if (!inputCh) { fprintf(stderr, "[MC] Ch %d: InputChannel is null!\n", ch); return false; }
@@ -4853,8 +4854,44 @@ static bool snapshotChannel(int ch, ChannelSnapshot& snap) {
 
         void* cChannel = getChannel(g_channelManager, 1, (uint8_t)ch);
         for (int ip = 0; ip < 2; ip++) {
-            snap.insertInfo[ip] = {nullptr, nullptr, nullptr, -1, false};
+            snap.insertInfo[ip] = {nullptr, nullptr, nullptr, -1, false, false, false, false};
             if (!cChannel) continue;
+            // Capture insert IN from cInputChannel->0x60/0x68->+0x8 + 0x88
+            // and user-facing BYPASS from the cInsertIntermediate at
+            // audioCoreDM + (0x2408 | 0x2808) + 8*ch, field +0x81.
+            {
+                size_t baseOff = (ip == 0) ? 0x60 : 0x68;
+                void* insertDriver = nullptr;
+                safeRead((uint8_t*)cChannel + baseOff, &insertDriver, sizeof(insertDriver));
+                if (insertDriver) {
+                    void* insertObj = nullptr;
+                    safeRead((uint8_t*)insertDriver + 0x8, &insertObj, sizeof(insertObj));
+                    if (insertObj) {
+                        uint8_t inB = 0;
+                        if (safeRead((uint8_t*)insertObj + 0x88, &inB, 1)) {
+                            snap.insertInfo[ip].inEnabled = (inB != 0);
+                        }
+                    }
+                }
+                void* acdm = getAudioCoreDM();
+                if (acdm) {
+                    size_t arrOff = (ip == 0) ? 0x2408 : 0x2808;
+                    void* intermediate = nullptr;
+                    safeRead((uint8_t*)acdm + arrOff + 8 * (size_t)ch,
+                             &intermediate, sizeof(intermediate));
+                    if (intermediate) {
+                        uint8_t byB = 0;
+                        if (safeRead((uint8_t*)intermediate + 0x81, &byB, 1)) {
+                            snap.insertInfo[ip].bypass = (byB != 0);
+                            snap.insertInfo[ip].validInBypass = true;
+                            fprintf(stderr, "[MC]   Insert%c ch %d: in=%d bypass=%d (intermediate=%p)\n",
+                                    'A'+ip, ch+1,
+                                    snap.insertInfo[ip].inEnabled ? 1 : 0,
+                                    byB, intermediate);
+                        }
+                    }
+                }
+            }
             if (!hasInserts(cChannel, ip)) continue;
             snap.insertInfo[ip].hasInsert = true;
 
@@ -5086,6 +5123,38 @@ static bool recallChannel(int ch, const ChannelSnapshot& snap, bool skipPreamp =
 
     g_setChannelName(g_audioDM, 1, (uint8_t)ch, snap.name);
     g_setChannelColour(g_audioDM, 1, (uint8_t)ch, snap.colour);
+
+    // Restore Insert IN via cInputChannel::AssignInsert1/2 (writes routing flag,
+    // broadcasts net message). The user-facing BYPASS lives on cInsertIntermediate
+    // and is restored via cInsertIntermediate::SetInsertBypassed (writes [+0x81]
+    // and fires InformOtherObjects → propagates to FPGA, UI, scene system).
+    {
+        typedef void (*fn_AssignInsert)(void* inputCh, bool in, bool bypass);
+        auto assignInsert1 = (fn_AssignInsert)RESOLVE(0x100290490);
+        auto assignInsert2 = (fn_AssignInsert)RESOLVE(0x1002905b0);
+        typedef void (*fn_SetInsertBypassed)(void* intermediate, bool bypass);
+        auto setInsertBypassed = (fn_SetInsertBypassed)RESOLVE(0x1002a4410);
+        void* acdm = getAudioCoreDM();
+        for (int ip = 0; ip < 2; ip++) {
+            if (!snap.insertInfo[ip].validInBypass) continue;
+            auto fn = (ip == 0) ? assignInsert1 : assignInsert2;
+            if (fn) fn(inputCh, snap.insertInfo[ip].inEnabled, false);
+
+            void* intermediate = nullptr;
+            if (acdm && setInsertBypassed) {
+                size_t arrOff = (ip == 0) ? 0x2408 : 0x2808;
+                intermediate = *reinterpret_cast<void**>(
+                    (uint8_t*)acdm + arrOff + 8 * (size_t)ch);
+                if (intermediate)
+                    setInsertBypassed(intermediate, snap.insertInfo[ip].bypass);
+            }
+            fprintf(stderr, "[MC]   Recall Insert%c ch %d: in=%d bypass=%d (intermediate=%p)\n",
+                    'A'+ip, ch+1,
+                    snap.insertInfo[ip].inEnabled ? 1 : 0,
+                    snap.insertInfo[ip].bypass ? 1 : 0,
+                    intermediate);
+        }
+    }
 
     return true;
 }
@@ -7015,18 +7084,6 @@ static bool runAutomatedMoveTest() {
                 runWestProcessingRefreshExperiment("[MC][AUTOTEST] (delayed 1000ms) ");
             });
         }
-        if (autotestEnvEnabled("MC_AUTOTEST_WEST_DRIVER_POST_USER") ||
-            autotestEnvEnabled("MC_AUTOTEST_WEST_DRIVER_WRITE_VALUE")) {
-            QTimer::singleShot(0, qApp, []() {
-                runWestUserControlDriverExperiment("[MC][AUTOTEST] ");
-            });
-            QTimer::singleShot(250, qApp, []() {
-                runWestUserControlDriverExperiment("[MC][AUTOTEST] (delayed 250ms) ");
-            });
-            QTimer::singleShot(1000, qApp, []() {
-                runWestUserControlDriverExperiment("[MC][AUTOTEST] (delayed 1000ms) ");
-            });
-        }
         if (!skipChannelVerify) {
             for (auto& [tgtCh, snapIdx] : plan.targetMap) {
                 ChannelSnapshot live;
@@ -8088,44 +8145,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     phase("Phase: rewrite patching");
     fprintf(stderr, "[MC] Writing patching (%s; MixRack I/O Port: %s)...\n",
             patchPolicy, ioPortPolicy);
-    // Snapshot cDL5000ChannelMapperDiscovery::0x88 (A-patch sAudioSource array)
-    // so we can detect and restore collateral corruption on channels NOT in the
-    // move targetMap. Stereo reconfig in SetInputChannelSource can silently
-    // rewrite other channels' entries (root cause of ch15/16 gain bleed).
-    void* g_discBeforePatch = nullptr;
-    void* g_acMapperBefore = nullptr;
-    uint64_t g_preSrcArr[0x80] = {0};
-    uint64_t g_preAcArr[0x80]  = {0};
-    {
-        typedef void* (*fn_AppInstance3)();
-        auto appInst3 = (fn_AppInstance3)RESOLVE(0x100d5a120);
-        void* a3 = appInst3 ? appInst3() : nullptr;
-        void* s3 = a3 ? *reinterpret_cast<void**>((uint8_t*)a3 + 0xc0) : nullptr;
-        g_discBeforePatch = s3 ? *reinterpret_cast<void**>((uint8_t*)s3 + 0xa0) : nullptr;
-        if (g_discBeforePatch) {
-            uint64_t* srcArr = *reinterpret_cast<uint64_t**>((uint8_t*)g_discBeforePatch + 0x88);
-            if (srcArr) {
-                for (int i = 0; i < 0x80; ++i) g_preSrcArr[i] = srcArr[i];
-                fprintf(stderr, "[MC]   Snapshotted discovery->0x88 (disc=%p, arr=%p)\n",
-                        g_discBeforePatch, srcArr);
-            }
-        }
-        // Also snapshot AudioCore cChannelMapper->0x88 (app→0xb8→0x48→0xa8→0x20)
-        if (a3) {
-            void* drbox = *reinterpret_cast<void**>((uint8_t*)a3 + 0xb8);
-            void* acd   = drbox ? *reinterpret_cast<void**>((uint8_t*)drbox + 0x48) : nullptr;
-            void* wrap  = acd ? *reinterpret_cast<void**>((uint8_t*)acd + 0xa8) : nullptr;
-            g_acMapperBefore = wrap ? *reinterpret_cast<void**>((uint8_t*)wrap + 0x20) : nullptr;
-            if (g_acMapperBefore) {
-                uint64_t* acArr = *reinterpret_cast<uint64_t**>((uint8_t*)g_acMapperBefore + 0x88);
-                if (acArr) {
-                    for (int i = 0; i < 0x80; ++i) g_preAcArr[i] = acArr[i];
-                    fprintf(stderr, "[MC]   Snapshotted acMapper->0x88 (mapper=%p, arr=%p)\n",
-                            g_acMapperBefore, acArr);
-                }
-            }
-        }
-    }
         bool disablePatchMetadataSync = envFlagEnabled("MC_DISABLE_PATCH_METADATA_SYNC");
         fprintf(stderr,
                 "[MC]   Patch metadata sync after SetInputChannelSource: %s\n",
@@ -8299,123 +8318,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
             QApplication::processEvents();
         } else {
             fprintf(stderr, "[MC]   WARN: could not resolve cAudioCoreDM for NewInputStereoConfiguration\n");
-        }
-    }
-    // Re-fire cDL5000ChannelMapperDiscovery AboutToChangeSource/HaveChangedSource
-    // observers for each affected channel. SetInputChannelSource updates the audio
-    // graph but bypasses cChannelMapperDiscovery::NewIPChannelAPatch, which is the
-    // normal UI-repatch path that invokes vtable[0xc0]/[0xc8] per channel to make
-    // cChannelSelectorLite::LinkInputPreAmp republish the West-form gain-knob
-    // binding. Without this, ch15/16 after a stereo-reconfig move keep their
-    // stale LinkSurfacePreAmp pointing at ch13/14's preamp (the gain bleed).
-    if (!envFlagEnabled("MC_DISABLE_REFIRE_DISCOVERY")) {
-        typedef void* (*fn_AppInstance2)();
-        auto appInst = (fn_AppInstance2)RESOLVE(0x100d5a120);
-        void* discovery = nullptr;
-        void* app2 = appInst ? appInst() : nullptr;
-        void* surface = app2 ? *reinterpret_cast<void**>((uint8_t*)app2 + 0xc0) : nullptr;
-        if (surface) {
-            discovery = *reinterpret_cast<void**>((uint8_t*)surface + 0xa0);
-        }
-        fprintf(stderr, "[MC]   Observer re-fire lookup: app=%p surface=%p discovery=%p\n",
-                app2, surface, discovery);
-        if (discovery) {
-            void** vt = *reinterpret_cast<void***>(discovery);
-            typedef void (*fn_changeSource)(void* self, int event, void* srcArr,
-                                            uint16_t chan, uint8_t stripType);
-            auto aboutTo = (fn_changeSource)vt[0xc0 / 8];
-            auto haveChg = (fn_changeSource)vt[0xc8 / 8];
-            void* srcArr = *reinterpret_cast<void**>((uint8_t*)discovery + 0x88);
-            fprintf(stderr,
-                    "[MC]   Re-firing discovery observers: disc=%p srcArr=%p\n",
-                    discovery, srcArr);
-            // Build set of channels the move legitimately touched.
-            std::set<int> movedSet;
-            for (auto& [tgtCh, si] : plan.targetMap) {
-                movedSet.insert(tgtCh);
-                if (isChannelStereo(tgtCh)) movedSet.insert(tgtCh + 1);
-            }
-            // Restore collateral-corrupted entries (channels NOT in movedSet
-            // whose srcArr[chan] changed versus pre-patch snapshot).
-            uint64_t* curArr = reinterpret_cast<uint64_t*>(srcArr);
-            int restored = 0;
-            if (discovery == g_discBeforePatch && curArr) {
-                for (int ch = 0; ch < 0x80; ++ch) {
-                    if (movedSet.count(ch)) continue;
-                    if (curArr[ch] == g_preSrcArr[ch]) continue;
-                    fprintf(stderr,
-                            "[MC]     Restore ch %d srcArr slot: 0x%016llx -> 0x%016llx\n",
-                            ch + 1,
-                            (unsigned long long)curArr[ch],
-                            (unsigned long long)g_preSrcArr[ch]);
-                    curArr[ch] = g_preSrcArr[ch];
-                    ++restored;
-                    haveChg(discovery, 0, (uint8_t*)discovery + 0x88,
-                            (uint16_t)ch, 0);
-                }
-            }
-            fprintf(stderr, "[MC]   Restored %d collateral srcArr entries\n", restored);
-            // Also diff/restore Audio Core cChannelMapper->0x88.
-            if (g_acMapperBefore) {
-                uint64_t* acCur = *reinterpret_cast<uint64_t**>(
-                    (uint8_t*)g_acMapperBefore + 0x88);
-                int acRestored = 0;
-                if (acCur) {
-                    for (int ch = 0; ch < 0x80; ++ch) {
-                        if (acCur[ch] == g_preAcArr[ch]) continue;
-                        fprintf(stderr,
-                                "[MC]     acMapper ch %d slot changed: 0x%016llx -> 0x%016llx (moved=%d)\n",
-                                ch + 1,
-                                (unsigned long long)g_preAcArr[ch],
-                                (unsigned long long)acCur[ch],
-                                movedSet.count(ch) ? 1 : 0);
-                        if (movedSet.count(ch)) continue;
-                        acCur[ch] = g_preAcArr[ch];
-                        ++acRestored;
-                    }
-                }
-                fprintf(stderr, "[MC]   Restored %d collateral acMapper entries\n", acRestored);
-            }
-            // Sync discovery->0x88 from acMapper->0x88 for moved channels.
-            // SetInputChannelSource writes the new source into the Audio Core
-            // cChannelMapper but the Surface-side cDL5000ChannelMapperDiscovery
-            // (which cChannelSelectorLite queries for preamp binding) is only
-            // updated by the NewIPChannelAPatch net-message path, which our
-            // move bypasses. Without this sync, re-firing the observer below
-            // would re-publish the stale pre-move source for each moved ch.
-            if (g_acMapperBefore && curArr) {
-                uint64_t* acCur = *reinterpret_cast<uint64_t**>(
-                    (uint8_t*)g_acMapperBefore + 0x88);
-                if (acCur) {
-                    int synced = 0;
-                    for (int ch : movedSet) {
-                        if (ch < 0 || ch > 0x7f) continue;
-                        if (curArr[ch] == acCur[ch]) continue;
-                        fprintf(stderr,
-                                "[MC]     Sync discovery ch %d: 0x%016llx -> 0x%016llx\n",
-                                ch + 1,
-                                (unsigned long long)curArr[ch],
-                                (unsigned long long)acCur[ch]);
-                        curArr[ch] = acCur[ch];
-                        ++synced;
-                    }
-                    fprintf(stderr, "[MC]   Synced %d discovery slots from acMapper\n", synced);
-                }
-            }
-            // Re-fire observers for moved channels (normal case).
-            for (int ch : movedSet) {
-                fprintf(stderr,
-                        "[MC]     Re-fire ch %d (AboutToChangeSource + HaveChangedSource)\n",
-                        ch + 1);
-                aboutTo(discovery, 0, (uint8_t*)discovery + 0x88,
-                        (uint16_t)ch, 0);
-                haveChg(discovery, 0, (uint8_t*)discovery + 0x88,
-                        (uint16_t)ch, 0);
-            }
-            QApplication::processEvents();
-        } else {
-            fprintf(stderr,
-                    "[MC]   WARN: could not resolve cDL5000ChannelMapperDiscovery for observer re-fire\n");
         }
     }
     // Rebuild the cChannelMapper gain-sharing link registers so the West-form
@@ -9152,7 +9054,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         logFinalPreampStateForChannel(i);
     }
     refreshVisiblePreampUI("[MC] final-preamp: ");
-    scheduleWestPreampGainPushForCurrentSelection("[MC] final-preamp: ");
 
     if (autotestEnvEnabled("MC_EXPERIMENT_RECALL_CURRENT_SETTINGS")) {
         phase("Phase: scene refresh experiment");
@@ -9190,25 +9091,6 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     dumpChannelSourceFields("[MC] post-move: ");
 
     probeChannelBindings("PROBE/before-complete:", std::max(0, lo-2), std::min(127, hi+2));
-
-    if (envFlagEnabled("MC_REBIND_WEST_FORM")) {
-        const uintptr_t westVt = (uintptr_t)0x106ce0448 + g_slide + 0x10;
-        typedef void (*fn_ChangeChannel)(void* form, void* chan);
-        auto changeChannel = (fn_ChangeChannel)RESOLVE(0x100d69350);
-        int rebound = 0;
-        if (changeChannel) {
-            for (QWidget* w : QApplication::allWidgets()) {
-                if (!w) continue;
-                if (*reinterpret_cast<uintptr_t*>(w) != westVt) continue;
-                void* curChan = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(w) + 0x200);
-                if (!curChan) continue;
-                changeChannel(w, nullptr);
-                changeChannel(w, curChan);
-                rebound++;
-            }
-        }
-        fprintf(stderr, "[MC] MC_REBIND_WEST_FORM: rebound %d cWestProcessingForm instance(s)\n", rebound);
-    }
 
     phase("Phase: move complete");
     return true;
@@ -9254,33 +9136,16 @@ static id g_moveShortcutMonitor = nil;
 static QPushButton* g_toolbarReorderButton = nullptr;
 static QTimer* g_toolbarButtonRefreshTimer = nullptr;
 static QTimer* g_autotestOverlayStatusTimer = nullptr;
-static QTimer* g_westPreampSyncTimer = nullptr;
 static QPointer<QFrame> g_autotestOverlayFrame = nullptr;
 static QPointer<QLabel> g_autotestOverlayTitle = nullptr;
 static QPointer<QLabel> g_autotestOverlayDetail = nullptr;
 static QString g_autotestOverlayStatusPath;
 static QString g_lastAutotestOverlayStatusText;
-static int g_westPreampSyncLastChannel = -2;
-static int g_westPreampSyncLastSocket = -2;
-static int g_westPreampSyncLastGain = INT32_MIN;
-static int g_westPreampSyncLastPad = -1;
-static int g_westPreampSyncLastPhantom = -1;
-static int g_westPreampSyncLastForms = -1;
 
 static bool shouldShowAutotestOverlay() {
     return getenv("MC_AUTOTEST_SELECT_ONLY") ||
            (getenv("MC_AUTOTEST_SRC") && getenv("MC_AUTOTEST_DST")) ||
            (getenv("MC_AUTOTEST_COPY_SRC") && getenv("MC_AUTOTEST_COPY_DST"));
-}
-
-static bool westPreampSyncEnabled() {
-    const char* env = getenv("MC_ENABLE_WEST_PREAMP_SYNC");
-    return env && atoi(env) != 0;
-}
-
-static bool westPreampGainPushEnabled() {
-    const char* env = getenv("MC_DISABLE_WEST_GAIN_PUSH");
-    return !(env && atoi(env) != 0);
 }
 
 static QWidget* getLargestVisibleAutotestWindow() {
@@ -11752,319 +11617,6 @@ static void relinkWestPreampControlWrappers(const char* phaseTag) {
             selectorLitePath);
 }
 
-static void pushWestPreampGainValue(int ch, const char* phaseTag) {
-    typedef uint16_t (*fn_UserControlDriverWrapperGetControllerRangeLower)(void*);
-    typedef uint16_t (*fn_UserControlDriverWrapperGetControllerRangeUpper)(void*);
-    typedef void (*fn_UserControlDriverWrapperPostContinuousControllerValue)(void*, uint16_t);
-    typedef void (*fn_UserControlDriverWrapperPostContinuousControllerRangeAndValue)(void*, uint16_t, uint16_t, uint16_t);
-    typedef void* (*fn_UserControlDriverWrapperGetAudioObject)(void*);
-
-    if (ch < 0 || ch >= 128)
-        return;
-
-    auto getRangeLower = (fn_UserControlDriverWrapperGetControllerRangeLower)RESOLVE(0x10013a430);
-    auto getRangeUpper = (fn_UserControlDriverWrapperGetControllerRangeUpper)RESOLVE(0x10013a470);
-    auto postValue = (fn_UserControlDriverWrapperPostContinuousControllerValue)RESOLVE(0x10013a4b0);
-    auto postRangeValue = (fn_UserControlDriverWrapperPostContinuousControllerRangeAndValue)RESOLVE(0x10013a4f0);
-    auto getAudioObject = (fn_UserControlDriverWrapperGetAudioObject)RESOLVE(0x10013a530);
-    if ((!postRangeValue && !postValue) || !getRangeLower || !getRangeUpper)
-        return;
-
-    PatchData livePatch = {};
-    if (!readPatchData(ch, livePatch))
-        return;
-
-    PreampData pd = {};
-    if (!readPreampDataForPatch(livePatch, pd))
-        return;
-
-    uint16_t rawValue = (uint16_t)pd.gain;
-    QList<QObject*> forms = collectWestProcessingForms();
-    int formsTouched = 0;
-    int posts = 0;
-    for (QObject* obj : forms) {
-        char* raw = (char*)obj;
-        void* gainRotary = *(void**)(raw + 0xc8);
-        void* gainText = *(void**)(raw + 0xd0);
-        formsTouched++;
-
-        auto postWrapper = [&](const char* label, void* wrapper) {
-            if (!wrapper)
-                return;
-            uint16_t lower = getRangeLower(wrapper);
-            uint16_t upper = getRangeUpper(wrapper);
-            void* audioObj = getAudioObject ? getAudioObject(wrapper) : nullptr;
-            int controllerSigned = 0x8000 + (int)pd.gain;
-            if (controllerSigned < (int)lower)
-                controllerSigned = (int)lower;
-            if (controllerSigned > (int)upper)
-                controllerSigned = (int)upper;
-            uint16_t controllerValue = (uint16_t)controllerSigned;
-            fprintf(stderr,
-                    "[MC] %swest gain push ch %d %s wrapper=%p audioObj=%p range=[%u,%u] raw=%u signed=%d controller=%u\n",
-                    phaseTag ? phaseTag : "",
-                    ch + 1,
-                    label,
-                    wrapper,
-                    audioObj,
-                    (unsigned)lower,
-                    (unsigned)upper,
-                    (unsigned)rawValue,
-                    (int16_t)rawValue,
-                    (unsigned)controllerValue);
-            if (postRangeValue)
-                postRangeValue(wrapper, lower, upper, controllerValue);
-            else
-                postValue(wrapper, controllerValue);
-            posts++;
-        };
-
-        postWrapper("rotary", gainRotary);
-        postWrapper("text", gainText);
-    }
-
-    fprintf(stderr,
-            "[MC] %swest gain push summary: ch=%d forms=%d posts=%d raw=%u signed=%d\n",
-            phaseTag ? phaseTag : "",
-            ch + 1,
-            formsTouched,
-            posts,
-            (unsigned)rawValue,
-            (int16_t)rawValue);
-}
-
-static void scheduleWestPreampGainPush(int ch, const char* phaseTag) {
-    if (!westPreampGainPushEnabled())
-        return;
-    if (ch < 0 || ch >= 128)
-        return;
-    pushWestPreampGainValue(ch, phaseTag);
-    QTimer::singleShot(150, qApp, [ch]() {
-        pushWestPreampGainValue(ch, "[MC] (delayed 150ms) ");
-    });
-    QTimer::singleShot(600, qApp, [ch]() {
-        pushWestPreampGainValue(ch, "[MC] (delayed 600ms) ");
-    });
-}
-
-static void scheduleWestPreampGainPushForCurrentSelection(const char* phaseTag) {
-    if (!westPreampGainPushEnabled())
-        return;
-
-    auto tryPush = [phaseTag](const char* attemptTag) {
-        int ch = getSelectedInputChannel(false);
-        if (ch >= 0) {
-            fprintf(stderr,
-                    "[MC] %scurrent-selection west gain push: selected ch %d\n",
-                    attemptTag ? attemptTag : (phaseTag ? phaseTag : ""),
-                    ch + 1);
-            scheduleWestPreampGainPush(ch, attemptTag ? attemptTag : phaseTag);
-            return;
-        }
-        fprintf(stderr,
-                "[MC] %scurrent-selection west gain push: no selected input channel yet\n",
-                attemptTag ? attemptTag : (phaseTag ? phaseTag : ""));
-    };
-
-    tryPush(phaseTag);
-    QTimer::singleShot(250, qApp, [phaseTag, tryPush]() {
-        tryPush("[MC] final-preamp: (delayed 250ms) ");
-    });
-    QTimer::singleShot(1000, qApp, [phaseTag, tryPush]() {
-        tryPush("[MC] final-preamp: (delayed 1000ms) ");
-    });
-    QTimer::singleShot(2500, qApp, [phaseTag, tryPush]() {
-        tryPush("[MC] final-preamp: (delayed 2500ms) ");
-    });
-}
-
-static void runWestUserControlDriverExperiment(const char* phaseTag) {
-    typedef void (*fn_cUserControlCCDriverQObjectPostNewUserValue)(void*, uint16_t);
-    typedef void (*fn_cUserControlCCDriverQObjectWriteControllerValue)(void*, uint16_t);
-
-    auto postNewUserValue =
-        (fn_cUserControlCCDriverQObjectPostNewUserValue)RESOLVE(0x100136f20);
-    auto writeControllerValue =
-        (fn_cUserControlCCDriverQObjectWriteControllerValue)RESOLVE(0x1001372b0);
-
-    bool usePostUser = autotestEnvEnabled("MC_AUTOTEST_WEST_DRIVER_POST_USER");
-    bool useWriteValue = autotestEnvEnabled("MC_AUTOTEST_WEST_DRIVER_WRITE_VALUE");
-    if ((!usePostUser || !postNewUserValue) &&
-        (!useWriteValue || !writeControllerValue))
-        return;
-
-    int ch = getSelectedInputChannel(false);
-    if (ch < 0 || ch >= 128)
-        return;
-
-    PatchData livePatch = {};
-    if (!readPatchData(ch, livePatch))
-        return;
-
-    PreampData pd = {};
-    if (!readPreampDataForPatch(livePatch, pd))
-        return;
-
-    int controllerValue = 0x8000 + (int)pd.gain;
-    QList<QObject*> forms = collectWestProcessingForms();
-    int actions = 0;
-    for (QObject* obj : forms) {
-        char* raw = (char*)obj;
-        void* gainRotary = *(void**)(raw + 0xc8);
-        void* gainText = *(void**)(raw + 0xd0);
-        auto updateWrapper = [&](const char* label, void* wrapper) {
-            if (!wrapper)
-                return;
-            uint32_t kind = 0;
-            void* ptr18 = nullptr;
-            void* ptr20 = nullptr;
-            safeRead((char*)wrapper + 0x10, &kind, sizeof(kind));
-            safeRead((char*)wrapper + 0x18, &ptr18, sizeof(ptr18));
-            safeRead((char*)wrapper + 0x20, &ptr20, sizeof(ptr20));
-            void* driver = (kind == 2) ? ptr20 : ptr18;
-            if (!driver || (uintptr_t)driver < 0x100000000ULL)
-                return;
-            fprintf(stderr,
-                    "[MC] %swest user-control driver: ch=%d %s wrapper=%p driver=%p encoded=%d signedGain=%d post=%d write=%d\n",
-                    phaseTag ? phaseTag : "",
-                    ch + 1,
-                    label,
-                    wrapper,
-                    driver,
-                    controllerValue,
-                    pd.gain,
-                    usePostUser ? 1 : 0,
-                    useWriteValue ? 1 : 0);
-            if (usePostUser && postNewUserValue) {
-                postNewUserValue(driver, (uint16_t)controllerValue);
-                actions++;
-            }
-            if (useWriteValue && writeControllerValue) {
-                writeControllerValue(driver, (uint16_t)controllerValue);
-                actions++;
-            }
-        };
-        updateWrapper("gainRotary", gainRotary);
-        updateWrapper("gainText", gainText);
-    }
-
-    fprintf(stderr,
-            "[MC] %swest user-control driver summary: ch=%d forms=%d actions=%d encoded=%d signedGain=%d post=%d write=%d\n",
-            phaseTag ? phaseTag : "",
-            ch + 1,
-            forms.size(),
-            actions,
-            controllerValue,
-            pd.gain,
-            usePostUser ? 1 : 0,
-            useWriteValue ? 1 : 0);
-    QApplication::processEvents();
-}
-
-static void syncWestPreampUiToSelectedChannel(bool force, const char* phaseTag) {
-    QList<QObject*> forms = collectWestProcessingForms();
-    int formCount = forms.size();
-    if (formCount <= 0) {
-        g_westPreampSyncLastForms = 0;
-        return;
-    }
-
-    int ch = getSelectedInputChannel(false);
-    if (ch < 0 || ch >= 128)
-        return;
-
-    PatchData livePatch = {};
-    if (!readPatchData(ch, livePatch))
-        return;
-
-    int socketNum = -1;
-    if (!patchDataUsesSocketBackedPreamp(livePatch) ||
-        !getAnalogueSocketIndexForAudioSource(livePatch.source, socketNum)) {
-        return;
-    }
-
-    PreampData pd = {};
-    if (!readPreampDataForPatch(livePatch, pd))
-        return;
-
-    if (!force &&
-        ch == g_westPreampSyncLastChannel &&
-        socketNum == g_westPreampSyncLastSocket &&
-        pd.gain == g_westPreampSyncLastGain &&
-        pd.pad == g_westPreampSyncLastPad &&
-        pd.phantom == g_westPreampSyncLastPhantom &&
-        formCount == g_westPreampSyncLastForms) {
-        return;
-    }
-
-    pushWestPreampGainValue(ch, phaseTag ? phaseTag : "[MC] west sync ");
-    g_westPreampSyncLastChannel = ch;
-    g_westPreampSyncLastSocket = socketNum;
-    g_westPreampSyncLastGain = pd.gain;
-    g_westPreampSyncLastPad = pd.pad;
-    g_westPreampSyncLastPhantom = pd.phantom;
-    g_westPreampSyncLastForms = formCount;
-}
-
-static void refreshWestProcessingForChannel(int ch, const char* phaseTag) {
-    typedef void (*fn_WestProcessingFormChangeChannel)(void*, void*);
-    typedef void (*fn_WestProcessingFormReceivePointUpdated)(void*, void*);
-    typedef void (*fn_WestProcessingFormSocketStatusUpdated)(void*);
-    typedef void (*fn_WestProcessingFormLink)(void*);
-    typedef void (*fn_WestProcessingFormPreampModelModeChanged)(void*);
-
-    if (ch < 0 || ch >= 128)
-        return;
-
-    void* selectedChannelObj = getInputChannel(ch);
-    if (!selectedChannelObj)
-        return;
-
-    auto changeChannel = (fn_WestProcessingFormChangeChannel)RESOLVE(0x100d69350);
-    auto receivePointUpdated =
-        (fn_WestProcessingFormReceivePointUpdated)RESOLVE(0x100d6a920);
-    auto socketStatusUpdated =
-        (fn_WestProcessingFormSocketStatusUpdated)RESOLVE(0x100d6a810);
-    auto link = (fn_WestProcessingFormLink)RESOLVE(0x100d697c0);
-    auto preampModelModeChanged = (fn_WestProcessingFormPreampModelModeChanged)RESOLVE(0x100d69b20);
-    bool useDeepRelink = autotestEnvEnabled("MC_AUTOTEST_WEST_DEEP_RELINK");
-
-    QList<QObject*> forms = collectWestProcessingForms();
-    int actions = 0;
-    for (QObject* obj : forms) {
-        void* raw = obj;
-        if (changeChannel) {
-            changeChannel(raw, selectedChannelObj);
-            actions++;
-        }
-        if (selectedChannelObj && receivePointUpdated) {
-            receivePointUpdated(raw, selectedChannelObj);
-            actions++;
-        }
-        if (socketStatusUpdated) {
-            socketStatusUpdated(raw);
-            actions++;
-        }
-        if (useDeepRelink && link) {
-            link(raw);
-            actions++;
-        }
-        if (useDeepRelink && preampModelModeChanged) {
-            preampModelModeChanged(raw);
-            actions++;
-        }
-    }
-
-    fprintf(stderr,
-            "[MC] %swest refresh after selection: ch=%d channelObj=%p forms=%d actions=%d deepRelink=%d\n",
-            phaseTag ? phaseTag : "",
-            ch + 1,
-            selectedChannelObj,
-            forms.size(),
-            actions,
-            useDeepRelink ? 1 : 0);
-    QApplication::processEvents();
-}
 
 static void runWestProcessingRefreshExperiment(const char* phaseTag) {
     typedef void (*fn_WestProcessingFormChangeChannel)(void*, void*);
@@ -13816,27 +13368,6 @@ static void refreshSelectionCacheForShortcut() {
         rememberSelectedInputChannel(inputCh);
 }
 
-static void scheduleWestPreampGainPushAfterPointerSelection() {
-    if (!westPreampGainPushEnabled())
-        return;
-    uint64_t token = g_lastPointerSelectionEventMs;
-    QTimer::singleShot(kPointerSelectionSettleDelayMs, qApp, [token]() {
-        if (token == 0 || token != g_lastPointerSelectionEventMs)
-            return;
-        refreshSelectionCacheForShortcut();
-        int ch = getSelectedInputChannel(false);
-        if (ch < 0) {
-            fprintf(stderr,
-                    "[MC] pointer-settle west gain push: no selected input channel after settle\n");
-            return;
-        }
-        fprintf(stderr,
-                "[MC] pointer-settle west gain push: selected ch %d after pointer settle\n",
-                ch + 1);
-        scheduleWestPreampGainPush(ch, "[MC] pointer-settle: ");
-    });
-}
-
 static void runCopyPasteShortcutAction(bool isCopy, const char* origin) {
     uint64_t now = monotonicMs();
     bool shouldDelay =
@@ -14502,10 +14033,6 @@ protected:
             event->type() == QEvent::TouchBegin ||
             event->type() == QEvent::TouchEnd) {
             g_lastPointerSelectionEventMs = monotonicMs();
-            if (event->type() == QEvent::MouseButtonRelease ||
-                event->type() == QEvent::TouchEnd) {
-                scheduleWestPreampGainPushAfterPointerSelection();
-            }
         }
         if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
             auto* ke = static_cast<QKeyEvent*>(event);
@@ -14762,17 +14289,6 @@ static void onLoad() {
             g_autotestOverlayStatusTimer->start();
             pollAutotestOverlayStatusFile();
         }
-        if (westPreampSyncEnabled() && !g_westPreampSyncTimer) {
-            g_westPreampSyncTimer = new QTimer(qApp);
-            g_westPreampSyncTimer->setInterval(250);
-            QObject::connect(g_westPreampSyncTimer, &QTimer::timeout, qApp, []() {
-                syncWestPreampUiToSelectedChannel(false);
-            });
-            g_westPreampSyncTimer->start();
-            QTimer::singleShot(1200, qApp, []() {
-                syncWestPreampUiToSelectedChannel(true, "[MC] west sync (startup) ");
-            });
-        }
         QObject::connect(qApp, &QGuiApplication::focusWindowChanged, qApp, [](QWindow*) {
             SelectedStripInfo strip = getSelectedStripInfo(false);
             if (strip.valid)
@@ -14781,8 +14297,6 @@ static void onLoad() {
                                                      false);
             installMoveShortcuts();
             refreshToolbarReorderButton();
-            if (westPreampSyncEnabled())
-                syncWestPreampUiToSelectedChannel(true, "[MC] west sync (focus) ");
         });
         hookShowManagerSignalsForLogging();
         fprintf(stderr, "[MC] Global key filter installed (Ctrl+Shift+M / Cmd+Shift+M).\n");
