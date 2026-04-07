@@ -24,3 +24,5 @@ testCSV.csv
 # Local editor / OS noise
 *.swp
 *.swo
+
+tmp/
