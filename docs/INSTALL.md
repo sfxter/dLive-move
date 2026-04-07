@@ -30,6 +30,7 @@ If your app is somewhere else, edit `_launch_internal.sh` inside the packaged fo
 - On some Macs, the stock signed Director app refuses third-party dylib injection even after quarantine removal
 - `Prepare Director For Patch.command` is an opt-in workaround for that case
 - It now supports both `dLive Director V2.11.app` and `dLive Director V2.12.app`
-- It may ask for an administrator password because it modifies the app inside `/Applications`
+- It opens Terminal and runs the required `sudo` commands there
+- Terminal may ask for an administrator password because it modifies the app inside `/Applications`
 - It re-signs the user's local Director app with an ad-hoc signature
 - If the user wants to undo that change later, the safe path is reinstalling Director

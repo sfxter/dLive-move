@@ -45,7 +45,7 @@ For most users, use the packaged build in [`dist/`](./dist):
 5. If Director opens but the patch still does not load on that Mac, run:
    `Prepare Director For Patch.command`
 
-`Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder and re-signs the user's local `dLive Director` app with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
+`Prepare Director For Patch.command` is an opt-in helper. It removes quarantine from the patch folder, opens Terminal, and runs the required `sudo` commands to re-sign the user's local `dLive Director` app with an ad-hoc signature so the patch can be injected on Macs that block the stock signed app. This modifies the local Director install, so the README/package should make that clear.
 
 The package is built by:
 
