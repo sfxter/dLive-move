@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST_DIR="$ROOT/dist"
-PKG_NAME="dLive-move-patch-beta"
+PKG_NAME="dLive-move-patch"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$DIST_DIR/$PKG_NAME-$STAMP"
 ZIP_PATH="$DIST_DIR/$PKG_NAME-$STAMP.zip"
@@ -193,8 +193,8 @@ fi
 EOF
 
 cat >"$OUT_DIR/README.txt" <<'EOF'
-dLive Move Patch BETA
-=====================
+dLive Move Patch
+================
 
 What is included
 - libmovechannel.dylib
@@ -260,9 +260,8 @@ If macOS blocks the files
   xattr -dr com.apple.quarantine .
 
 Notes
-- Beta release
 - Adds support for dLive Director V2.12
-- Tested offline; to be tested online
+- Tested offline and online
 - Fixed mix copy/paste with Cmd+C / Cmd+V
 - The launcher app and plugin are Developer ID signed during packaging.
 - This package is not notarized.

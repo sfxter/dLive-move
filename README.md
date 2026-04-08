@@ -1,6 +1,6 @@
 # dLive Move Patch
 
-Unofficial community beta patch for `dLive Director V2.11` and `dLive Director V2.12` on macOS.
+Unofficial community patch for `dLive Director V2.11` and `dLive Director V2.12` on macOS.
 
 This project adds quality-of-life features to the dLive offline editor, with the main focus on moving channel data safely across mono and stereo layouts.
 

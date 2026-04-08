@@ -2,7 +2,7 @@
 
 Date: 2026-04-07
 
-Beta release focused on `dLive Director V2.12` support and move/copy-paste parity.
+Release focused on `dLive Director V2.12` support and move/copy-paste parity.
 
 ## What's New
 
@@ -14,10 +14,9 @@ Beta release focused on `dLive Director V2.12` support and move/copy-paste parit
 ## Test Status
 
 - Tested offline.
-- To be tested online.
+- Tested online.
 
 ## Notes
 
-- This is still a beta release.
 - The release keeps the current supported move/copy behavior and ports it to
   `V2.12`; it is not intended as a broader feature expansion release.
