@@ -856,7 +856,12 @@ static bool envFlagEnabled(const char* name) {
 static bool inputConfigSignalSettleEnabled() {
     if (const char* value = getenv("MC_EXPERIMENT_INPUTCFG_SIGNAL_SETTLE"))
         return atoi(value) != 0;
-    return true;
+    // This signal-based settle path was introduced as an experiment, but it is
+    // not conservative enough for normal moves. When it fires we only wait for
+    // a few event-loop turns instead of the long safety window below, which can
+    // leave the stereo object graph half-reset and cause writes to bleed into
+    // an adjacent pair. Keep it opt-in only.
+    return false;
 }
 
 static void* findChildObjectByVtable(void* root,
@@ -2546,6 +2551,415 @@ static void waitForStereoConfigReset();
 static bool readStereoConfig(uint8_t config[64]);
 static bool writeStereoConfig(const uint8_t config[64]);
 static bool isInsertStatusProc(int procIdx);
+
+struct DiscoveryRelinkState {
+    void* discovery = nullptr;
+    void* acMapper = nullptr;
+    bool haveDiscoverySnapshot = false;
+    bool haveAcMapperSnapshot = false;
+    uint64_t discoverySrcArr[0x80] = {};
+    uint64_t acMapperSrcArr[0x80] = {};
+};
+
+static void maybeRunGlobalStereoRelinkHammer(const char* phaseTag) {
+    if (!envFlagEnabled("MC_ENABLE_NEW_STEREO_CFG"))
+        return;
+
+    // Experimental global relink hammer.
+    //
+    // Purpose:
+    // SetInputChannelSource updates the audio graph but does not fully replay
+    // Director's own selector/preamp relink path. This call was kept as a way
+    // to force those bindings to republish when investigating stale preamp UI
+    // / selector-link issues after moves.
+    //
+    // Risk:
+    // Even when fed the current stereo map, this path is broad enough to cause
+    // collateral resets on adjacent channels in some reorder scenarios.
+    // Therefore it must remain opt-in only and never run as part of the normal
+    // move flow.
+    typedef void* (*fn_AppInstance3)();
+    auto appInst3 = (fn_AppInstance3)RESOLVE(g_binaryLayout->fn_c_application_instance);
+    void* audioCoreDM = nullptr;
+    if (appInst3) {
+        void* app3 = appInst3();
+        if (app3) {
+            void* drbox3 = *reinterpret_cast<void**>((uint8_t*)app3 + g_binaryLayout->off_app_drbox);
+            if (drbox3) {
+                audioCoreDM = *reinterpret_cast<void**>((uint8_t*)drbox3 + g_binaryLayout->off_drbox_audio_core);
+            }
+        }
+    }
+    if (!audioCoreDM) {
+        fprintf(stderr,
+                "[MC]   %sWARN: could not resolve cAudioCoreDM for NewInputStereoConfiguration\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+
+    uint8_t cfg[128];
+    memset(cfg, 0, sizeof(cfg));
+    for (int i = 0; i < 128; i += 2) {
+        if (isChannelStereo(i)) {
+            cfg[i] = 1;
+            cfg[i + 1] = 1;
+        }
+    }
+
+    fprintf(stderr,
+            "[MC]   %sCalling cAudioCoreDM::NewInputStereoConfiguration(audioCoreDM=%p, cfg=%p)\n",
+            phaseTag ? phaseTag : "",
+            audioCoreDM, cfg);
+    typedef void (*fn_NewStereoCfg)(void* self, const uint8_t* cfg);
+    auto newStereoCfg = (fn_NewStereoCfg)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_new_input_stereo_configuration);
+    newStereoCfg(audioCoreDM, cfg);
+    fprintf(stderr,
+            "[MC]   %scAudioCoreDM::NewInputStereoConfiguration returned\n",
+            phaseTag ? phaseTag : "");
+    QApplication::processEvents();
+}
+
+static void captureDiscoveryRelinkState(DiscoveryRelinkState& state,
+                                        const char* phaseTag) {
+    if (!envFlagEnabled("MC_ENABLE_REFIRE_DISCOVERY"))
+        return;
+
+    typedef void* (*fn_AppInstance)();
+    auto appInstance = (fn_AppInstance)RESOLVE(g_binaryLayout->fn_c_application_instance);
+    void* app = appInstance ? appInstance() : nullptr;
+    void* surface = app ? *reinterpret_cast<void**>((uint8_t*)app + 0xc0) : nullptr;
+    state.discovery = surface ? *reinterpret_cast<void**>((uint8_t*)surface + 0xa0) : nullptr;
+
+    if (state.discovery) {
+        uint64_t* srcArr = *reinterpret_cast<uint64_t**>((uint8_t*)state.discovery + 0x88);
+        if (srcArr) {
+            for (int i = 0; i < 0x80; ++i)
+                state.discoverySrcArr[i] = srcArr[i];
+            state.haveDiscoverySnapshot = true;
+            fprintf(stderr,
+                    "[MC]   %ssnapshotted discovery->0x88 (disc=%p, arr=%p)\n",
+                    phaseTag ? phaseTag : "",
+                    state.discovery, srcArr);
+        }
+    }
+
+    void* drbox = app ? *reinterpret_cast<void**>((uint8_t*)app + g_binaryLayout->off_app_drbox) : nullptr;
+    void* acdm = drbox ? *reinterpret_cast<void**>((uint8_t*)drbox + g_binaryLayout->off_drbox_audio_core) : nullptr;
+    void* wrapper = acdm ? *reinterpret_cast<void**>((uint8_t*)acdm + g_binaryLayout->off_audio_core_input_mixer_wrapper) : nullptr;
+    state.acMapper = wrapper ? *reinterpret_cast<void**>((uint8_t*)wrapper + g_binaryLayout->off_channel_mapper_usbdriver_mapper) : nullptr;
+    if (state.acMapper) {
+        uint64_t* acArr = *reinterpret_cast<uint64_t**>((uint8_t*)state.acMapper + 0x88);
+        if (acArr) {
+            for (int i = 0; i < 0x80; ++i)
+                state.acMapperSrcArr[i] = acArr[i];
+            state.haveAcMapperSnapshot = true;
+            fprintf(stderr,
+                    "[MC]   %ssnapshotted acMapper->0x88 (mapper=%p, arr=%p)\n",
+                    phaseTag ? phaseTag : "",
+                    state.acMapper, acArr);
+        }
+    }
+}
+
+static void maybeRefireDiscoveryRelinkObservers(const std::vector<std::pair<int, int>>& targetMap,
+                                                const DiscoveryRelinkState& beforeState,
+                                                const char* phaseTag) {
+    if (!envFlagEnabled("MC_ENABLE_REFIRE_DISCOVERY"))
+        return;
+
+    typedef void* (*fn_AppInstance)();
+    auto appInstance = (fn_AppInstance)RESOLVE(g_binaryLayout->fn_c_application_instance);
+    void* app = appInstance ? appInstance() : nullptr;
+    void* surface = app ? *reinterpret_cast<void**>((uint8_t*)app + 0xc0) : nullptr;
+    void* discovery = surface ? *reinterpret_cast<void**>((uint8_t*)surface + 0xa0) : nullptr;
+
+    fprintf(stderr,
+            "[MC]   %sobserver re-fire lookup: app=%p surface=%p discovery=%p\n",
+            phaseTag ? phaseTag : "",
+            app, surface, discovery);
+    if (!discovery) {
+        fprintf(stderr,
+                "[MC]   %sWARN: could not resolve cDL5000ChannelMapperDiscovery for observer re-fire\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+
+    void** vt = *reinterpret_cast<void***>(discovery);
+    typedef void (*fn_changeSource)(void* self, int event, void* srcArr,
+                                    uint16_t chan, uint8_t stripType);
+    auto aboutTo = (fn_changeSource)vt[0xc0 / 8];
+    auto haveChg = (fn_changeSource)vt[0xc8 / 8];
+    void* srcArr = *reinterpret_cast<void**>((uint8_t*)discovery + 0x88);
+    if (!aboutTo || !haveChg || !srcArr) {
+        fprintf(stderr,
+                "[MC]   %sWARN: discovery observer hooks unavailable (aboutTo=%p haveChanged=%p srcArr=%p)\n",
+                phaseTag ? phaseTag : "",
+                (void*)aboutTo, (void*)haveChg, srcArr);
+        return;
+    }
+
+    std::set<int> movedSet;
+    for (auto& [tgtCh, _] : targetMap) {
+        movedSet.insert(tgtCh);
+        if (isChannelStereo(tgtCh))
+            movedSet.insert(tgtCh + 1);
+    }
+
+    fprintf(stderr,
+            "[MC]   %sre-firing discovery observers: disc=%p srcArr=%p moved=%zu\n",
+            phaseTag ? phaseTag : "",
+            discovery, srcArr, movedSet.size());
+
+    uint64_t* curArr = reinterpret_cast<uint64_t*>(srcArr);
+    int restored = 0;
+    if (beforeState.haveDiscoverySnapshot && beforeState.discovery == discovery && curArr) {
+        for (int ch = 0; ch < 0x80; ++ch) {
+            if (movedSet.count(ch))
+                continue;
+            if (curArr[ch] == beforeState.discoverySrcArr[ch])
+                continue;
+            fprintf(stderr,
+                    "[MC]     %srestore discovery ch %d: 0x%016llx -> 0x%016llx\n",
+                    phaseTag ? phaseTag : "",
+                    ch + 1,
+                    (unsigned long long)curArr[ch],
+                    (unsigned long long)beforeState.discoverySrcArr[ch]);
+            curArr[ch] = beforeState.discoverySrcArr[ch];
+            ++restored;
+            haveChg(discovery, 0, (uint8_t*)discovery + 0x88, (uint16_t)ch, 0);
+        }
+    }
+    fprintf(stderr,
+            "[MC]   %srestored %d collateral discovery entries\n",
+            phaseTag ? phaseTag : "",
+            restored);
+
+    void* drbox = app ? *reinterpret_cast<void**>((uint8_t*)app + g_binaryLayout->off_app_drbox) : nullptr;
+    void* acdm = drbox ? *reinterpret_cast<void**>((uint8_t*)drbox + g_binaryLayout->off_drbox_audio_core) : nullptr;
+    void* wrapper = acdm ? *reinterpret_cast<void**>((uint8_t*)acdm + g_binaryLayout->off_audio_core_input_mixer_wrapper) : nullptr;
+    void* acMapper = wrapper ? *reinterpret_cast<void**>((uint8_t*)wrapper + g_binaryLayout->off_channel_mapper_usbdriver_mapper) : nullptr;
+
+    uint64_t* acCur = nullptr;
+    int acRestored = 0;
+    if (acMapper)
+        acCur = *reinterpret_cast<uint64_t**>((uint8_t*)acMapper + 0x88);
+    if (beforeState.haveAcMapperSnapshot && beforeState.acMapper == acMapper && acCur) {
+        for (int ch = 0; ch < 0x80; ++ch) {
+            if (acCur[ch] == beforeState.acMapperSrcArr[ch])
+                continue;
+            fprintf(stderr,
+                    "[MC]     %sacMapper ch %d slot changed: 0x%016llx -> 0x%016llx (moved=%d)\n",
+                    phaseTag ? phaseTag : "",
+                    ch + 1,
+                    (unsigned long long)beforeState.acMapperSrcArr[ch],
+                    (unsigned long long)acCur[ch],
+                    movedSet.count(ch) ? 1 : 0);
+            if (movedSet.count(ch))
+                continue;
+            acCur[ch] = beforeState.acMapperSrcArr[ch];
+            ++acRestored;
+        }
+    }
+    fprintf(stderr,
+            "[MC]   %srestored %d collateral acMapper entries\n",
+            phaseTag ? phaseTag : "",
+            acRestored);
+
+    int synced = 0;
+    if (curArr && acCur) {
+        for (int ch : movedSet) {
+            if (ch < 0 || ch > 0x7f)
+                continue;
+            if (curArr[ch] == acCur[ch])
+                continue;
+            fprintf(stderr,
+                    "[MC]     %ssync discovery ch %d: 0x%016llx -> 0x%016llx\n",
+                    phaseTag ? phaseTag : "",
+                    ch + 1,
+                    (unsigned long long)curArr[ch],
+                    (unsigned long long)acCur[ch]);
+            curArr[ch] = acCur[ch];
+            ++synced;
+        }
+    }
+    fprintf(stderr,
+            "[MC]   %ssynced %d discovery slots from acMapper\n",
+            phaseTag ? phaseTag : "",
+            synced);
+
+    for (int ch : movedSet) {
+        fprintf(stderr,
+                "[MC]     %sre-fire ch %d (AboutToChangeSource + HaveChangedSource)\n",
+                phaseTag ? phaseTag : "",
+                ch + 1);
+        aboutTo(discovery, 0, (uint8_t*)discovery + 0x88, (uint16_t)ch, 0);
+        haveChg(discovery, 0, (uint8_t*)discovery + 0x88, (uint16_t)ch, 0);
+    }
+    QApplication::processEvents();
+}
+
+static void maybeRunSelectorPreampRelink(const std::vector<std::pair<int, int>>& targetMap,
+                                         const char* phaseTag) {
+    if (const char* env = getenv("MC_ENABLE_SELECTOR_PREAMP_RELINK")) {
+        if (atoi(env) == 0)
+            return;
+    }
+    if (envFlagEnabled("MC_DISABLE_SELECTOR_PREAMP_RELINK"))
+        return;
+
+    typedef void (*fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)(void*, unsigned char, int);
+    typedef void (*fn_SurfaceChannelsUpdateInputPreAmp)(void*, unsigned char);
+    typedef void (*fn_ChannelSelectorManagerLinkInputMicPre)(void*, unsigned char, unsigned char);
+    typedef void (*fn_ChannelSelectorLiteUpdateInputPreAmpSingle)(void*, unsigned char);
+
+    auto informPreampControls =
+        (fn_ChannelSelectorInformDL5000ControlSurfacePreAmpControls)RESOLVE(g_binaryLayout->fn_c_channel_selector_inform_dl5000_control_surface_pre_amp_controls);
+    auto updateInputPreAmp =
+        (fn_SurfaceChannelsUpdateInputPreAmp)RESOLVE(g_binaryLayout->fn_c_surface_channels_update_input_pre_amp);
+    auto linkInputMicPre =
+        (fn_ChannelSelectorManagerLinkInputMicPre)RESOLVE(g_binaryLayout->fn_c_channel_selector_manager_link_input_mic_pre);
+    auto updateInputPreAmpSingle =
+        (fn_ChannelSelectorLiteUpdateInputPreAmpSingle)RESOLVE(g_binaryLayout->fn_c_channel_selector_lite_update_input_pre_amp);
+
+    uintptr_t selectorVt = (uintptr_t)g_binaryLayout->vt_channel_selector + g_slide + 0x10;
+    uintptr_t selectorMgrVt = (uintptr_t)g_binaryLayout->vt_channel_selector_manager + g_slide + 0x10;
+    uintptr_t selectorLiteVt = (uintptr_t)g_binaryLayout->vt_channel_selector_lite + g_slide + 0x10;
+    uintptr_t surfaceChannelsVt = (uintptr_t)g_binaryLayout->vt_surface_channels + g_slide + 0x10;
+
+    if (!g_channelSelectorManager)
+        discoverSelectorManagerFromChannelMapper(phaseTag);
+    if (!g_channelSelectorManager) {
+        g_channelSelectorManager = findSurfaceDiscoveryNamedObject("Channel Selector Manager");
+    }
+    if (!g_channelSelector && g_channelSelectorManager) {
+        g_channelSelector = findChildObjectByVtable(g_channelSelectorManager, selectorVt, 0x800, 0x800);
+    }
+    if (!g_channelSelectorLite && g_channelSelectorManager) {
+        g_channelSelectorLite = findChildObjectByVtable(g_channelSelectorManager, selectorLiteVt, 0x800, 0x800);
+    }
+    if (!g_channelSelector) {
+        g_channelSelector = findSurfaceDiscoveryNamedObject("Control Surface Channel Selector 01");
+    }
+    if (!g_channelSelectorLite) {
+        g_channelSelectorLite = findSurfaceDiscoveryNamedObject("Control Surface Channel Selector Lite");
+    }
+    std::array<std::pair<const char*, void*>, 3> roots = {{
+        {"AppInstance", g_AppInstance ? g_AppInstance() : nullptr},
+        {"UIManagerHolder", g_uiManagerHolder},
+        {"qApp", qApp},
+    }};
+    for (const auto& [label, root] : roots) {
+        if (!root)
+            continue;
+        if (!g_channelSelectorManager)
+            g_channelSelectorManager = findChildObjectByVtable(root, selectorMgrVt, 0x800, 0x800);
+        if (!g_channelSelector)
+            g_channelSelector = findChildObjectByVtable(root, selectorVt, 0x800, 0x800);
+        if (!g_channelSelectorLite)
+            g_channelSelectorLite = findChildObjectByVtable(root, selectorLiteVt, 0x800, 0x800);
+        if (!g_surfaceChannels)
+            g_surfaceChannels = findChildObjectByVtable(root, surfaceChannelsVt, 0x800, 0x800);
+    }
+
+    fprintf(stderr,
+            "[MC] %sselector-preamp relink: manager=%p selector=%p selectorLite=%p surfaceChannels=%p\n",
+            phaseTag ? phaseTag : "",
+            g_channelSelectorManager,
+            g_channelSelector,
+            g_channelSelectorLite,
+            g_surfaceChannels);
+
+    if (!g_channelSelectorManager && !g_channelSelector && !g_channelSelectorLite && !g_surfaceChannels) {
+        fprintf(stderr,
+                "[MC] %sselector-preamp relink: skipped, no selector/surface objects discovered\n",
+                phaseTag ? phaseTag : "");
+        return;
+    }
+
+    std::set<int> relinkSet;
+    for (auto& [tgtCh, _] : targetMap) {
+        int pairStart = isChannelStereo(tgtCh) ? (tgtCh & ~1) : tgtCh;
+        relinkSet.insert(pairStart);
+        if (isChannelStereo(pairStart))
+            relinkSet.insert(pairStart + 1);
+    }
+
+    // `linkArg=0` is the safe variant that fixes West-bank gain refresh and
+    // avoids the unrelated-channel resets seen with broader relink hammers.
+    unsigned char linkArg =
+        (unsigned char)atoi(getenv("MC_EXPERIMENT_SELECTOR_MANAGER_LINK_ARG")
+                                ? getenv("MC_EXPERIMENT_SELECTOR_MANAGER_LINK_ARG")
+                                : "0");
+    int actions = 0;
+    for (int ch : relinkSet) {
+        if (ch < 0 || ch >= 128)
+            continue;
+        if (linkInputMicPre && g_channelSelectorManager) {
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: LinkInputMicPre begin manager=%p ch=%d arg=%u\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelectorManager,
+                    ch + 1,
+                    (unsigned)linkArg);
+            linkInputMicPre(g_channelSelectorManager, (unsigned char)ch, linkArg);
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: LinkInputMicPre end manager=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelectorManager,
+                    ch + 1);
+            actions++;
+        }
+        if (informPreampControls && g_channelSelector) {
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: InformDL5000ControlSurfacePreAmpControls begin selector=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelector,
+                    ch + 1);
+            informPreampControls(g_channelSelector, (unsigned char)ch, 0);
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: InformDL5000ControlSurfacePreAmpControls end selector=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelector,
+                    ch + 1);
+            actions++;
+        }
+        if (updateInputPreAmpSingle && g_channelSelectorLite) {
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: UpdateInputPreAmp(single) begin selectorLite=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelectorLite,
+                    ch + 1);
+            updateInputPreAmpSingle(g_channelSelectorLite, (unsigned char)ch);
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: UpdateInputPreAmp(single) end selectorLite=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_channelSelectorLite,
+                    ch + 1);
+            actions++;
+        }
+        if (updateInputPreAmp && g_surfaceChannels) {
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: UpdateInputPreAmp begin surfaceChannels=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_surfaceChannels,
+                    ch + 1);
+            updateInputPreAmp(g_surfaceChannels, (unsigned char)ch);
+            fprintf(stderr,
+                    "[MC] %sselector-preamp relink: UpdateInputPreAmp end surfaceChannels=%p ch=%d\n",
+                    phaseTag ? phaseTag : "",
+                    g_surfaceChannels,
+                    ch + 1);
+            actions++;
+        }
+    }
+
+    fprintf(stderr,
+            "[MC] %sselector-preamp relink: channels=%zu actions=%d\n",
+            phaseTag ? phaseTag : "",
+            relinkSet.size(),
+            actions);
+    QApplication::processEvents();
+}
 
 static void waitForSceneRecall() {
     int settleMs = 8000;
@@ -8259,7 +8673,16 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         uint8_t oldChannel;
         uint8_t newChannel;
     };
+    struct ExternalDyn8SidechainRemap {
+        int ownerCh;
+        int unitIdx;
+        int ip;
+        uint32_t oldChannel;
+        uint32_t newChannel;
+        uint8_t dyn8Data[0x94];
+    };
     std::vector<ExternalSidechainRemap> externalSidechainRemaps;
+    std::vector<ExternalDyn8SidechainRemap> externalDyn8SidechainRemaps;
     const char* patchPolicy = movePatchWithChannel ? "move with channel" : "shift by move amount";
     const char* ioPortPolicy = movePatchWithChannel
         ? "move with channel"
@@ -8365,6 +8788,67 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     "[MC]   Plan external %s on ch %d: channel %d -> %d\n",
                     g_procB[p].name, ch + 1, oldChannel, newChannel);
             externalSidechainRemaps.push_back({ch, p, stripType, oldChannel, newChannel});
+        }
+    }
+    if (g_channelManager) {
+        typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+        auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
+        typedef bool (*fn_HasInserts)(void* channel, int insertPoint);
+        auto hasInserts = (fn_HasInserts)RESOLVE(g_binaryLayout->fn_has_inserts_c_channel_e_insert_point_const);
+        typedef void* (*fn_GetInsertReturnPoint)(void* channel, int insertPoint);
+        auto getReturnPoint = (fn_GetInsertReturnPoint)RESOLVE(g_binaryLayout->fn_get_insert_return_point_c_channel_e_insert_point_const);
+        typedef int (*fn_GetParentType)(void* sendPoint);
+        auto getParentType = (fn_GetParentType)RESOLVE(g_binaryLayout->fn_c_audio_send_point_get_parent_type);
+
+        for (int ch = 0; ch < 128; ch++) {
+            if (ch >= lo && ch <= hi) continue;
+            void* cChannel = getChannel ? getChannel(g_channelManager, 1, (uint8_t)ch) : nullptr;
+            if (!cChannel || !hasInserts || !getReturnPoint || !getParentType) continue;
+
+            for (int ip = 0; ip < 2; ip++) {
+                if (!hasInserts(cChannel, ip)) continue;
+                void* returnPt = getReturnPoint(cChannel, ip);
+                if (!returnPt) continue;
+
+                void* connSendPt = nullptr;
+                safeRead((uint8_t*)returnPt + g_binaryLayout->off_insert_return_connected_send_point,
+                         &connSendPt, sizeof(connSendPt));
+                if (!connSendPt || getParentType(connSendPt) != 5) continue;
+
+                int dynIdx = findDyn8UnitIdx(connSendPt);
+                if (dynIdx < 0) continue;
+
+                void* dynNetObj = getDynNetObj(dynIdx);
+                if (!dynNetObj) continue;
+
+                ExternalDyn8SidechainRemap fix = {};
+                fix.ownerCh = ch;
+                fix.unitIdx = dynIdx;
+                fix.ip = ip;
+                safeRead((uint8_t*)dynNetObj + g_binaryLayout->off_dyn_obj_data,
+                         fix.dyn8Data, sizeof(fix.dyn8Data));
+
+                uint32_t srcType = 0;
+                memcpy(&srcType, fix.dyn8Data + 4, sizeof(srcType));
+                memcpy(&fix.oldChannel, fix.dyn8Data + 8, sizeof(fix.oldChannel));
+                if (srcType == 0) continue;
+
+                if (!remapDyn8SideChainRef(fix.dyn8Data,
+                                           sizeof(fix.dyn8Data),
+                                           plan,
+                                           "[MC] plan external ",
+                                           ch,
+                                           dynIdx)) {
+                    continue;
+                }
+
+                memcpy(&fix.newChannel, fix.dyn8Data + 8, sizeof(fix.newChannel));
+                fprintf(stderr,
+                        "[MC]   Plan external Dyn8 Insert%c on ch %d unit %d: channel %u -> %u\n",
+                        'A' + ip, ch + 1, dynIdx,
+                        fix.oldChannel, fix.newChannel);
+                externalDyn8SidechainRemaps.push_back(fix);
+            }
         }
     }
 
@@ -8794,186 +9278,149 @@ static bool applyMovePlan(const MovePlan& inputPlan,
     phase("Phase: rewrite patching");
     fprintf(stderr, "[MC] Writing patching (%s; MixRack I/O Port: %s)...\n",
             patchPolicy, ioPortPolicy);
-        bool disablePatchMetadataSync = envFlagEnabled("MC_DISABLE_PATCH_METADATA_SYNC");
-        fprintf(stderr,
-                "[MC]   Patch metadata sync after SetInputChannelSource: %s\n",
-                disablePatchMetadataSync ? "DISABLED by MC_DISABLE_PATCH_METADATA_SYNC" : "enabled");
-        // Use CSV import path: cChannel::SetInputChannelSource via task system
-        // This is what Import CSV uses — full update + UI refresh
-        typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
-        auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
+    DiscoveryRelinkState relinkState;
+    captureDiscoveryRelinkState(relinkState, "");
+    bool disablePatchMetadataSync = envFlagEnabled("MC_DISABLE_PATCH_METADATA_SYNC");
+    fprintf(stderr,
+            "[MC]   Patch metadata sync after SetInputChannelSource: %s\n",
+            disablePatchMetadataSync ? "DISABLED by MC_DISABLE_PATCH_METADATA_SYNC" : "enabled");
+    // Use CSV import path: cChannel::SetInputChannelSource via task system
+    // This is what Import CSV uses — full update + UI refresh
+    typedef void* (*fn_GetChannel)(void* mgr, uint32_t stripType, uint8_t chNum);
+    auto getChannel = (fn_GetChannel)RESOLVE(g_binaryLayout->fn_c_channel_manager_get_channel_e_channel_strip_type_unsigned_char_const);
 
-        typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
-        auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
+    typedef void* (*fn_GetSendPoint)(void* mgr, uint32_t sourceType, uint16_t sourceNum);
+    auto getSendPoint = (fn_GetSendPoint)RESOLVE(g_binaryLayout->fn_c_audio_send_receive_point_manager_get_send_point);
 
-        typedef void (*fn_SetInputChannelSource)(void* channel, int activeInputSource,
-                                                  void* sendPt, void* sendPt2);
-        auto setInputSource = (fn_SetInputChannelSource)RESOLVE(g_binaryLayout->fn_c_channel_set_input_channel_source);
+    typedef void (*fn_SetInputChannelSource)(void* channel, int activeInputSource,
+                                              void* sendPt, void* sendPt2);
+    auto setInputSource = (fn_SetInputChannelSource)RESOLVE(g_binaryLayout->fn_c_channel_set_input_channel_source);
 
-        for (auto& [tgtCh, si] : plan.targetMap) {
-            if (!snaps[si].validPatch) continue;
-            int srcCh = lo + si;
-            PatchData tgtPatch = getEffectiveTargetPatchData(&plan, snaps[si].patchData, srcCh, tgtCh,
-                                                             movePatchWithChannel,
-                                                             shiftMixRackIOPortWithMoveInScenarioA);
-            PatchData matePatch = {};
-            bool haveMatePatch = false;
+    for (auto& [tgtCh, si] : plan.targetMap) {
+        if (!snaps[si].validPatch) continue;
+        int srcCh = lo + si;
+        PatchData tgtPatch = getEffectiveTargetPatchData(&plan, snaps[si].patchData, srcCh, tgtCh,
+                                                         movePatchWithChannel,
+                                                         shiftMixRackIOPortWithMoveInScenarioA);
+        PatchData matePatch = {};
+        bool haveMatePatch = false;
 
-            bool tgtStereo = isChannelStereo(tgtCh);
-            if (tgtStereo && (tgtCh & 1)) {
-                fprintf(stderr,
-                        "[MC]   Patch ch %d skipped; stereo pair handled by ch %d\n",
-                        tgtCh + 1, tgtCh);
-                continue;
-            }
+        bool tgtStereo = isChannelStereo(tgtCh);
+        if (tgtStereo && (tgtCh & 1)) {
+            fprintf(stderr,
+                    "[MC]   Patch ch %d skipped; stereo pair handled by ch %d\n",
+                    tgtCh + 1, tgtCh);
+            continue;
+        }
 
-            sAudioSource& src = tgtPatch.source;
-            fprintf(stderr, "[MC]   Patch ch %d: srcType=%d src={type=%d, num=%d}\n",
-                    tgtCh+1, tgtPatch.sourceType,
-                    src.type, src.number);
+        sAudioSource& src = tgtPatch.source;
+        fprintf(stderr, "[MC]   Patch ch %d: srcType=%d src={type=%d, num=%d}\n",
+                tgtCh+1, tgtPatch.sourceType,
+                src.type, src.number);
 
-            if (!g_channelManager || !g_audioSRPManager) {
-                fprintf(stderr, "[MC]   WARN: channelMgr or audioSRPMgr not available, falling back to writePatchData\n");
-                writePatchData(tgtCh, tgtPatch);
-                continue;
-            }
+        if (!g_channelManager || !g_audioSRPManager) {
+            fprintf(stderr, "[MC]   WARN: channelMgr or audioSRPMgr not available, falling back to writePatchData\n");
+            writePatchData(tgtCh, tgtPatch);
+            continue;
+        }
 
-            void* ch = getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh);
-            if (!ch) {
-                fprintf(stderr, "[MC]   WARN: GetChannel(%d) returned null\n", tgtCh);
-                writePatchData(tgtCh, tgtPatch);
-                continue;
-            }
+        void* ch = getChannel(g_channelManager, 1/*Input*/, (uint8_t)tgtCh);
+        if (!ch) {
+            fprintf(stderr, "[MC]   WARN: GetChannel(%d) returned null\n", tgtCh);
+            writePatchData(tgtCh, tgtPatch);
+            continue;
+        }
 
-            void* sendPtA = audioSourceIsUnassigned(src)
-                ? getUnassignedInputSendPoint()
-                : getSendPoint(g_audioSRPManager, src.type, (uint16_t)src.number);
-            void* sendPtB = nullptr;
+        void* sendPtA = audioSourceIsUnassigned(src)
+            ? getUnassignedInputSendPoint()
+            : getSendPoint(g_audioSRPManager, src.type, (uint16_t)src.number);
+        void* sendPtB = nullptr;
 
-            if (tgtStereo) {
-                int pairMateCh = tgtCh + 1;
-                int mateSnapIdx = -1;
-                for (auto& [mappedTgtCh, mappedSi] : plan.targetMap) {
-                    if (mappedTgtCh == pairMateCh) {
-                        mateSnapIdx = mappedSi;
-                        break;
-                    }
+        if (tgtStereo) {
+            int pairMateCh = tgtCh + 1;
+            int mateSnapIdx = -1;
+            for (auto& [mappedTgtCh, mappedSi] : plan.targetMap) {
+                if (mappedTgtCh == pairMateCh) {
+                    mateSnapIdx = mappedSi;
+                    break;
                 }
-                if (mateSnapIdx >= 0 && snaps[mateSnapIdx].validPatch) {
-                    int mateSrcCh = lo + mateSnapIdx;
-                    matePatch = getEffectiveTargetPatchData(
-                        &plan, snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh,
-                        movePatchWithChannel, shiftMixRackIOPortWithMoveInScenarioA);
-                    haveMatePatch = true;
-                    sAudioSource& mateSrc = matePatch.source;
-                    sendPtB = audioSourceIsUnassigned(mateSrc)
-                        ? getUnassignedInputSendPoint()
-                        : getSendPoint(g_audioSRPManager, mateSrc.type, (uint16_t)mateSrc.number);
+            }
+            if (mateSnapIdx >= 0 && snaps[mateSnapIdx].validPatch) {
+                int mateSrcCh = lo + mateSnapIdx;
+                matePatch = getEffectiveTargetPatchData(
+                    &plan, snaps[mateSnapIdx].patchData, mateSrcCh, pairMateCh,
+                    movePatchWithChannel, shiftMixRackIOPortWithMoveInScenarioA);
+                haveMatePatch = true;
+                sAudioSource& mateSrc = matePatch.source;
+                sendPtB = audioSourceIsUnassigned(mateSrc)
+                    ? getUnassignedInputSendPoint()
+                    : getSendPoint(g_audioSRPManager, mateSrc.type, (uint16_t)mateSrc.number);
+                fprintf(stderr,
+                        "[MC]   Stereo patch pair ch %d+%d: A={type=%d,num=%d}->%p B={type=%d,num=%d}->%p\n",
+                        tgtCh + 1, pairMateCh + 1,
+                        src.type, src.number, sendPtA,
+                        mateSrc.type, mateSrc.number, sendPtB);
+            } else {
+                fprintf(stderr,
+                        "[MC]   WARN: stereo target ch %d missing pair mate patch snapshot; falling back to single source\n",
+                        tgtCh + 1);
+            }
+        } else {
+            fprintf(stderr, "[MC]   ch=%p sendPt=%p\n", ch, sendPtA);
+        }
+
+        fprintf(stderr, "[MC]   Apply patch on ch %d via SetInputChannelSource\n", tgtCh + 1);
+        setInputSource(ch, 1, sendPtA, sendPtB);
+        // Keep channel-mapper metadata aligned with the applied send points so
+        // Director and the reorder panel show the correct source family.
+        if (disablePatchMetadataSync) {
+            fprintf(stderr,
+                    "[MC]   Metadata patch sync skipped on ch %d after SetInputChannelSource\n",
+                    tgtCh + 1);
+            if (tgtStereo && haveMatePatch) {
+                int pairMateCh = tgtCh + 1;
+                fprintf(stderr,
+                        "[MC]   Metadata patch sync skipped on stereo mate ch %d after SetInputChannelSource\n",
+                        pairMateCh + 1);
+            }
+        } else {
+            if (!writePatchData(tgtCh, tgtPatch)) {
+                fprintf(stderr,
+                        "[MC]   WARN: metadata patch sync failed on ch %d after SetInputChannelSource\n",
+                        tgtCh + 1);
+            } else {
+                fprintf(stderr,
+                        "[MC]   Metadata patch sync applied on ch %d after SetInputChannelSource\n",
+                        tgtCh + 1);
+            }
+            if (tgtStereo && haveMatePatch) {
+                int pairMateCh = tgtCh + 1;
+                if (!writePatchData(pairMateCh, matePatch)) {
                     fprintf(stderr,
-                            "[MC]   Stereo patch pair ch %d+%d: A={type=%d,num=%d}->%p B={type=%d,num=%d}->%p\n",
-                            tgtCh + 1, pairMateCh + 1,
-                            src.type, src.number, sendPtA,
-                            mateSrc.type, mateSrc.number, sendPtB);
+                            "[MC]   WARN: metadata patch sync failed on stereo mate ch %d after SetInputChannelSource\n",
+                            pairMateCh + 1);
                 } else {
                     fprintf(stderr,
-                            "[MC]   WARN: stereo target ch %d missing pair mate patch snapshot; falling back to single source\n",
-                            tgtCh + 1);
-                }
-            } else {
-                fprintf(stderr, "[MC]   ch=%p sendPt=%p\n", ch, sendPtA);
-            }
-
-            fprintf(stderr, "[MC]   Apply patch on ch %d via SetInputChannelSource\n", tgtCh + 1);
-            setInputSource(ch, 1, sendPtA, sendPtB);
-            // Keep channel-mapper metadata aligned with the applied send points so
-            // Director and the reorder panel show the correct source family.
-            if (disablePatchMetadataSync) {
-                fprintf(stderr,
-                        "[MC]   Metadata patch sync skipped on ch %d after SetInputChannelSource\n",
-                        tgtCh + 1);
-                if (tgtStereo && haveMatePatch) {
-                    int pairMateCh = tgtCh + 1;
-                    fprintf(stderr,
-                            "[MC]   Metadata patch sync skipped on stereo mate ch %d after SetInputChannelSource\n",
+                            "[MC]   Metadata patch sync applied on stereo mate ch %d after SetInputChannelSource\n",
                             pairMateCh + 1);
                 }
-            } else {
-                if (!writePatchData(tgtCh, tgtPatch)) {
-                    fprintf(stderr,
-                            "[MC]   WARN: metadata patch sync failed on ch %d after SetInputChannelSource\n",
-                            tgtCh + 1);
-                } else {
-                    fprintf(stderr,
-                            "[MC]   Metadata patch sync applied on ch %d after SetInputChannelSource\n",
-                            tgtCh + 1);
-                }
-                if (tgtStereo && haveMatePatch) {
-                    int pairMateCh = tgtCh + 1;
-                    if (!writePatchData(pairMateCh, matePatch)) {
-                        fprintf(stderr,
-                                "[MC]   WARN: metadata patch sync failed on stereo mate ch %d after SetInputChannelSource\n",
-                                pairMateCh + 1);
-                    } else {
-                        fprintf(stderr,
-                                "[MC]   Metadata patch sync applied on stereo mate ch %d after SetInputChannelSource\n",
-                                pairMateCh + 1);
-                    }
-                }
-            }
-            fprintf(stderr, "[MC]   Patch applied on ch %d\n", tgtCh + 1);
-            QApplication::processEvents();
-            usleep(25 * 1000);
-            QApplication::processEvents();
-        }
-        fprintf(stderr, "[MC]   Patching applied via SetInputChannelSource.\n");
-    // cAudioCoreDM::NewInputStereoConfiguration hammer: the app's own
-    // mono<->stereo reconfig entry point (0x1001a0f10). Given a 128-byte stereo
-    // map, it rebuilds input intermediates for pairs that flipped AND
-    // unconditionally calls cChannelSelectorManager::NewInputStereoConfiguration
-    // which loops every cChannelSelectorLite, refreshes selector->0xb0 from
-    // stagebox discovery, and re-fires CreateStageBoxPreAmpAssignments for all
-    // 128 channels. This is exactly what republishes the name-based preamp
-    // Links in the parameter registry, which is what our moveChannel is
-    // missing for channels whose stereo-pair position changed.
-    //
-    // We pass the CURRENT stereo map (read via isChannelStereo), so the
-    // diff-based intermediate-rebuild block inside the function is a no-op
-    // (no resets, no glitches), but the selector refresh still runs.
-    if (!envFlagEnabled("MC_DISABLE_NEW_STEREO_CFG")) {
-        typedef void* (*fn_AppInstance3)();
-        auto appInst3 = (fn_AppInstance3)RESOLVE(g_binaryLayout->fn_c_application_instance);
-        void* audioCoreDM = nullptr;
-        if (appInst3) {
-            void* app3 = appInst3();
-            if (app3) {
-                void* drbox3 = *reinterpret_cast<void**>((uint8_t*)app3 + g_binaryLayout->off_app_drbox);
-                if (drbox3) {
-                    audioCoreDM = *reinterpret_cast<void**>((uint8_t*)drbox3 + g_binaryLayout->off_drbox_audio_core);
-                }
             }
         }
-        if (audioCoreDM) {
-            uint8_t cfg[128];
-            memset(cfg, 0, sizeof(cfg));
-            for (int i = 0; i < 128; i += 2) {
-                if (isChannelStereo(i)) { cfg[i] = 1; cfg[i + 1] = 1; }
-            }
-            fprintf(stderr, "[MC]   Calling cAudioCoreDM::NewInputStereoConfiguration(audioCoreDM=%p, cfg=%p)\n",
-                    audioCoreDM, cfg);
-            typedef void (*fn_NewStereoCfg)(void* self, const uint8_t* cfg);
-            auto newStereoCfg = (fn_NewStereoCfg)RESOLVE(g_binaryLayout->fn_c_audio_core_dm_new_input_stereo_configuration);
-            newStereoCfg(audioCoreDM, cfg);
-            fprintf(stderr, "[MC]   cAudioCoreDM::NewInputStereoConfiguration returned\n");
-            QApplication::processEvents();
-        } else {
-            fprintf(stderr, "[MC]   WARN: could not resolve cAudioCoreDM for NewInputStereoConfiguration\n");
-        }
+        fprintf(stderr, "[MC]   Patch applied on ch %d\n", tgtCh + 1);
+        QApplication::processEvents();
+        usleep(25 * 1000);
+        QApplication::processEvents();
     }
+    fprintf(stderr, "[MC]   Patching applied via SetInputChannelSource.\n");
+    maybeRunGlobalStereoRelinkHammer("");
+    maybeRefireDiscoveryRelinkObservers(plan.targetMap, relinkState, "");
     // Rebuild the cChannelMapper gain-sharing link registers so the West-form
     // gain knob is re-bound to the correct preamp for channels whose input
     // source changed. SetInputChannelSource updates the audio graph but not
     // the ChannelMapper parameter-link table maintained via DoGainSharingLinking.
-    if (!envFlagEnabled("MC_DISABLE_REBUILD_PATCHBAY")) {
+    // Same story for the ChannelMapper patch-bay rebuild below: useful as an
+    // experiment, but too invasive for the normal move path.
+    if (envFlagEnabled("MC_ENABLE_REBUILD_PATCHBAY")) {
         typedef void* (*fn_AppInstance)();
         auto appInstance = (fn_AppInstance)RESOLVE(g_binaryLayout->fn_c_application_instance);
         void* mapper = nullptr;
@@ -9051,6 +9498,7 @@ static bool applyMovePlan(const MovePlan& inputPlan,
                     tgtCh + 1, (unsigned)socketNum);
         }
     }
+    maybeRunSelectorPreampRelink(plan.targetMap, "[MC] post-main-preamp: ");
     phase("Phase: restore ABCD source setup");
     typedef void (*fn_SetActiveInputChannel)(void* channel, uint8_t activeInputSource);
     auto setActiveInputChannel = (fn_SetActiveInputChannel)RESOLVE(g_binaryLayout->fn_c_channel_set_active_input_channel);
@@ -9649,6 +10097,17 @@ static bool applyMovePlan(const MovePlan& inputPlan,
         }
         for (int ch : refreshedChannels) {
             refreshSideChainStateForChannel(ch, "post-external-sidechain-refresh");
+            QApplication::processEvents();
+        }
+    }
+    if (!externalDyn8SidechainRemaps.empty()) {
+        phase("Phase: update external Dyn8 sidechain references");
+        for (const auto& fix : externalDyn8SidechainRemaps) {
+            replayDyn8DataToUnit(fix.unitIdx,
+                                 fix.dyn8Data,
+                                 fix.ownerCh,
+                                 fix.ip,
+                                 "External Dyn8 ");
             QApplication::processEvents();
         }
     }
